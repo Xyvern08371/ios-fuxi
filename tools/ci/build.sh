@@ -330,6 +330,8 @@ user_tools() {
     bash tools/build-fuxi-gpu-abi-test.sh
     cp tools/out/fuxi-gpu-abi-test tools/vk-smoke.conf "$out/"
     codesign --verify --strict "$out/fuxi-gpu-abi-test"
+    bash tools/build-fuxi-thermald.sh "$out"
+    cp tools/fuxi-thermald/com.fuxi.thermald.plist tools/fuxi-thermald/LICENSE.HackiOS "$out/"
     python3 tools/audit-fuxi-vulkan.py "$out/fuxi-vk-probe" "$out/fuxi-vk-smoke"
     # Audit sidecars describe only our binaries and are useful with the logs.
 }

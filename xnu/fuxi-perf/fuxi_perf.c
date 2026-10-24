@@ -64,6 +64,8 @@ static unsigned fp_duty_count;
 static int fp_prev_temp, fp_prev_valid, fp_blocked;
 static uint64_t fp_rate_elapsed;
 static int fp_rate_temp, fp_rate_valid, fp_rate;
+static unsigned fp_pressure_enabled;
+static int fp_pressure = -1; /* No fabricated nominal before the first sample. */
 static unsigned fp_enabled, fp_started, fp_ready;
 static thread_call_data_t fp_call;
 /* Refusals are EBUSY, never EAGAIN: userland_sysctl() retries a handler's
@@ -234,6 +236,22 @@ static int fp_compile_sysctl SYSCTL_HANDLER_ARGS
 SYSCTL_PROC(_kern, OID_AUTO, fuxicompileboost,
     CTLTYPE_OPAQUE | CTLFLAG_RW | CTLFLAG_ANYBODY | CTLFLAG_LOCKED,
     0, 0, fp_compile_sysctl, "S,fuxi_compile_reply", "platform backboardd current-thread compile lease");
+static int fp_pressure_sysctl SYSCTL_HANDLER_ARGS
+{
+ /* Reads never run the worker or touch MMIO. The lock snapshots readiness
+  * and pressure together; SYSCTL_OUT runs after dropping it. */
+ if (req->newptr) return EPERM;
+ if (!__atomic_load_n(&fp_enabled,__ATOMIC_ACQUIRE)) return ENOTSUP;
+ lck_mtx_lock(&fp_lock);
+ int level = fp_pressure, enabled = fp_pressure_enabled;
+ lck_mtx_unlock(&fp_lock);
+ if (!enabled) return ENOTSUP;
+ if (level < 0) return EBUSY;
+ return SYSCTL_OUT(req,&level,sizeof(level));
+}
+SYSCTL_PROC(_kern, OID_AUTO, fuxipressure,
+    CTLTYPE_INT | CTLFLAG_RD | CTLFLAG_LOCKED,
+    0, 0, fp_pressure_sysctl, "I", "OSThermalPressureLevel (fuxiperf=1 fuxitp=1)");
 static int fp_read(uintptr_t base, unsigned off, uint32_t *value)
 {
  uint64_t v = 0;
@@ -545,6 +563,8 @@ static void fp_worker_locked(thread_call_param_t arg, thread_call_param_t result
  if ((valid && temp >= (int)fp_hot) ||
      (fp_prev_valid && fp_prev_temp >= (int)fp_hot)) fp_above_time += elapsed;
  int safe = fp_thermal_guard(valid,temp,now,elapsed_ns);
+ if (fp_pressure_enabled)
+  fp_pressure = fp_pressure_level(fp_pressure,valid,temp,fp_blocked,fp_hot,fp_limit,fp_resume);
  uint64_t used = fp_duty_used(now);
  int duty_ok = used < fp_budget && (fp_boosted || fp_duty_count < 16);
  fp_compile_poll(now,safe,duty_ok);
@@ -625,6 +645,8 @@ void fuxi_perf_start(void)
  (void)PE_parse_boot_argn("fuxiperf",&enable,sizeof(enable));
  if (enable != 1 || fp_started) return;
  fp_started = 1;
+ (void)PE_parse_boot_argn("fuxitp",&fp_pressure_enabled,sizeof(fp_pressure_enabled));
+ fp_pressure_enabled = fp_pressure_enabled == 1;
  (void)PE_parse_boot_argn("fuxicompileboost",&fp_compile_enabled,sizeof(fp_compile_enabled));
  fp_compile_enabled = fp_compile_enabled == 1;
  /* Keep at least two of logical 2-6 (gold/prime); otherwise ignore. */

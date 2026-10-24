@@ -1,6 +1,27 @@
 /* Pure policy shared with offline tests. Frequencies always come from EPSS LUT. */
 #ifndef FUXI_PERF_LOGIC_H
 #define FUXI_PERF_LOGIC_H
+/* OSThermalPressureLevel wire values used by OSThermalNotification.h:
+ * nominal=0, moderate=1, heavy=2, trapping=3, sleeping=4. This is not
+ * NSProcessInfoThermalState's four-value scale. No sleeping is emitted:
+ * this governor has no platform sleep/shutdown policy.
+ */
+enum { FP_TP_NOMINAL, FP_TP_MODERATE, FP_TP_HEAVY, FP_TP_TRAPPING, FP_TP_SLEEPING };
+static int fp_pressure_level(int previous, int valid, int temp, int blocked,
+    unsigned hot, unsigned limit, unsigned resume)
+{
+ /* Missing quorum is at least heavy; never relax a prior trapping state
+  * on missing data. The guard independently cuts all high votes. */
+ if (!valid) return previous >= FP_TP_TRAPPING ? FP_TP_TRAPPING : FP_TP_HEAVY;
+ /* Inclusive entry, 4 C hysteresis on heavy/trapping; moderate follows
+  * the governor's rise/predictive/recovery latch as well as its hot trip.
+  * limit/hot/resume may be lowered by the existing governor boot args. */
+ if (temp >= 770 || (previous >= FP_TP_TRAPPING && temp > 730)) return FP_TP_TRAPPING;
+ if (temp >= (int)limit || (previous >= FP_TP_HEAVY && temp > (int)limit-40)) return FP_TP_HEAVY;
+ if (blocked || temp >= (int)hot ||
+     (previous >= FP_TP_MODERATE && temp > (int)resume)) return FP_TP_MODERATE;
+ return FP_TP_NOMINAL;
+}
 static unsigned fp_khz(uint32_t row)
 {
  return row >> 30 ? (row & 255u)*19200u : 300000u;
