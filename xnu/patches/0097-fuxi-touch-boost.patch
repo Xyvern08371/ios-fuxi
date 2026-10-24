@@ -79,7 +79,7 @@
   *
 --- a/bsd/dev/fuxi_perf.c
 +++ b/bsd/dev/fuxi_perf.c
-@@ -0,0 +1,680 @@
+@@ -0,0 +1,684 @@
 +/* Opt-in touch/compile boost for SM8550. One serialized worker owns MMIO.
 + * Input/swap hooks only publish timestamps and queue work; no MMIO or sleeps.
 + * No voltage, PLL, thermal-trip or power-collapse registers are programmed.
@@ -148,6 +148,7 @@
 +static int fp_rate_temp, fp_rate_valid, fp_rate;
 +static unsigned fp_pressure_enabled;
 +static int fp_pressure = -1; /* No fabricated nominal before the first sample. */
++static uint64_t fp_pressure_since, fp_pressure_dwell; /* fall hold, 10 s */
 +static unsigned fp_enabled, fp_started, fp_ready;
 +static thread_call_data_t fp_call;
 +/* Refusals are EBUSY, never EAGAIN: userland_sysctl() retries a handler's
@@ -646,7 +647,9 @@
 +     (fp_prev_valid && fp_prev_temp >= (int)fp_hot)) fp_above_time += elapsed;
 + int safe = fp_thermal_guard(valid,temp,now,elapsed_ns);
 + if (fp_pressure_enabled)
-+  fp_pressure = fp_pressure_level(fp_pressure,valid,temp,fp_blocked,fp_hot,fp_limit,fp_resume);
++  fp_pressure = fp_pressure_hold(fp_pressure,
++      fp_pressure_level(fp_pressure,valid,temp,fp_blocked,fp_hot,fp_limit,fp_resume),
++      now,&fp_pressure_since,fp_pressure_dwell);
 + uint64_t used = fp_duty_used(now);
 + int duty_ok = used < fp_budget && (fp_boosted || fp_duty_count < 16);
 + fp_compile_poll(now,safe,duty_ok);
@@ -729,6 +732,7 @@
 + fp_started = 1;
 + (void)PE_parse_boot_argn("fuxitp",&fp_pressure_enabled,sizeof(fp_pressure_enabled));
 + fp_pressure_enabled = fp_pressure_enabled == 1;
++ nanoseconds_to_absolutetime(10*NSEC_PER_SEC,&fp_pressure_dwell);
 + (void)PE_parse_boot_argn("fuxicompileboost",&fp_compile_enabled,sizeof(fp_compile_enabled));
 + fp_compile_enabled = fp_compile_enabled == 1;
 + /* Keep at least two of logical 2-6 (gold/prime); otherwise ignore. */
@@ -762,7 +766,7 @@
 +#endif
 --- a/bsd/dev/fuxi_perf_logic.h
 +++ b/bsd/dev/fuxi_perf_logic.h
-@@ -0,0 +1,92 @@
+@@ -0,0 +1,102 @@
 +/* Pure policy shared with offline tests. Frequencies always come from EPSS LUT. */
 +#ifndef FUXI_PERF_LOGIC_H
 +#define FUXI_PERF_LOGIC_H
@@ -772,6 +776,16 @@
 + * this governor has no platform sleep/shutdown policy.
 + */
 +enum { FP_TP_NOMINAL, FP_TP_MODERATE, FP_TP_HEAVY, FP_TP_TRAPPING, FP_TP_SLEEPING };
++/* Rises publish at once; a fall waits until the level has held for `hold`
++ * ticks. Without it the rise latch toggled the level 11 times in the first
++ * 90 s of a boot (observed), and each change wakes every notify client. */
++static int fp_pressure_hold(int previous, int next, uint64_t now, uint64_t *since,
++    uint64_t hold)
++{
++ if (next < previous && previous >= 0 && now-*since < hold) return previous;
++ if (next != previous) *since = now;
++ return next;
++}
 +static int fp_pressure_level(int previous, int valid, int temp, int blocked,
 +    unsigned hot, unsigned limit, unsigned resume)
 +{

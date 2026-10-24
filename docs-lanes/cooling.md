@@ -440,3 +440,11 @@ Normal threads then run only on logical 2-6 (gold and prime). The A510s keep
 interrupts and bound threads. The mask must not set bits above 6 and must keep
 at least two of logical 2-6, otherwise it is ignored. GUESS: UI latency drops;
 heat and power impact are unmeasured.
+
+### Falling hold (2026-10-25)
+
+OBSERVED (first device run with `fuxitp=1`): thermald published 11 level changes
+in the first 90 s of boot, during the shader-compile burst at 50-64 C. Some
+were one log line apart: the rise latch toggled the level between nominal and
+moderate. Rises still publish at once. A fall now waits until the level has
+held for 10 s (`fp_pressure_hold`). GUESS: fewer notify wake-ups for iOS clients.

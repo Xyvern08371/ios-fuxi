@@ -624,6 +624,14 @@ int main(void) {
  assert(fp_pressure_level(0,1,770,1,620,680,580)==3);
  assert(fp_pressure_level(3,1,731,1,620,680,580)==3);
  assert(fp_pressure_level(3,1,730,1,620,680,580)==2);
+ { uint64_t since=0;
+  assert(fp_pressure_hold(-1,0,5,&since,10)==0 && since==5);
+  assert(fp_pressure_hold(0,1,6,&since,10)==1 && since==6);
+  assert(fp_pressure_hold(1,0,15,&since,10)==1 && since==6);
+  assert(fp_pressure_hold(1,2,15,&since,10)==2 && since==15);
+  assert(fp_pressure_hold(2,0,24,&since,10)==2);
+  assert(fp_pressure_hold(2,0,25,&since,10)==0 && since==25);
+  assert(fp_pressure_hold(0,0,26,&since,10)==0 && since==25); }
  for(int prev=-1;prev<=3;prev++) {
   assert(fp_pressure_level(prev,0,-400,1,620,680,580)==(prev==3?3:2));
   assert(fp_pressure_level(prev,1,450,0,620,680,580)==0);

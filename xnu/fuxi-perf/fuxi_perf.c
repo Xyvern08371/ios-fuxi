@@ -66,6 +66,7 @@ static uint64_t fp_rate_elapsed;
 static int fp_rate_temp, fp_rate_valid, fp_rate;
 static unsigned fp_pressure_enabled;
 static int fp_pressure = -1; /* No fabricated nominal before the first sample. */
+static uint64_t fp_pressure_since, fp_pressure_dwell; /* fall hold, 10 s */
 static unsigned fp_enabled, fp_started, fp_ready;
 static thread_call_data_t fp_call;
 /* Refusals are EBUSY, never EAGAIN: userland_sysctl() retries a handler's
@@ -564,7 +565,9 @@ static void fp_worker_locked(thread_call_param_t arg, thread_call_param_t result
      (fp_prev_valid && fp_prev_temp >= (int)fp_hot)) fp_above_time += elapsed;
  int safe = fp_thermal_guard(valid,temp,now,elapsed_ns);
  if (fp_pressure_enabled)
-  fp_pressure = fp_pressure_level(fp_pressure,valid,temp,fp_blocked,fp_hot,fp_limit,fp_resume);
+  fp_pressure = fp_pressure_hold(fp_pressure,
+      fp_pressure_level(fp_pressure,valid,temp,fp_blocked,fp_hot,fp_limit,fp_resume),
+      now,&fp_pressure_since,fp_pressure_dwell);
  uint64_t used = fp_duty_used(now);
  int duty_ok = used < fp_budget && (fp_boosted || fp_duty_count < 16);
  fp_compile_poll(now,safe,duty_ok);
@@ -647,6 +650,7 @@ void fuxi_perf_start(void)
  fp_started = 1;
  (void)PE_parse_boot_argn("fuxitp",&fp_pressure_enabled,sizeof(fp_pressure_enabled));
  fp_pressure_enabled = fp_pressure_enabled == 1;
+ nanoseconds_to_absolutetime(10*NSEC_PER_SEC,&fp_pressure_dwell);
  (void)PE_parse_boot_argn("fuxicompileboost",&fp_compile_enabled,sizeof(fp_compile_enabled));
  fp_compile_enabled = fp_compile_enabled == 1;
  /* Keep at least two of logical 2-6 (gold/prime); otherwise ignore. */

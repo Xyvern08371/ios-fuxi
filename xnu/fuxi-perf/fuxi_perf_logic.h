@@ -7,6 +7,16 @@
  * this governor has no platform sleep/shutdown policy.
  */
 enum { FP_TP_NOMINAL, FP_TP_MODERATE, FP_TP_HEAVY, FP_TP_TRAPPING, FP_TP_SLEEPING };
+/* Rises publish at once; a fall waits until the level has held for `hold`
+ * ticks. Without it the rise latch toggled the level 11 times in the first
+ * 90 s of a boot (observed), and each change wakes every notify client. */
+static int fp_pressure_hold(int previous, int next, uint64_t now, uint64_t *since,
+    uint64_t hold)
+{
+ if (next < previous && previous >= 0 && now-*since < hold) return previous;
+ if (next != previous) *since = now;
+ return next;
+}
 static int fp_pressure_level(int previous, int valid, int temp, int blocked,
     unsigned hot, unsigned limit, unsigned resume)
 {
