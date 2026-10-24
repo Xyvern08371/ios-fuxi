@@ -56,6 +56,9 @@ struct NativeAdrenoAbiBoAllocReply {
  * call BoImport). Reply is NativeAdrenoAbiBoAllocReply. The original CPU cache
  * policy is preserved; no CPU-map token is issued. Kernel cleans/invalidates
  * imported mappings before submit and invalidates after retirement/drain.
+ * fuxigpuncimport=1 instead cleans GPU-writable imports once at map time;
+ * it requires NO CPU writes until unmap, including between submissions.
+ * Completion/drained-fault invalidation is retained for CPU readers.
  * GPU access uses Normal NC, outer-shareable SMMU leaves. Caller must keep the
  * original allocation alive and externally synchronize CPU/other GPU access.
  * BoFree/task death unmaps and unwires after DMA retirement, or quarantines on

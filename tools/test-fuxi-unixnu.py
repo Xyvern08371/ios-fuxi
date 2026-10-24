@@ -228,6 +228,7 @@ DISPLAY_PREFIX = r'''
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <stdarg.h>
 #include <vector>
 #include "fuxi_unixnu_copy.h"
 #include "fuxi_unixnu_display.h"
@@ -263,7 +264,14 @@ static int fuxi_gpu_scanout_owned(void) {return scanOwned;}
 static unsigned scanPublications;
 static int fuxi_gpu_scanout_acquire(void) {return scanAcquire;}
 static int fuxi_gpu_scanout_publish(void) {scanPublications++;return scanPublish;}
-static int IOLog(const char *,...) {logs++;return 0;}
+static char importStatsLog[2048];
+static int IOLog(const char *format,...) {
+ logs++;
+ if(strstr(format,"bytes cumulative")) {
+  va_list args;va_start(args,format);vsnprintf(importStatsLog,sizeof(importStatsLog),format,args);va_end(args);
+ }
+ return 0;
+}
 static void *IOMallocData(unsigned n) {return malloc(n);}
 static void IOFreeData(void *p,unsigned) {free(p);}
 struct IOTimerEventSource {uint64_t next=0;void wakeAtTime(int,uint64_t n,int){next=n;arms++;}};
@@ -286,6 +294,8 @@ static int sweet_console_muted=1;
 static int sweet_surface_gpu_copy(SweetSurface *,uintptr_t,int,int,int,int,int,int){return gpuMode;}
 static int sweet_surface_gpu_poll(uint64_t *elapsed) {*elapsed=42;return pollMode;}
 struct fg_times {uint64_t pin,lookup,map,clean,submit,wait,unmap,cpu;unsigned attempts,hits,misses,sleeps,blocks,groups;};
+static void fuxi_gpu_import_stats(uint64_t *cleaned,uint64_t *skipped,uint64_t *invalidated,
+ uint64_t *mapped,unsigned *imports) {*cleaned=64;*skipped=128;*invalidated=64;*mapped=16384;*imports=1;}
 static void sweet_surface_gpu_stats(fg_times *t){memset(t,0,sizeof(*t));}
 static unsigned sweet_fb_swaps_logged=16;
 static uint64_t sweet_fb_swap_count;
@@ -344,6 +354,11 @@ int main(void) {
  for(int off=0;off<2;off++)for(int black=0;black<2;black++)for(int dirty=0;dirty<2;dirty++)
  for(int gpu=0;gpu<2;gpu++)for(int notify=0;notify<2;notify++)
   assert(!!fuxi_unixnu_tick_wanted(off,black,dirty,gpu,notify)==!!(gpu||notify||(off?black:dirty)));
+ // The periodic production diagnostic includes actual import snapshots in
+ // the right columns; values are cumulative, not reset with present counters.
+ fb.fStatFrames=599;pollMode=1;gpuMode=0;
+ fb.swap(rec);fb.vsyncFired(&fb,&timer);
+ assert(!fb.fStatFrames && strstr(importStatsLog,"imports 1 mapped 16384 cache cleaned 64 skipped 128 invalidated 64 bytes cumulative"));
  puts("PASS: actual framebuffer present/tick/swap: demand wake/idle, GPU retirement/fallback, blanking and shadow invalidation");
 }
 '''

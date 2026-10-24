@@ -11,6 +11,10 @@ struct fg_times {
 /* Full-range lookup only; zero for unpublished, wrapping or unknown PAs. */
 uintptr_t fuxi_gpu_nc_pointer(uint64_t pa, uint64_t bytes);
 int fuxi_gpu_ready(void);
+/* Cumulative ABI cache bytes (including initial map clean), plus live imports.
+ * Snapshot under the GPU lock; no counter reset or ownership change. */
+void fuxi_gpu_import_stats(uint64_t *cleaned, uint64_t *skipped, uint64_t *invalidated,
+    uint64_t *mapped, unsigned *imports);
 /* Default-off command-mode handoff. configure is called before GPU startup.
  * acquire: 1 CPU/GPU may write, 0 deferred, -1 held. publish: 1 transferred,
  * 0 old path (caller kicks), -1 held. All calls are nonblocking.

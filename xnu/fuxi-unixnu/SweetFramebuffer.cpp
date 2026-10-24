@@ -203,6 +203,21 @@ OSDefineMetaClassAndStructors(IOMobileFramebufferUserClient, IOUserClient);
 extern "C" void fuxi_display_kick(void);
 #endif
 
+/* NativeMetal c6d29ca (MIT): prioritize the path carrying frames to screen.
+ * Here IOTimerEventSource executes vsyncFired/present on its thread-call,
+ * under the work-loop gate; raising only the IOWorkLoop thread misses it.
+ * See bsd/dev/LICENSE.NativeMetal. Keep scheduling changes opt-in.
+ * Default is KERNEL_HIGH, not user default.
+ */
+static uint32_t sweet_fb_timer_options(void)
+{
+	uint32_t high = 0;
+#if defined(FUXI)
+	PE_parse_boot_argn("fuxifbprio", &high, sizeof(high));
+#endif
+	return high == 1 ? kIOTimerEventSourceOptionsPriorityHigh : kIOTimerEventSourceOptionsDefault;
+}
+
 bool
 AppleCLCD::start(IOService *provider)
 {
@@ -261,7 +276,9 @@ AppleCLCD::start(IOService *provider)
 	}
 	if (fUnixnuIdle) IOLog("FUXI UNIXNU FB: demand timer enabled, software 60 Hz, panel power inherited\n");
 #endif
-	fVsync = IOTimerEventSource::timerEventSource(this, &AppleCLCD::vsyncFired);
+	uint32_t timerOptions = sweet_fb_timer_options();
+	if (timerOptions == kIOTimerEventSourceOptionsPriorityHigh)
+		IOLog("FUXI SCANOUT: present timer THREAD_CALL_PRIORITY_HIGH\n");	fVsync = IOTimerEventSource::timerEventSource(timerOptions, this, &AppleCLCD::vsyncFired);
 	if (fVsync == NULL || fWorkLoop->addEventSource(fVsync) != kIOReturnSuccess) {
 		IOLog("SWEET FB: no vsync timer\n");
 		return false;
@@ -453,7 +470,7 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
   int writable = fuxi_gpu_scanout_acquire();
   if (writable != 1) {
    fb->fScanoutHeld = writable < 0;
-   fb->fScanoutDefers++;
+   fb->fScanoutDefers++; /* ownership/drain poll, not a dropped frame or scheduler delay */
    IOLockUnlock(fb->fLock);
    sweet_fb_rearm(fb, sender);
    return;
@@ -755,6 +772,9 @@ AppleCLCD::present(const uint8_t *rec)
 		absolutetime_to_nanoseconds(fGpuTime, &gpu_ns);
 		absolutetime_to_nanoseconds(fCpuTime, &cpu_ns);
 		struct fg_times split;
+		uint64_t cleaned, skipped, invalidated, mapped;
+		unsigned imports;
+		fuxi_gpu_import_stats(&cleaned, &skipped, &invalidated, &mapped, &imports);
 		sweet_surface_gpu_stats(&split);
 		uint64_t ticks[] = {split.pin, split.lookup, split.map, split.clean,
 		    split.submit, split.wait, split.unmap, split.cpu};
@@ -767,11 +787,13 @@ AppleCLCD::present(const uint8_t *rec)
 		}
 		IOLog("FUXI GPU: presents GPU %u CPU %u, GPU retire avg %llu us CPU avg %llu us, "
 		    "split pin %llu lookup %llu map+TLB %llu clean %llu submit %llu wait %llu unmap %llu us, "
-		    "GPU CPU-time %llu us, cache hit %u miss %u, sleeps %u, 2M %u 64K %u, busy ticks %u failed %u\n",
+		    "GPU CPU-time %llu us, cache hit %u miss %u, sleeps %u, 2M %u 64K %u, busy ticks %u failed %u, "
+		    "imports %u mapped %llu cache cleaned %llu skipped %llu invalidated %llu bytes cumulative\n",
 		    fGpuFrames, fCpuFrames, fGpuFrames ? gpu_ns / 1000 / fGpuFrames : 0ULL,
 		    fCpuFrames ? cpu_ns / 1000 / fCpuFrames : 0ULL,
 		    us[0], us[1], us[2], us[3], us[4], us[5], us[6], us[7],
-		    split.hits, split.misses, split.sleeps, split.blocks, split.groups, fGpuBusyTicks, fGpuFailed);
+		    split.hits, split.misses, split.sleeps, split.blocks, split.groups, fGpuBusyTicks, fGpuFailed,
+		    imports, mapped, cleaned, skipped, invalidated);
 		fGpuBusyTicks = fGpuFailed = 0;
 		fGpuFrames = fCpuFrames = 0;
 		fGpuTime = fCpuTime = 0;

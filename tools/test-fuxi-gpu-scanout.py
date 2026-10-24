@@ -142,7 +142,7 @@ def kernel_syntax(buildtree):
         for path in (ROOT / 'xnu/fuxi-adreno').iterdir():
             if path.suffix in ('.h', '.inc', '.c'):
                 (dev / path.name).write_bytes(path.read_bytes())
-        for name in ('gpu.c', 'gpu-a740.h', 'gpu-zap.h', 'gpu-handoff.h'):
+        for name in ('gpu.c', 'gpu-a740.h', 'gpu-zap.h', 'gpu-handoff.h', 'gpu-clock.h'):
             (dev / name).write_bytes((ROOT / 'shim/fuxi-probe' / name).read_bytes())
         (arm / 'SweetSurface.cpp').write_bytes((ROOT / 'xnu/fuxi-scanout/SweetSurface.cpp').read_bytes())
         # Check the modified console function against the complete preexisting TU.
@@ -170,7 +170,17 @@ def kernel_syntax(buildtree):
             original = pe.read_text()
         assert before in original
         pe.write_text(original.replace(before, (ROOT / 'xnu/fuxi-scanout/display-kick.c').read_text()))
-        for comp, path in [('bsd', dev / 'fuxi_adreno.c'), ('iokit', arm / 'SweetSurface.cpp'), ('pexpert', pe)]:
+        # Compile the new union delta against the complete local saved XNU TU.
+        lookup = temp / 'bsd/vfs/vfs_lookup.c'
+        lookup.parent.mkdir(parents=True)
+        lookup.write_bytes((buildtree / 'xnu/bsd/vfs/vfs_lookup.c').read_bytes())
+        (lookup.parent / 'fuxi_unixnu_lookup.h').write_bytes(
+            (ROOT / 'xnu/fuxi-unixnu/fuxi_unixnu_lookup.h').read_bytes())
+        subprocess.run(['git', 'apply', '--check', str(ROOT / 'xnu/patches/0110-fuxi-union-lower-directory.patch')],
+                       cwd=temp, check=True)
+        subprocess.run(['git', 'apply', str(ROOT / 'xnu/patches/0110-fuxi-union-lower-directory.patch')],
+                       cwd=temp, check=True)
+        for comp, path in [('bsd', dev / 'fuxi_adreno.c'), ('iokit', arm / 'SweetSurface.cpp'), ('pexpert', pe), ('bsd', lookup)]:
             cwd = config / comp / 'DEVELOPMENT'
             old_root = re.search(r'^SOURCE_DIR=(.+)/xnu$', (cwd / 'Makefile').read_text(), re.M)[1]
             raw = (cwd / '.CFLAGS').read_text().replace('\0', '')

@@ -147,7 +147,11 @@ static uint64_t ticks;
 static uint64_t counter(const char *name) {return strcmp(name,"cntfrq_el0")?ticks:1000000;}
 #define rsr(r) counter(r)
 static unsigned fg_access_failed,fg_busy,fg_client_busy,g3_wptr,g3_bank=2,g3_asid=3;
-static unsigned cacheClean,cacheInvalidate;
+static unsigned cacheClean,cacheInvalidate,ncimportArg;
+static int PE_parse_boot_argn(const char *name,void *value,size_t bytes) {
+ assert(!strcmp(name,"fuxigpuncimport") && bytes==sizeof(unsigned));
+ memcpy(value,&ncimportArg,bytes);return ncimportArg!=0;
+}
 static void host_cache(uintptr_t p,int complete) { assert(!(p&63)); if(complete) cacheInvalidate++; else cacheClean++; }
 static uint64_t fg_faults,fg_suspends;
 static unsigned state=1,drains,drainGood=1,fault,tlbs,failTlb,doorbells,enqueued;
@@ -193,7 +197,8 @@ static void seed(void) {
  fg_abi_live=fg_abi_seq=fg_abi_completed=fg_abi_poisoned=fg_abi_timed_out=0;fg_abi_hang_dumped=0;
  fg_faults=fg_suspends=highReads=rollover=0;
  ticks=tlbs=failTlb=doorbells=enqueued=drains=fault=cacheClean=cacheInvalidate=0;
- memset(fg_abi_imports,0,sizeof(fg_abi_imports));fg_abi_host_handoff=0;
+ memset(fg_abi_imports,0,sizeof(fg_abi_imports));fg_abi_host_handoff=fg_abi_ncimport=ncimportArg=0;
+ fg_abi_cleaned=fg_abi_skipped=fg_abi_invalidated=0;
  readFault=sreadFault=writeFail=writeCount=logLines=hangLines=0;
 }
 static void reset(void) {
@@ -381,6 +386,43 @@ int main(void) {
  failTlb=1;assert(fuxi_gpu_abi_unmap(va,16384)==-1);
  assert(!cacheClean && !cacheInvalidate); // no submit: preserve dirty CPU data
  puts("PASS: imported BO cache handoff covers indirect resources, watchdog retirement, drained fault and undrained quarantine");
+ // Optional writable-import lifetime handoff. NC SMMU attributes stay equal;
+ // only initial map clean replaces per-submit clean. Completion still IVACs.
+ for(unsigned arg=0;arg<3;arg++) {
+  seed();ncimportArg=arg;assert(fg_abi_init());
+  assert(fg_abi_ncimport==(arg==1));
+  assert(!fuxi_gpu_abi_map_import(va,source,32768,3));
+  assert(!(*fg_abi_leaf(va)&(1u<<2)) && ((*fg_abi_leaf(va)>>8)&3)==2);
+  assert(!fuxi_gpu_abi_map_import(va+0x10000,source+65536,16384,1));
+  assert(cacheClean==(arg==1?512u:0u));
+  // Rejected/overlapping and busy maps must never do a cache handoff.
+  unsigned before=cacheClean;
+  assert(fuxi_gpu_abi_map_import(va,source,16384,3)==-1 && cacheClean==before);
+  for(unsigned frame=0;frame<2;frame++) {
+   assert(!fuxi_gpu_abi_submit(addresses,sizes,1,&fence));
+   before=cacheClean;
+   assert(fuxi_gpu_abi_map_import(va+0x20000,source,16384,3)==1 && cacheClean==before);
+   complete();assert(!fuxi_gpu_abi_poll(fence));
+  }
+  uint64_t cleaned,skipped,invalidated,mapped;unsigned imports;
+  fuxi_gpu_import_stats(&cleaned,&skipped,&invalidated,&mapped,&imports);
+  assert(imports==2 && mapped==49152 && invalidated==98304);
+  assert(cleaned==(arg==1?65536u:98304u) && skipped==(arg==1?65536u:0u));
+  assert(cacheClean==cleaned/64 && cacheInvalidate==invalidated/64);
+  assert(!fuxi_gpu_abi_unmap(va,32768));
+  fuxi_gpu_import_stats(&cleaned,&skipped,&invalidated,&mapped,&imports);
+  assert(imports==1 && mapped==16384);
+ }
+ for(unsigned good=0;good<2;good++) {
+  seed();ncimportArg=1;assert(fg_abi_init());drainGood=good;
+  assert(!fuxi_gpu_abi_map_import(va,source,16384,3));
+  assert(!fuxi_gpu_abi_submit(addresses,sizes,1,&fence));
+  ticks=100001;fg_abi_watch(NULL,NULL);
+  assert(cacheClean==256 && cacheInvalidate==good*256 && fg_abi_skipped==16384);
+  assert(fuxi_gpu_abi_unmap(va,16384)==(good?0:-2));
+ }
+ puts("PASS: opt-in NC-import map handoff, indirect RW/RO policy, repeated submits, byte counters, map failure/busy and fault quarantine");
+
  puts("PASS: actual backend root isolation, 16K/4K scattered leaves, VA reuse/TLBI, present exclusion, late retirement, independent watchdog/fault/drain/quarantine");
 }
 '''

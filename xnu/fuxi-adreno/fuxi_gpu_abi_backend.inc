@@ -19,21 +19,51 @@ static thread_call_data_t fg_client_watchdog;
 /* Every mapped import can be referenced indirectly by PM4, not just the IB
  * list. Serialize cache handoff with the same GPU lock as submit/retirement.
  * The user client owns these prepared kernel mappings until successful unmap. */
-static struct { uint64_t iova, bytes; uintptr_t source; } fg_abi_imports[FG_ABI_MAX_IMPORTS];
-static unsigned fg_abi_host_handoff;
+static struct { uint64_t iova, bytes; uintptr_t source; unsigned permissions; } fg_abi_imports[FG_ABI_MAX_IMPORTS];
+static unsigned fg_abi_host_handoff, fg_abi_ncimport;
+static uint64_t fg_abi_cleaned, fg_abi_skipped, fg_abi_invalidated;
+static void fg_abi_cache_region(uintptr_t source, uint64_t bytes, int complete)
+{
+ uintptr_t end=source+bytes;
+ for (uintptr_t p=source;p<end;p+=64) {
+  if (complete) { __asm__ volatile("dc ivac, %0" :: "r"(p) : "memory"); }
+  else { __asm__ volatile("dc civac, %0" :: "r"(p) : "memory"); }
+ }
+ if (complete) fg_abi_invalidated+=bytes;
+ else fg_abi_cleaned+=bytes;
+}
 static void fg_abi_import_cache(int complete)
 {
  if (complete && !fg_abi_host_handoff) return;
  __asm__ volatile("dsb sy" ::: "memory");
  for (unsigned i=0;i<FG_ABI_MAX_IMPORTS;i++) if (fg_abi_imports[i].iova) {
-  uintptr_t end=fg_abi_imports[i].source+fg_abi_imports[i].bytes;
-  for (uintptr_t p=fg_abi_imports[i].source;p<end;p+=64) {
-   if (complete) { __asm__ volatile("dc ivac, %0" :: "r"(p) : "memory"); }
-   else { __asm__ volatile("dc civac, %0" :: "r"(p) : "memory"); }
+  /* NativeAdreno b686b90 (MIT), adapted: GPU-written imports are already
+   * NC in our SMMU. Opt-in requires NO CPU writes for their mapped lifetime,
+   * not merely while a submission is in flight. Clean once at map, then
+   * avoid re-cleaning unchanged CPU lines on every indirect PM4 use.
+   * Permissions alone do NOT prove CPU immutability: keep default off.
+   * Unlike upstream, retain completion IVAC: CPU readers (fallback/pixel
+   * oracle) may have cached an older frame. Never clean over GPU writes.
+   * Read-only imports may change on CPU between submissions; keep cleaning.
+   * An IB list is not a resource list, so keep walking ALL mapped imports. */
+  if (!complete && fg_abi_ncimport && (fg_abi_imports[i].permissions&2)) {
+   fg_abi_skipped+=fg_abi_imports[i].bytes;
+   continue;
   }
+  fg_abi_cache_region(fg_abi_imports[i].source,fg_abi_imports[i].bytes,complete);
  }
  __asm__ volatile("dsb sy" ::: "memory");
  fg_abi_host_handoff=!complete;
+}
+void fuxi_gpu_import_stats(uint64_t *cleaned, uint64_t *skipped, uint64_t *invalidated,
+    uint64_t *mapped, unsigned *imports)
+{
+ FG_GUARD;
+ *cleaned=fg_abi_cleaned; *skipped=fg_abi_skipped; *invalidated=fg_abi_invalidated;
+ *mapped=0; *imports=0;
+ for (unsigned i=0;i<FG_ABI_MAX_IMPORTS;i++) if (fg_abi_imports[i].iova) {
+  *mapped+=fg_abi_imports[i].bytes; ++*imports;
+ }
 }
 static volatile uint64_t *fg_abi_leaf(uint64_t iova)
 {
@@ -124,6 +154,8 @@ static void fg_abi_watch(thread_call_param_t arg, thread_call_param_t unused)
 }
 static int fg_abi_init(void)
 {
+ (void)PE_parse_boot_argn("fuxigpuncimport",&fg_abi_ncimport,sizeof(fg_abi_ncimport));
+ fg_abi_ncimport=fg_abi_ncimport==1;
  /* 772 4K pages: root, two L2s, kernel runtime L3, 768 client L3s.
   * Allocate all table storage from unused reserved NC scratch, never VM.
   * No existing GMU or present PTE is reused as mutable client storage. */
@@ -286,6 +318,14 @@ int fuxi_gpu_abi_map_import(uint64_t iova, uintptr_t source, uint64_t bytes, uns
  if (slot==FG_ABI_MAX_IMPORTS) return -1;
  int s=fg_abi_map_locked(iova,source,bytes,permissions,0,2);
  if (!s) {
+  if (fg_abi_ncimport && (permissions&2)) {
+   /* Before the first GPU use: publish preexisting CPU pixels/dirty lines.
+    * The GPU lock prevents any submission until this handoff has finished. */
+   __asm__ volatile("dsb sy" ::: "memory");
+   fg_abi_cache_region(source,bytes,0);
+   __asm__ volatile("dsb sy" ::: "memory");
+  }
+  fg_abi_imports[slot].permissions=permissions;
   fg_abi_imports[slot].source=source; fg_abi_imports[slot].bytes=bytes; fg_abi_imports[slot].iova=iova;
  }
  return s;

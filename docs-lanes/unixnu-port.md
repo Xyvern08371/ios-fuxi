@@ -306,3 +306,194 @@ telemetry with the same workload, startup temperature and monitor settings.
 If any option regresses, omit just that option on the next temporary boot;
 reboot is required to clear a quarantined UFS allocation. No runtime toggle,
 flash operation or automatic deployment is part of 0106.
+
+## UniXNU 2026-10-24 port
+
+Offline review of the supplied upstream diffs and two saved boot logs. Sources
+remain canonical in `xnu/fuxi-adreno/` and `xnu/fuxi-unixnu/`, synchronized into
+0098 and 0106. New patch **0110** integrates the lower-directory check into
+XNU's existing union traversal. All three new switches require the exact
+integer value **1**, default off. No deployment or hardware test was performed.
+
+### Sources and dispositions
+
+| Project / repository | Commit and license | Result |
+| --- | --- | --- |
+| [UniXNU NativeAdreno](https://github.com/UniXNU/NativeAdreno) | `b686b9054f57d393c80195b82568a09f8ca106a2`, MIT | Adapt writable-import cache handoff, retaining completion invalidation; `fuxigpuncimport=1`. Existing `LICENSE.NativeAdreno` retained. |
+| Same | `26220f1ab79fec643517336fbd81574bd1e0d05a`, MIT | Already present: `fuxi_abi_wire.h` programs IFPC off (`P1(0x65,0x101)`); no power sequencing change. |
+| [UniXNU NativeMetal](https://github.com/UniXNU/NativeMetal) | `c6d29caad6d880cc8204ebe3bc34d77479a3255d`, MIT | Adapt screen-delivery priority to the kernel timer callback; `fuxifbprio=1`. Existing `LICENSE.NativeMetal` retained. No NativeMetal source tree modified or vendored. |
+| Same | `dce1bdc468716bfa9e8f58ac05bfacdec6b6128a`, `eed65758722bd4a1219de5161a8ed9ef0bc547da`, MIT | Already at the final setting: `ClientSetup.hpp` supplies `TU_DEBUG=sysmem,nocb` without overwriting an explicit environment value. Do not restore the superseded `nobin,nocb`. |
+| [UniXNU NativeMobileDisplay](https://github.com/UniXNU/NativeMobileDisplay) | `8666a9950c9699b368931d18cac92c0fdb2ce9c0`, BSD-2-Clause-Patent | Reviewed; retirement timing is inapplicable to our current immediate-success SwapWait stub. No `fuxiearlyretire` switch or early-retirement counters added; explanation below. |
+| Same | `c99046af4ac1cecfcef2575bb0025d2e21e005a4`, BSD-2-Clause-Patent | Deferred: no original-family `getRefreshAttributes` implementation/interval layout exists in our reconstructed framebuffer ABI. Our software timer is already fixed at 60 Hz; this does not prove what userland assumes for unimplemented refresh queries. |
+| [UniXNU superproject](https://github.com/UniXNU/UniXNU) | `cb0749940c598f2bd7fb113c1a660fcc2fd825ce`, BSD-2-Clause-Patent | Port lower-directory eligibility/iocount handling; `fuxiuniondir=1`. Notice retained in `LICENSE.UniXNU`. Skip unrelated MobileSafari lookup tracing. |
+| Same | `477e530a8689af4a09eacb4eb9bdb878c737d8b6`, BSD-2-Clause-Patent | Inapplicable: no `native-4k-signature-hash-cache.patch`/`cs_native4k_prepare` in our patch stack. Our 16 KiB kernel uses the existing signature path, not their native 4 KiB rehashing pass. Adding 1 MiB reads/IO_NOCACHE without that consumer has no effect. |
+| Same | `11c818217b7ba90fb8d3e356d4f1ede88f952cf6`, BSD-2-Clause-Patent | Inapplicable: no `native_sandbox_grant`/`NativeSandboxGrantProcess` machinery. Patch 0050 registers a permissive Sandbox policy with no `mpo_iokit_check_set_properties` hook. Do not add a second bypass for a restriction this policy does not impose. |
+| Same | `52d18cef78f362d7ca0c72865fc97d1b98bf4a15`, BSD-2-Clause-Patent | Already covered: `Translator::cacheIdentity` requires `fuxi_m2v_cache_identity`; its SHA-256 covers translator pin, adapter source, translator `SOURCE_DIGEST`, semantics and artifact versions. `Backend.hpp` requires this identity for persistent products; `ArtifactCache.hpp` validates it on load. Missing identity keeps memory-only operation. No upstream build script or padded-row translator patch copied. |
+
+Both UniXNU and HackiOS are already credited in README. The supplied HackiOS
+kernel diff changes the APFS extractor prerequisite and QEMU's ramfb height,
+which do not affect this physical panel/GPU path. The userland diff adds a
+thermal notification daemon for `kern.redwood.thermal_*`, a stress probe, and
+boot-state writes for its bundle loader/store layout. Fuxi exposes a different
+thermal API and uses a different loader/storage contract. These are skipped,
+not assumed to be GPU fixes; their diffs contain no commit identifiers, and
+no code from them is copied. Existing credits identify
+[HackiOS kernel](https://github.com/oosexgang/hackios-xnu-kernel) (APSL 2.0) and
+[HackiOS userland](https://github.com/oosexgang/hackios-xnu-userland) (MIT).
+No unrelated older superproject patch inventory is imported. Reference diffs
+were read only, never executed or built. No GPL code, firmware, Apple binaries,
+Mesa/metal2vulkan/NativeMetal source changes, or research artifacts are included.
+
+### OBSERVED: import work and traces
+
+The production `fg_abi_import_cache()` previously CIVACed **every mapped
+import** before every submission and IVACed each at completion, under the GPU
+mutex. Imports already use Normal NC, outer-shareable SMMU leaves (`wb=0`,
+`sh=2`); copying upstream's coherent/non-coherent mapping change is unnecessary.
+Read-only GPU permissions do not mean the CPU's bytes stayed unchanged, and
+PM4 can reference resources indirectly. An IB-only cache walk would be wrong.
+
+Saved `boot-cores98.log` reports four IOSurface-import admissions and
+`boot-use95.log` eleven, with row stride 4608 and allocation **11,239,424 B**
+for 1125x2436 BGRA. These are log events, **not simultaneous live-import
+counts**. Both contain 17 successful map trace rows, but the 64-row ABI trace
+budget mixes ordinary BOs/imports and stops early. There is no complete live
+import-byte census in either log; multiplying those event counts as if all
+were resident would overstate the evidence.
+
+One allocation covers **175,616 cache lines** at 64 B/line, hence **351,232
+cache instructions per submission/completion pair**. For N such live imports,
+the old walk executes `351232 * N` operations even if only one is used.
+After the initial map-time clean, the option saves `175616 * Nw` CIVACs per
+submission for Nw writable allocations; completion IVACs remain.
+
+`boot-cores98.log` has four nonempty frame-trace windows (2, 1, 78 and 13
+samples). Its `backend_submit` p50/p90 pairs in ms are **1.034/4.194,
+1.512/1.512, 1.262/1.534, 1.874/1.967**; corresponding `gpu_wait` pairs are
+**2.504/2.943, 2.781/2.781, 1.856/4.338, 7.173/7.543**. These include other
+backend/wait work; they do not isolate cache cost or establish upstream's
+roughly 60 ms/frame claim on this board. `boot-use95.log` has no frame-trace
+samples. Its scanout summary reports 120 frames, 118 GPU/2 CPU,
+copy average **1231 us**, maximum **2227 us**, `deferred=730`.
+
+### GUESS: cost and likely benefit
+
+Cache cost depends on dirty residency, memory traffic and CPU frequency.
+For one logged allocation, a hypothetical average 10 ns per maintenance
+instruction makes the old pair about **3.51 ms** and the skipped half about
+**1.76 ms**; at 1 ns these are 0.351/0.176 ms. These are sensitivity estimates,
+not measured latency or predicted savings. The sampled submit times argue
+against asserting a persistent 60 ms submit penalty here. Multiple resident
+imports can still turn the all-import walk into meaningful lock contention.
+The new live-count/byte and cumulative-maintenance counters enable an actual
+before/after comparison; no UI speedup is claimed from host tests.
+
+### Cache ownership and diagnostics: `fuxigpuncimport=1`
+
+This opt-in borrows upstream's immutable CPU-pixels assumption only for GPU
+writable imports (permissions bit 2). It CIVACs the whole import once on a
+successful map, before the GPU lock permits any submission. Subsequent submits
+skip its CIVAC. **No CPU writer, including an alias or a CPU fallback renderer,
+may modify that allocation until it is unmapped**, even between GPU fences.
+The existing ABI has no dirty-generation protocol to prove this: writable GPU
+permissions alone are insufficient. Disable the option for mixed CPU/GPU
+writers or CPU initialization after mapping. The ordinary default remains
+submission-scoped cache handoff and permits synchronized CPU updates.
+
+Unlike upstream, completion and confirmed-drain fault paths still IVAC all
+imports before publishing successful fences or releasing memory. This retains
+CPU-reader/pixel-oracle visibility across frames without cleaning stale CPU
+lines over GPU writes. Failed DMA drains still quarantine imports, with no
+cache operation/release that implies completion. Read-only imports retain
+normal submit cleaning and completion invalidation. The map attributes, PM4,
+ABI version, watchdog and shared-ring exclusion are unchanged.
+
+The existing 600-frame `FUXI GPU: presents` line now appends `imports`, `mapped`,
+`cache cleaned`, `skipped`, and `invalidated` bytes. Import count/bytes are a
+locked live snapshot; cache-byte counters are cumulative since boot and include
+initial map cleans. Counter reads release the mutex before printing. With the
+option absent, skipped bytes must stay zero. Compare deltas, not absolute
+cumulative counts, and check the live byte census before estimating cost.
+
+### Presentation priority and retirement
+
+`fuxifbprio=1` selects `kIOTimerEventSourceOptionsPriorityHigh`, which maps to
+`THREAD_CALL_PRIORITY_HIGH`. This is where `vsyncFired` actually polls the
+copy, invokes `present`, and kicks the panel, while holding the work-loop gate.
+Raising only the IOWorkLoop thread or FuxiMetal's pipeline compilation queue
+would miss this callback. The old timer already used KERNEL_HIGH; NativeMetal's
+reported user-default queue contention and measured benefit are not assumed
+for Fuxi. Default scheduling and the 100 ms ABI watchdog priority stay intact.
+
+`deferred` counts **polls**, including two sites: an unsuccessful scanout
+ownership acquisition (mandatory 20 ms drain, transfer still active, busy GPU,
+or a held/error state), and a source-writer/ring deferral in `present`. It is
+not a frame-drop or scheduler-lateness counter. Pending swaps stay queued and
+writers are blocked during the in-flight copy. A higher priority cannot bypass
+the drain, GPU fences or the source lease. The fixed 20 ms guard already limits
+sustained manual-transfer pacing to less than 50 Hz before copy overhead;
+reducing it without panel completion evidence risks tearing and is not done.
+
+Upstream 8666a99 moves its original-family completion earlier because its
+compositor waits for retirement. Here selector 6 (`SwapWait`, seen with three
+scalar inputs in both logs) already returns success immediately; `SwapEnd`
+queues the latest frame and also returns immediately. There is no owned
+original-family swap request, `completeCurrentSwap`, completion-report queue,
+or implemented retirement notification to move. The GPU copy retains its own
+SweetSurface reference until the fence; `fGpuPending` prevents a following
+copy/black fill, and producer surface leases prevent reuse during that copy.
+Thus producer acknowledgement is already earlier than upstream's change.
+Adding `fuxiearlyretire=1` and incrementing counters here would label an event
+without changing retirement. A real implementation first needs the iOS 16.7
+SwapWait/completion ABI and generation-aware pending/superseded/error handling;
+this port does not invent those semantics or claim early-retirement speedup.
+
+Likewise c99046a changes a private original-family refresh method that we do
+not implement. No original vtable offsets or guessed selector outputs are
+introduced. Fixed 60 Hz software notifications do not by themselves implement
+refresh attribute reporting.
+
+### Union lookup: `fuxiuniondir=1`
+
+After successful lower-layer `namei`, a non-directory vnode cannot contain the
+missing child. The opt-in helper releases that vnode's iocount and returns
+ENOENT; directories preserve the existing successful handoff. The caller still
+runs `nameidone`, initializes the output to NULL, and preserves the original
+namei failures/root handling. This addresses the upstream lower symlink versus
+upper directory case without adding per-lookup tracing. It changes an errno,
+so it is gated even though no files or mounts are changed by the option.
+
+### Validation and remaining hardware work
+
+Production-code ASan/UBSan models cover opt-in/default/invalid values, initial
+map handoff, RW/RO indirect imports over repeated submits, byte counters, busy
+and rejected maps, watchdog completion, drained/undrained faults and retained
+ownership. Existing scanout tests retain busy-source/ring, delayed publication,
+CPU fallback, blanking and full-pixel checks. The new port test checks actual
+lower-vnode policy iocount/errno ownership and default/SWEET/FUXI priority
+selection. Full modified translation units pass ARM64 syntax checks using saved
+XNU headers: GPU driver, framebuffer, surface, display kick and union lookup.
+Patch sync/application checks cover 0096/0098/0100, the preceding framebuffer
+stack plus 0106, 0108, and 0110 against the local saved lookup source.
+
+The broad Linux run passed **45** default-invocation host scripts (including
+this port's new model). `test-fuxi-metal-stage.py --policy-storage-only` and
+`test-fuxi-metal-m9i.py --compile-only` also passed. Full staging and WLAN-artifact
+checks could not run because the staged bundle/build outputs are absent; the
+full M9i run requires a supplied translator. Other translator/SDK/firmware
+artifact tests and macOS-only tests were not run. No downloads or reference
+builds were used to fill those gaps. Matching sync checks and the downstream
+0109 backlight overlay check passed as well.
+
+For a later authorized hardware A/B, add only one option at a time. For the
+cache option first establish that mapped writable imports have no CPU writers;
+compare maintenance-byte deltas and frame-trace submit/wait percentiles, and
+check pixel validation, scrolling, CPU fallback and lock/wake. For priority,
+compare frame intervals under app-launch load while retaining identical drain
+settings. For union lookup, exercise the lower-symlink/upper-directory case and
+ordinary directory traversal. Scheduling latency, real cache coherency, visual
+correctness, frame pacing and performance remain **unverified on hardware**.
+The cmdline additions cost 18, 13 and 15 bytes respectively including one
+separator (`fuxigpuncimport=1`, `fuxifbprio=1`, `fuxiuniondir=1`); they need not be
+enabled together. No early-retirement/refresh switch is added without a matching
+ABI consumer.
