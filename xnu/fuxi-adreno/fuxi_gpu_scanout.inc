@@ -85,6 +85,77 @@ static int fg_scanout_write(unsigned pa, unsigned value)
  uint64_t v = value;
  return !fg_access(pa, &v, 1, 0);
 }
+/* Poll brackets the edge between the last old count and the first new count.
+ * Two narrow, consecutive brackets establish a measured period. An IIR (1/8
+ * period, 1/4 phase) rejects polling jitter without following the software
+ * timer's phase. Never extrapolate an advancing counter through a stall.
+ * All estimator writes belong to the caller, so this API needs no FG_GUARD. */
+int fuxi_gpu_scanout_te(struct fg_te_observer *te)
+{
+ unsigned count;
+ if (!fuxi_gpu_scanout_owned() || !fg_scanout_read(FG_SCAN_INTF+0x298, &count)) {
+  te->initialized = te->samples = 0;
+  return 0;
+ }
+ uint64_t now = mach_absolute_time();
+ unsigned frame = count >> 16, nominal = fg_scanout_period_us;
+ unsigned delta = (frame - te->frame) & 0xffffu;
+ if (!te->initialized || te->nominal_us != nominal || now < te->poll ||
+     (!delta && now - te->change > te->period + te->period/4)) {
+  nanoseconds_to_absolutetime((uint64_t)nominal*1000, &te->period);
+  te->nominal_us = nominal;
+  te->frame = frame;
+  te->poll = te->change = now;
+  te->raw_edge = te->edge = 0;
+  te->initialized = 1;
+  te->samples = 0;
+  return 0;
+ }
+ uint64_t previousPoll = te->poll;
+ uint64_t bracket = now - te->poll;
+ uint64_t raw = te->poll + bracket/2;
+ te->poll = now;
+ if (!delta) return te->samples >= 2;
+ te->frame = frame;
+ te->change = now;
+ if (delta != 1 || bracket > te->period/4) {
+  /* A slow copy can straddle TE. Retain an established phase only when
+   * the counter confirms up to four edges and the prediction fits the
+   * observation bracket (allow one polling interval of phase error).
+   * Do not feed this uncertain sample back into the period filter. */
+  uint64_t predicted = te->edge + delta*te->period;
+  uint64_t tolerance = te->period/16;
+  if (te->samples >= 2 && delta <= 4 &&
+      predicted + tolerance >= previousPoll && predicted <= now + tolerance) {
+   te->edge = predicted < now ? predicted : now;
+   return 1;
+  }
+  /* Reset, implausible jump or ambiguous acquisition: reacquire. */
+  te->samples = 0;
+  te->raw_edge = 0;
+  return 0;
+ }
+ if (te->samples) {
+  unsigned frames = (frame - te->raw_frame) & 0xffffu;
+  uint64_t measured = frames ? (raw - te->raw_edge)/frames : 0;
+  if (frames > 8 || measured < te->period*3/4 || measured > te->period*5/4) {
+   te->samples = 0;
+  } else {
+   int64_t error = (int64_t)measured - (int64_t)te->period;
+   te->period += error/8;
+  }
+ }
+ if (te->samples >= 2) {
+  uint64_t predicted = te->edge + te->period;
+  int64_t error = (int64_t)raw - (int64_t)predicted;
+  te->edge = predicted + error/4;
+  if (te->edge > now) te->edge = now;
+ } else te->edge = raw;
+ te->raw_edge = raw;
+ te->raw_frame = frame;
+ if (te->samples < 2) te->samples++;
+ return te->samples >= 2;
+}
 /* Arm the per-START gates. Called with the current read pointer value. */
 static void fg_scanout_arm(unsigned count)
 {

@@ -22,6 +22,15 @@ void fuxi_gpu_import_stats(uint64_t *cleaned, uint64_t *skipped, uint64_t *inval
  */
 void fuxi_gpu_scanout_configure(uintptr_t pixels, unsigned enabled, unsigned check);
 int fuxi_gpu_scanout_owned(void);
+/* Caller-owned, zero-initialized TE observer. Use from one serialized timer;
+ * independent observers share no mutable state. No GPU lock, waits or writes.
+ * On success frame (low16), edge and period describe the latest observed TE
+ * in mach absolute units. On failure these outputs must not be used. */
+struct fg_te_observer {
+ uint64_t edge, period, poll, change, raw_edge;
+ unsigned frame, raw_frame, samples, initialized, nominal_us;
+};
+int fuxi_gpu_scanout_te(struct fg_te_observer *te);
 int fuxi_gpu_scanout_acquire(void);
 int fuxi_gpu_scanout_publish(void);
 int fuxi_gpu_scanout_reserve(void);

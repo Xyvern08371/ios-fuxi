@@ -35,9 +35,10 @@ static int interruptsOn=1;
 static boolean_t ml_set_interrupts_enabled(boolean_t value) {int old=interruptsOn;interruptsOn=value;return old;}
 static unsigned fg_scanout_requested, fg_scanout_panel120_requested, fg_busy, fg_client_busy;
 static unsigned ready=1,abiLive=1,abiResult,observations,reads,writes,starts,failAddress;
-static uint64_t ticks=1000;
-static uint64_t mach_absolute_time(void) {return ticks;}
-static void absolutetime_to_nanoseconds(uint64_t t,uint64_t *ns) {*ns=t*1000;}
+static uint64_t ticks=1000,machScale=1;
+static uint64_t mach_absolute_time(void) {return ticks*machScale;}
+static void absolutetime_to_nanoseconds(uint64_t t,uint64_t *ns) {*ns=t*1000/machScale;}
+static void nanoseconds_to_absolutetime(uint64_t ns,uint64_t *t) {*t=ns*machScale/1000;}
 static uint32_t ctl[1024],intf[1024],dsi[1024];
 static struct {unsigned pa,value;} trace[1024];
 static unsigned traceCount,dsiReads,dmaStarts,pendingDma,noDone,busyAfterDone,staleDone,frozenClock,failWriteAddress;
@@ -106,7 +107,7 @@ static void reset(void) {
  interruptsOn=1;
  errorOnDone=tearReadbackMismatch=0;
  fg_scanout_last_start=0;fg_scanout_starts=0;memset(fg_scanout_iv,0,sizeof(fg_scanout_iv));
- ticks=1000;ready=abiLive=1;abiResult=observations=reads=writes=starts=failAddress=0;
+ ticks=1000;machScale=1;ready=abiLive=1;abiResult=observations=reads=writes=starts=failAddress=0;
 }
 static void panel120_setup(void) {
  modelPanel120=1;
@@ -226,7 +227,63 @@ static void panel120_tests(uint8_t *panel) {
  assert(fuxi_gpu_scanout_acquire()==1);
  puts("PASS: panel120 opt-in, exact HS DCS/FIFO protocol, safe boundary, bounded abort/hold, tear math/order, 120Hz floor/TE/gaps");
 }
+static int te_sample(struct fg_te_observer *te,unsigned frame,uint64_t time) {
+ ticks=time;intf[0x298/4]=((frame&0xffffu)<<16)|2500;
+ return fuxi_gpu_scanout_te(te);
+}
+static void te_estimator_tests(void) {
+ reset();struct fg_te_observer te={0};unsigned before=reads;
+ assert(!fuxi_gpu_scanout_te(&te) && reads==before && !te.initialized);
+ fg_scanout_owned=1;
+ // Both mach timebase conversion and measured 60.4/120.8 Hz, with jitter
+ // independent of the TE phase. Counter wrap is not a discontinuity.
+ for(unsigned scale=1;scale<=3;scale+=2)for(unsigned mode=0;mode<2;mode++) {
+  memset(&te,0,sizeof(te));machScale=scale;
+  fg_scanout_period_us=mode?8333:16667;
+  unsigned period=mode?8278:16556,frame=65530,valid=0;
+  uint64_t origin=1000000;
+  for(uint64_t t=origin+100;t<origin+period*160ull;t+=417+(t%113)) {
+   unsigned n=(unsigned)((t-origin)/period);
+   int available=te_sample(&te,frame+n,t);
+   if(n<2)assert(!available);
+   if(available) {
+    valid++;
+    uint64_t edge=(origin+(uint64_t)n*period)*scale;
+    assert(te.frame==((frame+n)&0xffff));
+    assert(te.edge<=t*scale && te.edge+600*scale>=edge && te.edge<=edge+600*scale);
+    if(n>80)assert(te.period+100*scale>=period*scale && te.period<=(period+100)*scale);
+   }
+  }
+  assert(valid>1000 && !writes && !observations && !starts);
+  // A frozen count expires instead of extrapolating indefinitely.
+  assert(!te_sample(&te,te.frame,ticks+period*2));
+  assert(!te.samples);
+ }
+ machScale=1;fg_scanout_period_us=16667;memset(&te,0,sizeof(te));
+ assert(!te_sample(&te,1,1000000));
+ assert(!te_sample(&te,1,1016400));assert(!te_sample(&te,2,1016800));
+ assert(!te_sample(&te,2,1033000));assert(te_sample(&te,3,1033400));
+ // Established phase survives a copy spanning two confirmed edges without
+ // teaching its uncertain bracket to the period filter.
+ uint64_t lockedPeriod=te.period,lockedEdge=te.edge;
+ assert(te_sample(&te,5,1066700) && te.edge==lockedEdge+lockedPeriod*2 && te.period==lockedPeriod);
+ assert(te_sample(&te,5,1067000)); // same counter is still fresh
+ // Skipped counter, backward/reset count, long polling gap and clock reversal
+ // all force reacquisition. A read fault cannot expose the previous snapshot.
+ assert(!te_sample(&te,7,1067100) && !te.samples);
+ assert(!te_sample(&te,6,1067500) && !te.samples);
+ assert(!te_sample(&te,7,1073300) && !te.samples);
+ assert(!te_sample(&te,7,1000) && !te.samples);
+ failAddress=FG_SCAN_INTF+0x298;assert(!fuxi_gpu_scanout_te(&te) && !te.initialized);
+ failAddress=0;fg_scanout_owned=0;before=reads;
+ assert(!fuxi_gpu_scanout_te(&te) && reads==before);
+ // Ownership and a panel timing switch each start with fresh warmup.
+ fg_scanout_owned=1;assert(!te_sample(&te,10,2000000));
+ fg_scanout_period_us=8333;assert(!te_sample(&te,11,2008300) && te.nominal_us==8333 && !te.samples);
+ puts("PASS: actual lock-free TE observer: jitter/period filter, mach units, 60/120Hz, wrap, stall/MMIO/ownership/gap/reset fallback");
+}
 int main(void) {
+ te_estimator_tests();
  reset();assert(fuxi_gpu_scanout_acquire()==1 && fuxi_gpu_scanout_publish()==0);
  assert(fuxi_gpu_scanout_reserve());fuxi_gpu_scanout_release();assert(!reads && !writes && !observations);
  uint8_t *source=malloc(4544u*2436),*panel=malloc(4320u*2400);assert(source && panel);
@@ -421,7 +478,7 @@ def main():
     display = module('scanout_display', 'tools/test-fuxi-unixnu.py')
     with tempfile.TemporaryDirectory(prefix='fuxi-scanout-test-') as tmp:
         tmp = Path(tmp)
-        compile_run(tmp, 'gate', PREFIX + inc + kick + TEST)
+        compile_run(tmp, 'gate', PREFIX + display.TE_OBSERVER + inc + kick + TEST)
         # Compile final production SweetSurface, including the reservation changes.
         source = (ROOT / 'xnu/fuxi-scanout/SweetSurface.cpp').read_text()
         declarations = source[source.index('struct sweet_gpu_backing'):source.index('static bool sweet_gpu_init')]
@@ -449,6 +506,7 @@ static void fuxi_gpu_scanout_release() {assert(reserved);reserved=false;}
         declaration = source[source.index('class AppleCLCD :'):source.index('OSDefineMetaClassAndStructors(AppleCLCD')]
         declaration = declaration.replace(': public IOMobileFramebuffer', '').replace('OSDeclareDefaultStructors(AppleCLCD);', 'public:')
         methods = ''.join(display.function(source, n) for n in (
+            'sweet_fb_te_configure', 'AppleCLCD::teVsyncTick', 'AppleCLCD::teVsyncLog',
             'AppleCLCD::presentWantedLocked', 'AppleCLCD::wakePresentLocked', 'sweet_fb_rearm',
             'AppleCLCD::vsyncFired', 'AppleCLCD::scanoutLog', 'get32', 'AppleCLCD::swap', 'AppleCLCD::present'))
         methods = re.sub(r'__asm__ volatile\s*\([^;]*\);', '(void)0;', methods)
@@ -483,7 +541,92 @@ static void fuxi_gpu_scanout_release() {assert(reserved);reserved=false;}
  fb.fScanoutFrames=119;fb.scanoutLog(false,216,42000,0);assert(fb.fScanoutFrames==120);
 '''
         model = display.DISPLAY_TEST.replace(' puts("PASS: actual framebuffer', extra + ' puts("PASS: actual framebuffer')
-        compile_run(tmp, 'framebuffer', display.DISPLAY_PREFIX + declaration + methods + model,
+        # Run the same framebuffer methods with the real observer too: the
+        # counter is derived from the modeled panel clock, independently of
+        # scheduled software deadlines. Slow copies straddle edges at 120Hz.
+        observer = display.function(inc, 'fuxi_gpu_scanout_te').replace(
+            'int fuxi_gpu_scanout_te(', 'static int model_scanout_te(')
+        # Compile the actual observer's integer/time arithmetic for the target.
+        arm = tmp / 'te-arm.c'
+        arm.write_text('#include <stdint.h>\n' + display.TE_OBSERVER + '''
+#define FG_SCAN_INTF 0x0ae36000u
+static unsigned fg_scanout_period_us=16667;
+int fuxi_gpu_scanout_owned(void);
+int fg_scanout_read(unsigned,unsigned *);
+uint64_t mach_absolute_time(void);
+void nanoseconds_to_absolutetime(uint64_t,uint64_t *);
+''' + display.function(inc, 'fuxi_gpu_scanout_te'))
+        subprocess.run(['clang', '--target=aarch64-none-elf', '-ffreestanding',
+                        '-mgeneral-regs-only', '-Wall', '-Wextra', '-Werror',
+                        '-c', str(arm), '-o', str(tmp / 'te-arm.o')], check=True)
+        prefix = display.DISPLAY_PREFIX.replace('static bool teAvailable;',
+            'static bool teAvailable,teUseEstimator;\nstatic int model_scanout_te(struct fg_te_observer *);')
+        prefix = prefix.replace(' teReads++;te->edge=teEdge;',
+            ' teReads++;if(teUseEstimator)return model_scanout_te(te);te->edge=teEdge;')
+        prefix += r'''
+#define FG_SCAN_INTF 0u
+static unsigned fg_scanout_period_us=16667;
+static uint64_t panelOrigin,panelPeriod;
+static bool panelFrozen;
+static unsigned frozenFrame;
+static int fg_scanout_read(unsigned address,unsigned *count) {
+ assert(address==0x298);
+ unsigned frame=panelFrozen?frozenFrame:(unsigned)((ticks-panelOrigin)/panelPeriod);
+ *count=(frame&0xffffu)<<16;return 1;
+}
+''' + observer
+        integrated = r'''
+ {
+ teUseEstimator=true;scanOwned=true;client.fPort=1;
+ for(uint64_t period:{16556000ull,8278000ull})for(uint64_t offset:{7800000ull,16000000ull}) {
+  AppleCLCD timed={};IOTimerEventSource beat;
+  timed.fLock=&lock;timed.fClients=&clients;timed.fVsync=&beat;
+  timed.fFlushTicks=1;timed.fScanout=timed.fVsyncTE=true;
+  timed.fTickAbs=16667000;timed.fTeOffset=offset;
+  panelOrigin=ticks+1000000;panelPeriod=period;ticks=panelOrigin;
+  fg_scanout_period_us=period<10000000?8333:16667;
+  timed.fNextTick=beat.next=ticks+timed.fTickAbs;
+  unsigned lastFrame=~0u,locked=0,fallback=0,iterations=0;
+  while(timed.fVsyncCount<650) {
+   assert(++iterations<25000);
+   if(ticks<beat.next)ticks=beat.next;
+   uint64_t count=timed.fVsyncCount;
+   timed.vsyncFired(&timed,&beat);
+   if(!timed.fTeValid)lastFrame=~0u;
+   if(timed.fVsyncCount==count)continue;
+   if(timed.fTeValid) {
+    if(lastFrame!=~0u)assert(((timed.fTeSentFrame-lastFrame)&0xffffu)==1);
+    lastFrame=timed.fTeSentFrame;locked++;
+    uint64_t phase=(timed.fTeLastNotify-panelOrigin)%period;
+    uint64_t target=offset%period;
+    uint64_t error=phase>target?phase-target:target-phase;
+    if(error>period/2)error=period-error;
+    assert(error<=3000000); // uncertainty grows when a copy hides the edge
+    // A 3ms completed copy crosses the next TE for late offsets.
+    ticks+=3000000;
+   } else fallback++;
+  }
+  assert(locked>640 && fallback<10);
+  // Freeze a real modeled counter, then allow it to advance and reacquire.
+  panelFrozen=true;frozenFrame=(unsigned)((ticks-panelOrigin)/period);
+  for(unsigned i=0;i<200;i++) {
+   if(ticks<beat.next)ticks=beat.next;
+   timed.vsyncFired(&timed,&beat);
+  }
+  assert(!timed.fTeValid && timed.fTeFallback>0);
+  panelFrozen=false;
+  for(unsigned i=0;i<200;i++) {
+   if(ticks<beat.next)ticks=beat.next;
+   timed.vsyncFired(&timed,&beat);
+  }
+  assert(timed.fTeValid);
+ }
+ teUseEstimator=false;scanOwned=false;client.fPort=0;
+ puts("PASS: real TE observer + framebuffer timer: independent 60.4/120.8Hz panel, late offsets, 3ms copies, stall and reacquisition");
+ }
+'''
+        model = model.replace(' puts("PASS: actual framebuffer', integrated + ' puts("PASS: actual framebuffer')
+        compile_run(tmp, 'framebuffer', prefix + declaration + methods + model,
                     cpp=True, includes=(ROOT / 'xnu/fuxi-unixnu',))
     print('PASS: production scanout integration; real panel completion/cache coherency still require device qualification')
     if args.xnu_buildtree:

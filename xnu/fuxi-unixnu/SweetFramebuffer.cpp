@@ -158,6 +158,15 @@ public:
 	bool          fScanout, fScanoutLog, fScanoutHeld;
  uint32_t      fScanoutFrames, fScanoutGpu, fScanoutCpu, fScanoutDefers;
  uint64_t      fScanoutTime, fScanoutMax, fScanoutBytes, fScanoutPrepare;
+#if defined(FUXI)
+ bool          fVsyncTE, fTeValid, fTeSent;
+ struct fg_te_observer fTe;
+ uint64_t      fTeOffset, fTeNext, fTeLastNotify, fTePeriodSum;
+ unsigned      fTeSentFrame, fTeLocked, fTeFallback;
+ uint16_t      fTePhase[256];  /* 128 us bins, locked notifications only */
+ bool teVsyncTick(uint64_t &now, bool fallback);
+ void teVsyncLog(uint64_t now);
+#endif
  void scanoutLog(bool gpu, uint64_t bytes, uint64_t copy, uint64_t prepare);
  bool          fGpuPending;
 	uint32_t      fGpuBusyTicks, fGpuFailed;
@@ -218,6 +227,86 @@ static uint32_t sweet_fb_timer_options(void)
 	return high == 1 ? kIOTimerEventSourceOptionsPriorityHigh : kIOTimerEventSourceOptionsDefault;
 }
 
+#if defined(FUXI)
+static void sweet_fb_te_configure(AppleCLCD *fb)
+{
+ unsigned enabled = 0, offset = 7800; /* 7.3 ms transfer + 0.5 ms margin */
+ PE_parse_boot_argn("fuxivsyncte", &enabled, sizeof(enabled));
+ fb->fVsyncTE = enabled == 1;
+ if (!fb->fVsyncTE) return;
+ unsigned requested = offset;
+ if (PE_parse_boot_argn("fuxivsynctoff", &requested, sizeof(requested)) && requested <= 16000)
+  offset = requested;
+ nanoseconds_to_absolutetime((uint64_t)offset*1000, &fb->fTeOffset);
+ IOLog("SWEET FB: vsync TE requested offset_us=%u\n", offset);
+}
+
+bool AppleCLCD::teVsyncTick(uint64_t &now, bool fallback)
+{
+ bool wasValid = fTeValid;
+ fTeValid = fScanout && fuxi_gpu_scanout_te(&fTe);
+ now = mach_absolute_time();
+ if (!fTeValid) {
+  if (wasValid && fTeLastNotify) {
+   /* Resume the old period without a second tick just after the last TE. */
+   fNextTick = fTeLastNotify + fTickAbs;
+   return now >= fNextTick;
+  }
+  return fallback;
+ }
+ /* Offset is a phase: wrap offsets exceeding a faster panel's period.
+  * Keep an armed deadline if the next TE is observed just before it fires:
+  * replacing it with that TE's deadline would silently drop a notification.
+  * Require a confirmed counter for every tick; skip long gaps, never burst. */
+ if (!wasValid) fTeSent = false;
+ uint64_t offset = fTeOffset % fTe.period;
+ unsigned target = fTeSent ? (fTeSentFrame + 1) & 0xffffu : fTe.frame;
+ unsigned delta = (fTe.frame - target) & 0xffffu;
+ if (fTeSent && delta > 0x7fffu) {
+  fTeNext = fTe.edge + fTe.period + offset;
+  return false; /* the next target TE has not been observed yet */
+ }
+ if (!fTeSent || delta == 0 || delta > 1) {
+  target = fTe.frame;
+  fTeNext = fTe.edge + offset;
+ }
+ if (now < fTeNext) return false;
+ fTeSent = true;
+ fTeSentFrame = target;
+ fTeNext = delta == 1 ? fTe.edge + offset : fTeNext + fTe.period;
+ /* A fallback tick may have occurred just before lock acquisition. */
+ if (fTeLastNotify && now - fTeLastNotify < fTe.period/2) return false;
+ return true;
+}
+
+void AppleCLCD::teVsyncLog(uint64_t now)
+{
+ fTeLastNotify = now;
+ if (fTeValid) {
+  fTeLocked++;
+  fTePeriodSum += fTe.period;
+  uint64_t ns;
+  absolutetime_to_nanoseconds((now - fTe.edge) % fTe.period, &ns);
+  unsigned bin = (unsigned)(ns/128000);
+  fTePhase[bin < 256 ? bin : 255]++;
+ } else fTeFallback++;
+ if (fTeLocked + fTeFallback != 600) return;
+ unsigned p50 = 0, p90 = 0, cumulative = 0;
+ for (unsigned i = 0; i < 256; i++) {
+  cumulative += fTePhase[i];
+  if (fTeLocked && !p50 && cumulative >= (fTeLocked+1)/2) p50 = i*128+64;
+  if (fTeLocked && !p90 && cumulative >= (fTeLocked*9+9)/10) p90 = i*128+64;
+  fTePhase[i] = 0;
+ }
+ uint64_t ns = 0;
+ if (fTeLocked) absolutetime_to_nanoseconds(fTePeriodSum/fTeLocked, &ns);
+ IOLog("SWEET FB: vsync te-locked=%u fallback=%u phase_us %u/%u period_us %llu\n",
+     fTeLocked, fTeFallback, p50, p90, (unsigned long long)(ns/1000));
+ fTeLocked = fTeFallback = 0;
+ fTePeriodSum = 0;
+}
+#endif
+
 bool
 AppleCLCD::start(IOService *provider)
 {
@@ -275,6 +364,7 @@ AppleCLCD::start(IOService *provider)
 		    fUnixnuDiff ? "enabled" : "unavailable");
 	}
 	if (fUnixnuIdle) IOLog("FUXI UNIXNU FB: demand timer enabled, software 60 Hz, panel power inherited\n");
+	sweet_fb_te_configure(this);
 #endif
 	uint32_t timerOptions = sweet_fb_timer_options();
 	if (timerOptions == kIOTimerEventSourceOptionsPriorityHigh)
@@ -385,7 +475,14 @@ sweet_fb_rearm(AppleCLCD *fb, IOTimerEventSource *sender)
   bool active = fb->fGpuPending || (!fb->fScanoutHeld &&
       (fb->fPowerOff ? fb->fFadeStep == 0 : fb->fDirty));
   uint64_t poll = now + fb->fTickAbs/16;
-  if (active && poll < deadline) deadline = poll;
+  if (fb->fVsyncTE) {
+   if (fb->fTeValid) {
+    deadline = fb->fTeNext;
+    poll = now + fb->fTe.period/16;
+   }
+   /* Keep observing TE even with subscribers but no dirty swap. */
+   if (poll < deadline || deadline <= now) deadline = poll;
+  } else if (active && poll < deadline) deadline = poll;
   fb->fTickArmed = true;
   sender->wakeAtTime(kIOTimeOptionsWithLeeway, deadline, 0);
   IOLockUnlock(fb->fLock);
@@ -423,6 +520,10 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
  bool vsyncTick = true;
 #if defined(FUXI)
  if (fb->fScanout && fuxi_gpu_scanout_owned()) vsyncTick = now >= fb->fNextTick;
+ if (fb->fVsyncTE) {
+  vsyncTick = fb->teVsyncTick(now, vsyncTick);
+  if (vsyncTick) fb->teVsyncLog(now);
+ }
 #endif
  uint64_t count = vsyncTick ? ++fb->fVsyncCount : fb->fVsyncCount;
 	uint64_t values[6] = {

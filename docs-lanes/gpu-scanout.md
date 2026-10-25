@@ -459,3 +459,102 @@ modeled MMIO: exact packet bytes and FIFO order/padding, boundary admission,
 one attempt, stale completion, frozen-clock and busy/done timeouts, MMIO
 failure, tear-counter disable/update/enable and readback, 60/120 Hz timing,
 and DSI mapping only with opt-in. They cannot qualify actual hardware.
+
+## TE-locked compositor heartbeat (`fuxivsyncte=1`, default off)
+
+The supplied 60 Hz device observation is `te_hz=60.4`, while CLCD's existing
+16,667 us notification timer has an unrelated phase. Backboardd's roughly
+60 Hz swaps can therefore miss the upcoming TE: the supplied 600-START sample
+had gaps of 1/2/3/4+ ticks = 225/287/62/26, about 29 displayed frames/s. The
+phase explanation is a hypothesis; host qualification does not establish a
+device improvement.
+
+`fuxivsyncte=1` opts CLCD into the panel clock while scanout is owned. The
+scanout API `fuxi_gpu_scanout_te` reads INTF+0x298's high16 frame counter and
+maintains a **caller-owned** observer in mach-absolute units. There is no GPU
+mutex, allocation, wait, START or register write in the observer. Polls bracket
+each counter change; the midpoint estimates TE. Two consecutive narrow
+brackets establish validity. The measured interval feeds a 1/8 period filter;
+a 1/4 phase correction smooths polling jitter. Counter wrap is handled modulo
+65,536. The inherited mode's period seeds acquisition; the successful
+`fuxipanel120=1` switch changes that seed and forces fresh acquisition. The
+notification period then follows measured TE rather than assuming 60 Hz.
+
+A copy can block the timer across an edge. An established estimate may bridge
+up to four confirmed counter increments when its predicted edge fits the poll
+bracket, allowing one poll interval of error. Such a wide bracket does not
+update the period filter; subsequent narrow brackets measure elapsed periods
+across the gap. An implausible jump, reset, clock reversal, mode change or MMIO
+failure invalidates the estimate. An unchanged counter expires after 1.25
+estimated periods since its last observed change. No ownership means no TE
+register read. Invalid data uses the existing absolute notification timer and
+can reacquire automatically; there is no prediction through a frozen counter.
+
+CLCD schedules notifications at **estimated TE + offset**, with a default
+**7,800 us**: the supplied 7.3 ms transfer time plus 0.5 ms margin. Tune with
+`fuxivsynctoff=<us>`, inclusive range **0..16000**; missing or invalid values
+retain 7,800 us. Offset zero fires on the first poll that confirms TE. Offsets
+longer than a measured period wrap modulo that period, preserving one phase
+per panel cycle. Each confirmed TE gets at most one count increment and
+notification; fence/ownership polls add none. An armed notification survives
+observation of the following TE just before its deadline. Long missed intervals
+are skipped without catch-up bursts; entering or leaving fallback avoids an
+immediate duplicate tick.
+
+With subscribers, the owned timer polls at about period/16 even without a
+dirty swap (about 1 ms at 60 Hz, 0.5 ms at 120 Hz). Existing demand-idle behavior
+still stops when nothing needs the timer. **With `fuxivsyncte` absent, zero or
+any value other than 1, the old deadlines, notification counts, polling and
+presentation path remain unchanged, with no new TE reads or diagnostics.**
+
+For device qualification, add these arguments to the existing GPU setup:
+
+```
+fuxigpuscanout=1 sweetfb_noconsole=1 fuxiscante=1 fuxivsyncte=1
+```
+
+The heartbeat option does not enable the separate `fuxiscante` gate or lower
+`fuxiscandrain`. The default 20 ms scanout floor itself prevents sustained
+one-TE START spacing at 60 Hz, so retain the TE gate when evaluating cadence.
+First compare the same workload with the heartbeat option off. With it on,
+look for `SWEET FB: vsync TE requested offset_us=7800`. Every 600 heartbeat
+notifications (including fallback), CLCD emits:
+
+```
+SWEET FB: vsync te-locked=<n> fallback=<n> phase_us <p50>/<p90> period_us <period>
+```
+
+The two counts sum to 600. After acquisition, expect predominantly locked
+notifications, period around **16,556 us** for the supplied 60.4 Hz baseline,
+and phase percentiles near the chosen offset. Phase is elapsed time modulo
+period relative to the latest **estimated** edge, with 128 us histogram bins;
+period is the mean measured period over locked ticks in that window. An
+all-fallback window reports zero phase/period. Also compare the existing
+`FUXI SCANOUT: waits per 600 starts ... te_hz=... gaps=...` lines: the success
+criterion under sustained animation is **START gaps mostly 1 tick**, fewer
+2/3/4+ gaps, and stable images. A good heartbeat log alone does not demonstrate
+that CA rendering, copying and START met the next panel deadline.
+
+With `fuxipanel120=1`, first require the separate panel-switch success and
+`te_hz` near 120; expect roughly half the measured period. The unchanged
+7,800 us default leaves very little preparation time before the next TE at
+that rate. Measure transfer completion and CA/copy time before choosing an
+earlier safe offset. A faster heartbeat alone cannot guarantee 120 fps.
+
+Risks include timer dispatch jitter, estimator uncertainty while copies hide
+edges, extra polling cost, a transfer time that varies with panel mode, and
+CA/copy work exceeding the remaining budget. An early offset can encounter a
+still-busy single buffer; a late offset can miss TE. Existing ownership,
+transfer and fence guards still gate every write. Validate animation, idle,
+blank/wake and fallback/relock as well as cadence; remove `fuxivsyncte` to
+restore the prior heartbeat. No device qualification was performed here.
+
+Offline coverage in `tools/test-fuxi-gpu-scanout.py` exercises the actual observer
+with counter jitter, wrap, mach timebase scaling, mode changes, stalls, faults
+and missed polls. Its combined panel-clock/framebuffer model covers 60.4 and
+120.8 Hz, copies crossing TE, loss and reacquisition. `tools/test-fuxi-unixnu.py`
+covers offset parsing/bounds/defaults, exact deadlines, pending-tick retention,
+count/notification suppression, diagnostics and the unchanged opt-out path.
+The kernel build receives the API/header through generated patch **0098** and
+CLCD through **0106**; regenerate with `tools/sync-fuxi-metal.py` and
+`tools/sync-fuxi-unixnu.py` and keep both `--check` modes passing.

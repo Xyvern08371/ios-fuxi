@@ -10,6 +10,8 @@ import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / 'xnu/fuxi-unixnu'
+TE_OBSERVER = re.search(r'struct fg_te_observer \{.*?\};',
+    (ROOT / 'xnu/fuxi-adreno/fuxi_adreno.h').read_text(), re.S)[0]
 
 
 def function(source, name):
@@ -255,18 +257,35 @@ static uint64_t ticks=1000;
 static unsigned arms,kicks,pollMode=1,gpuMode=0,refs,logs;
 static uint64_t mach_absolute_time(void) {return ticks++;}
 static void absolutetime_to_nanoseconds(uint64_t n,uint64_t *out) {*out=n;}
-static bool PE_parse_boot_argn(const char *,int *n,unsigned) {*n=1;return true;}
+static unsigned teOption,teOffsetOption=7800,teReads;
+static bool teOffsetPresent=true;
+static bool PE_parse_boot_argn(const char *name,void *n,unsigned) {
+ if(!strcmp(name,"fuxivsynctoff") && !teOffsetPresent)return false;
+ unsigned value=!strcmp(name,"fuxivsyncte")?teOption:!strcmp(name,"fuxivsynctoff")?teOffsetOption:1;
+ *(unsigned *)n=value;return true;
+}
+static void nanoseconds_to_absolutetime(uint64_t n,uint64_t *out) {*out=n;}
 static void fuxi_perf_swap(void) {}
 static void fuxi_display_kick(void) {kicks++;}
 static int scanAcquire=1,scanPublish=0;
 static bool scanOwned=false;
 static int fuxi_gpu_scanout_owned(void) {return scanOwned;}
+static bool teAvailable;
+static uint64_t teEdge,tePeriod=16667000;
+static unsigned teFrame;
+static int fuxi_gpu_scanout_te(struct fg_te_observer *te) {
+ teReads++;te->edge=teEdge;te->period=tePeriod;te->frame=teFrame;
+ return scanOwned && teAvailable;
+}
 static unsigned scanPublications;
 static int fuxi_gpu_scanout_acquire(void) {return scanAcquire;}
 static int fuxi_gpu_scanout_publish(void) {scanPublications++;return scanPublish;}
-static char importStatsLog[2048];
+static char importStatsLog[2048],teStatsLog[2048];
 static int IOLog(const char *format,...) {
  logs++;
+ if(strstr(format,"vsync te-locked=")) {
+  va_list args;va_start(args,format);vsnprintf(teStatsLog,sizeof(teStatsLog),format,args);va_end(args);
+ }
  if(strstr(format,"bytes cumulative")) {
   va_list args;va_start(args,format);vsnprintf(importStatsLog,sizeof(importStatsLog),format,args);va_end(args);
  }
@@ -304,6 +323,8 @@ class IOMobileFramebufferUserClient {
  void notify(unsigned type,const uint64_t *,unsigned){if(fFunc[type] && fPort)notifications++;}
 };
 '''
+
+DISPLAY_PREFIX = DISPLAY_PREFIX.replace('#define FUXI 1', TE_OBSERVER + '\n#define FUXI 1')
 
 DISPLAY_TEST = r'''
 static void put32(uint8_t *r,unsigned offset,uint32_t v){memcpy(r+offset,&v,4);}
@@ -359,6 +380,90 @@ int main(void) {
  fb.fStatFrames=599;pollMode=1;gpuMode=0;
  fb.swap(rec);fb.vsyncFired(&fb,&timer);
  assert(!fb.fStatFrames && strstr(importStatsLog,"imports 1 mapped 16384 cache cleaned 64 skipped 128 invalidated 64 bytes cumulative"));
+ { // TE opt-in admission and bounds use the production boot-arg parser.
+ AppleCLCD tefb={};
+ for(unsigned option:{0u,2u,~0u}) {
+  teOption=option;unsigned oldLogs=logs;sweet_fb_te_configure(&tefb);
+  assert(!tefb.fVsyncTE && logs==oldLogs);
+ }
+ teOption=1;
+ teOffsetPresent=false;sweet_fb_te_configure(&tefb);
+ assert(tefb.fVsyncTE && tefb.fTeOffset==7800000);
+ teOffsetPresent=true;
+ for(unsigned offset:{0u,7800u,16000u,16001u,~0u}) {
+  teOffsetOption=offset;sweet_fb_te_configure(&tefb);
+  assert(tefb.fVsyncTE && tefb.fTeOffset==(offset<=16000?offset:7800)*1000ull);
+ }
+ tefb.fLock=&lock;tefb.fClients=&clients;tefb.fVsync=&timer;
+ tefb.fFlushTicks=1;tefb.fTickAbs=16667000;tefb.fScanout=true;
+ client.fPort=1;scanOwned=true;teAvailable=true;
+ // Exact phase deadlines at both measured rates, including counter wrap.
+ for(uint64_t period:{16556000ull,8278000ull})for(uint64_t offset:{0ull,7800000ull,16000000ull}) {
+  tefb.fTeOffset=offset;tefb.fTeSent=false;tefb.fTeLastNotify=0;
+  tefb.fTeLocked=tefb.fTeFallback=0;memset(tefb.fTePhase,0,sizeof(tefb.fTePhase));
+  tePeriod=period;
+  for(unsigned i=0;i<600;i++) {
+   teFrame=(65530+i)&0xffff;teEdge=1000000000ull+i*period;
+   uint64_t deadline=teEdge+offset%period;
+   uint64_t prior=tefb.fVsyncCount,notified=client.notifications;
+   // With offset zero the first observation is necessarily just after TE.
+   if(offset%period) {
+    ticks=deadline-1;uint64_t now=ticks;
+    assert(!tefb.teVsyncTick(now,false) && tefb.fTeNext==deadline);
+   }
+   ticks=deadline;tefb.vsyncFired(&tefb,&timer);
+   assert(tefb.fVsyncCount==prior+1 && client.notifications==notified+1);
+   assert(timer.next>ticks && timer.next<=ticks+period/16);
+   ticks=deadline+1000;tefb.vsyncFired(&tefb,&timer);
+   assert(tefb.fVsyncCount==prior+1 && client.notifications==notified+1);
+  }
+  assert(strstr(teStatsLog,"te-locked=600 fallback=0 phase_us"));
+  unsigned locked,fallback,p50,p90;unsigned long long measured;
+  assert(sscanf(teStatsLog,"SWEET FB: vsync te-locked=%u fallback=%u phase_us %u/%u period_us %llu",
+    &locked,&fallback,&p50,&p90,&measured)==5);
+  assert(locked==600 && !fallback && measured==period/1000);
+  unsigned phase=(offset%period)/1000;
+  assert(p50+64>=phase && p50<=phase+64 && p90==p50);
+ }
+ // A new TE just before the old deadline cannot supersede an armed tick.
+ tefb.fTeSent=true;tefb.fTeValid=true;tefb.fTeSentFrame=99;
+ tefb.fTeLastNotify=0;tefb.fTeOffset=16000000;tePeriod=16556000;
+ teFrame=100;teEdge=50000000000ull;tefb.fTeNext=teEdge+16000000;
+ ticks=tefb.fTeNext-1000;uint64_t pendingNow=ticks;
+ assert(!tefb.teVsyncTick(pendingNow,false));
+ uint64_t pending=tefb.fTeNext;teFrame=101;teEdge=pending-500;
+ ticks=pending;pendingNow=ticks;
+ assert(tefb.teVsyncTick(pendingNow,false) && tefb.fTeSentFrame==100);
+ assert(tefb.fTeNext==teEdge+16000000);
+ pendingNow=ticks;assert(!tefb.teVsyncTick(pendingNow,false));
+ ticks=tefb.fTeNext;pendingNow=ticks;
+ assert(tefb.teVsyncTick(pendingNow,false) && tefb.fTeSentFrame==101);
+ // A late callback skips missed frames, without issuing a burst.
+ uint64_t prior=tefb.fVsyncCount;
+ teFrame+=4;teEdge+=tePeriod*4;ticks=teEdge+tefb.fTeOffset%tePeriod;
+ tefb.vsyncFired(&tefb,&timer);assert(tefb.fVsyncCount==prior+1);
+ tefb.vsyncFired(&tefb,&timer);assert(tefb.fVsyncCount==prior+1);
+ // Loss/stall falls back to the old period with no immediate double tick.
+ teAvailable=false;tefb.vsyncFired(&tefb,&timer);
+ assert(!tefb.fTeValid && tefb.fVsyncCount==prior+1);
+ assert(tefb.fNextTick==tefb.fTeLastNotify+tefb.fTickAbs);
+ ticks=tefb.fNextTick;tefb.vsyncFired(&tefb,&timer);
+ assert(tefb.fVsyncCount==prior+2 && tefb.fTeFallback==1);
+ // No ownership/scanout: old continuous-timer path; no TE MMIO API call.
+ scanOwned=false;tefb.fScanout=false;unsigned readsBefore=teReads;
+ tefb.vsyncFired(&tefb,&timer);assert(teReads==readsBefore && tefb.fTeFallback==2);
+ // Default off makes no TE call or log, and preserves old absolute deadlines.
+ tefb.fVsyncTE=false;scanOwned=true;tefb.fScanout=true;
+ ticks=tefb.fNextTick;prior=tefb.fVsyncCount;unsigned logsBefore=logs;
+ tefb.vsyncFired(&tefb,&timer);
+ assert(teReads==readsBefore && logs==logsBefore && tefb.fVsyncCount==prior+1);
+ assert(timer.next==tefb.fNextTick && tefb.fNextTick>ticks);
+ AppleCLCD stats={};
+ for(unsigned i=0;i<600;i++)stats.teVsyncLog(ticks+i);
+ assert(strstr(teStatsLog,"te-locked=0 fallback=600 phase_us 0/0 period_us 0"));
+ scanOwned=false;client.fPort=0;
+ puts("PASS: TE offset admission, 60/120Hz phase/count/wrap, duplicate/late suppression, logs and fallback/default path");
+ }
  puts("PASS: actual framebuffer present/tick/swap: demand wake/idle, GPU retirement/fallback, blanking and shadow invalidation");
 }
 '''
@@ -459,6 +564,7 @@ def main():
         declaration = declaration.replace(': public IOMobileFramebuffer', '').replace(
             'OSDeclareDefaultStructors(AppleCLCD);', 'public:')
         methods = ''.join(function(display, name) for name in (
+            'sweet_fb_te_configure', 'AppleCLCD::teVsyncTick', 'AppleCLCD::teVsyncLog',
             'AppleCLCD::presentWantedLocked', 'AppleCLCD::wakePresentLocked', 'sweet_fb_rearm',
             'AppleCLCD::vsyncFired', 'AppleCLCD::scanoutLog', 'get32', 'AppleCLCD::swap', 'AppleCLCD::present'))
         methods = methods.replace('__asm__ volatile ("dsb sy" ::: "memory");', '(void)0;')
