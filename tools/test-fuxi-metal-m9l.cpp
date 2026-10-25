@@ -29,16 +29,16 @@ int main(int argc,char **argv){
   for(unsigned i=0;i<count;++i){assert(!targets[i]->isDefined(0) && targets[i]->isDefined(1));check(targets[i],1,expected(i));}
   // Same-encoder MRT merging preserves every attachment's independent blend
   // state and load/store actions, across 2/4/8 mixed-format mip targets.
-  auto mergePair=[&](fuxi::Operation first,bool fetch,fuxi::Pipeline *nextPipeline=nullptr){first.encoderID=77;auto second=first;if(nextPipeline)second.pipeline=nextPipeline;
+  auto mergePair=[&](fuxi::Operation first,fuxi::Pipeline *nextPipeline=nullptr){first.encoderID=77;auto second=first;if(nextPipeline)second.pipeline=nextPipeline;
    for(unsigned i=0;i<count;++i){auto c=second.color(i);c.load=1;second.setColor(i,c);}
    b.submit({first});b.submit({second});std::vector<std::vector<uint8_t>> reference;
    for(auto *t:targets){pixels(t,1);auto n=t->levelWidth(1)*t->levelHeight(1)*fuxi::Backend::texelBytes(t->format);reference.emplace_back((uint8_t *)read->contents,(uint8_t *)read->contents+n);}
    fuxi::FrameSample sample;{fuxi::FrameTraceScope scope(&sample);b.submit({first,second});}
-   bool merged=fuxi::systemTranslationPolicy().merge && !fetch;assert(sample.passes==(merged?1u:2u) && sample.mergedDraws==unsigned(merged));
-   if(fetch && fuxi::systemTranslationPolicy().merge)assert(sample.mergeSplits[size_t(fuxi::MergeSplit::fetch)]==1);
+   bool merged=fuxi::systemTranslationPolicy().merge;assert(sample.passes==(merged?1u:2u) && sample.mergedDraws==unsigned(merged));
+   assert(sample.mergeSplits[size_t(fuxi::MergeSplit::fetch)]==0);
    for(unsigned i=0;i<count;++i){pixels(targets[i],1);assert(!memcmp(read->contents,reference[i].data(),reference[i].size()));}
   };
-  mergePair(draw,false);other=b.compilePipeline(lib,"mrt_vertex",lib,("mrt"+std::to_string(count)).c_str(),changed);mergePair(draw,false,other);b.destroy(other);
+  mergePair(draw);other=b.compilePipeline(lib,"mrt_vertex",lib,("mrt"+std::to_string(count)).c_str(),changed);mergePair(draw,other);b.destroy(other);
   auto first=draw;first.encoderID=77;auto last=first;for(unsigned i=0;i<count;++i){auto c=last.color(i);c.load=1;c.store=i%2;last.setColor(i,c);}
   fuxi::FrameSample discardSample;{fuxi::FrameTraceScope scope(&discardSample);b.submit({first,last});}assert(discardSample.passes==(fuxi::systemTranslationPolicy().merge?1u:2u));
   for(unsigned i=0;i<count;++i)assert(targets[i]->isDefined(1)==bool(i%2));b.submit({draw});
@@ -60,7 +60,7 @@ int main(int argc,char **argv){
    auto fetchOptions=options;fetchOptions.blend=0;for(auto &c:fetchOptions.colors)c.blend=0;
    auto *fetch=b.compilePipeline(lib,"mrt_vertex",lib,"fetch4",fetchOptions);assert(fetch->fetchMask==15);
    auto op=draw;op.pipeline=fetch;op.vertices=6;b.submit({op});
-   for(unsigned i=0;i<count;++i){std::array<float,4> value=i%2?std::array<float,4>{1.f,.4375f,.84375f,.5f}:std::array<float,4>{.40625f,.8125f,1.21875f,.875f};if(i==0)value[2]=1;if(i==3)value[1]=.25f;check(targets[i],1,value);}mergePair(op,true);b.destroy(fetch);
+   for(unsigned i=0;i<count;++i){std::array<float,4> value=i%2?std::array<float,4>{1.f,.4375f,.84375f,.5f}:std::array<float,4>{.40625f,.8125f,1.21875f,.875f};if(i==0)value[2]=1;if(i==3)value[1]=.25f;check(targets[i],1,value);}mergePair(op);mergePair(op,pipeline);mergePair(draw,fetch);b.destroy(fetch);
   }
   for(auto *t:targets)b.destroy(t);b.destroy(pipeline);
  }

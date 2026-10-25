@@ -13,6 +13,57 @@ int main(){
  auto counter=[&](const char *name){auto fn=reinterpret_cast<uint64_t (*)()>(dlsym(proxy,name));assert(fn);return fn();};
  auto run=[&](const std::vector<Operation> &ops,unsigned passes,unsigned merged){auto beforePass=counter("render_merge_passes"),beforeDraw=counter("render_merge_draws");FrameSample s;{FrameTraceScope scope(&s);b.submit(ops);}assert(s.passes==(merge?passes:s.draws+std::count_if(ops.begin(),ops.end(),[](const Operation &o){return o.clearOnly && (o.areaWidth || o.areaHeight);})));assert(counter("render_merge_passes")-beforePass==s.passes && counter("render_merge_draws")-beforeDraw==s.draws);assert(s.mergedDraws==(merge?merged:0));return s;};
  auto pixels=[&](const char *label,uint32_t level=0){Operation get{};get.texture=dst;get.dst=read;get.srcLevel=level;b.submit({get});printf("PIXELS %s ",label);for(size_t i=0;i<dst->levelWidth(level)*dst->levelHeight(level)*4;++i)printf("%02x",((uint8_t *)read->contents)[i]);puts("");};
+ if(b.supportsOrderedColorAccess()){
+  auto *fetch=b.compilePipeline(nullptr,"control",nullptr,"fetch");assert(fetch->fetchMask==1);
+  auto f=draw;f.pipeline=fetch;run({f},1,0);pixels("fetch-clear");
+  // Fetch sees the loadOp clear on the first draw, including alpha. Verify an
+  // independent expected value as well as byte-identical A/B output.
+  for(unsigned i=0;i<1024;++i){float clear=draw.clear[(i%4)==0?2:(i%4)==2?0:i%4];float sample=(i%4)==3?16:91;
+   assert(std::abs(int(((uint8_t *)read->contents)[i])-int(std::lround(clear*255*.75+sample*.25)))<=1);}
+  std::vector<Operation> mixed(19,draw);for(unsigned i=0;i<mixed.size();++i){auto &op=mixed[i];op.load=i?1:2;if(i%3!=1)op.pipeline=fetch;op.samples[0]=i%2?other:src;op.scissor.extent.width=16-i%5;}
+  auto s=run(mixed,1,18);assert(s.mergeSplits[size_t(MergeSplit::fetch)]==0);pixels("fetch-normal-interleaved");
+  // A fetch must use the current attachment view after switching target mips.
+  for(auto &op:mixed){op.dstLevel=1;op.viewport={0,8,8,-8,0,1};op.scissor.extent={8,8};}run(mixed,1,18);pixels("fetch-mip-view",1);
+  std::function<void()> fetchFirst,fetchSecond;b.submit(mixed,{},&fetchFirst);b.submit(mixed,{},&fetchSecond);fetchFirst();fetchSecond();pixels("fetch-two-flights",1);
+  b.destroy(fetch);
+ }else puts("SKIP: lavapipe lacks enabled VK_EXT_rasterization_order_attachment_access; ordered fetch pixel controls");
+ // The proxy masks linear sampling support so this uses the real production
+ // optimal-shadow fallback regardless of the host's preferred linear layout.
+ auto *backing=b.allocate(4096);auto *shadow=b.linearTexture(backing,80,1,16,16,0,64);assert(shadow->shadow);
+ auto *backing2=b.allocate(4096);auto *shadow2=b.linearTexture(backing2,80,1,16,16,0,64);assert(shadow2->shadow);
+ std::vector<Operation> shadowDraws(11,draw);for(unsigned i=0;i<shadowDraws.size();++i){auto &op=shadowDraws[i];op.load=i?1:2;op.samples[0]=i%2?shadow2:shadow;}
+ auto shadowLayout=shadow->layout;auto shadowDefined=shadow->defined;bool shadowFailed=false;b.failBeforeQueue=true;
+ try{b.submit(shadowDraws);}catch(...){shadowFailed=true;}assert(shadowFailed && !b.poisoned && shadow->layout==shadowLayout && shadow->defined==shadowDefined);
+ std::vector<uint8_t> prior;
+ for(unsigned frame=0;frame<3;++frame){memset(backing->contents,37+frame*61,4096);memset(backing2->contents,63+frame*43,4096);
+  auto before=counter("render_merge_copies");auto s=run(shadowDraws,1,10);assert(s.mergeSplits[size_t(MergeSplit::shadow)]==0);
+  assert(counter("render_merge_copies")-before==(merge?2u:11u));pixels(("shadow-cpu-frame-"+std::to_string(frame)).c_str());
+  std::vector<uint8_t> now((uint8_t *)read->contents,(uint8_t *)read->contents+1024);if(frame)assert(now!=prior);prior=now;
+ }
+ // Explicit backing-buffer writes stay outside passes. The refresh after the
+ // fill must observe it; run-local deduplication must never persist past a run.
+ auto sh=shadowDraws[0],shLoad=sh;shLoad.load=1;Operation fill{};fill.dst=backing;fill.size=4096;fill.value=199;
+ auto beforeCopies=counter("render_merge_copies");run({sh,fill,shLoad},2,0);assert(counter("render_merge_copies")-beforeCopies==2);pixels("shadow-after-fill");
+ // Attachment writes can also change a shadow's backing memory via a linear
+ // image alias. Such refreshes depend on earlier draws and must remain split.
+ auto *alias=b.linearTexture(backing,80,4,16,16,0,64);assert(!alias->shadow);
+ auto aliasDraw=sh;aliasDraw.texture=alias;auto aliasLoad=aliasDraw;aliasLoad.load=1;
+ auto split=run({aliasDraw,aliasLoad},2,0);if(merge)assert(split.mergeSplits[size_t(MergeSplit::shadow)]==1);
+ auto aliasNormal=aliasLoad;aliasNormal.samples[0]=src;run({aliasDraw,aliasNormal},1,1);
+ split=run({aliasDraw,aliasNormal,aliasLoad},2,1);if(merge)assert(split.mergeSplits[size_t(MergeSplit::shadow)]==1);
+ Operation aliasRead{};aliasRead.sourceTexture=alias;aliasRead.texture=dst;b.submit({aliasRead});pixels("shadow-attachment-producer");
+ // Change CPU bytes between submissions while both tickets stay outstanding.
+ // Independent frame backing avoids racing a live GPU read of shared bytes.
+ auto *flightTarget=b.allocateTexture(80,5,16,16);auto flight0=shadowDraws,flight1=shadowDraws;
+ for(auto &op:flight0)op.samples[0]=shadow;
+ for(auto &op:flight1){op.samples[0]=shadow2;op.texture=flightTarget;}
+ std::function<void()> shadowFirst,shadowSecond;FrameSample fs0,fs1;
+ memset(backing->contents,71,4096);{FrameTraceScope scope(&fs0);b.submit(flight0,{},&shadowFirst);}
+ memset(backing2->contents,163,4096);{FrameTraceScope scope(&fs1);b.submit(flight1,{},&shadowSecond);}
+ assert(fs0.passes==(merge?1u:11u) && fs1.passes==fs0.passes);shadowFirst();shadowSecond();pixels("shadow-updated-two-flights-0");
+ std::vector<uint8_t> flightPixels((uint8_t *)read->contents,(uint8_t *)read->contents+1024);
+ Operation flightCopy{};flightCopy.sourceTexture=flightTarget;flightCopy.texture=dst;b.submit({flightCopy});pixels("shadow-updated-two-flights-1");assert(memcmp(flightPixels.data(),read->contents,1024));b.destroy(flightTarget);
+ b.destroy(alias);b.destroy(shadow);b.destroy(shadow2);b.destroy(backing);b.destroy(backing2);
  // Distinct bindings, viewports and scissors remain per draw. Clear is applied
  // once; blending makes ordering, repeated clears and missing draws observable.
  std::vector<Operation> many(23,draw);for(unsigned i=0;i<many.size();++i){auto &op=many[i];op.load=i?1:2;op.samples[0]=i%2?other:src;op.scissor.extent.width=16-i%5;op.viewport.width=16-float(i%3);}
@@ -61,5 +112,5 @@ int main(){
  // Use both lanes and retire with the recording thread's trace scope gone.
  std::function<void()> first,second;b.submit(many,{},&first);b.submit(many,{},&second);first();second();pixels("two-flights");
  b.destroy(p);b.dropPipelineCacheForTest();b.destroy(sam);b.destroy(src);b.destroy(other);b.destroy(dst);b.destroy(bytes);b.destroy(read);
- puts("PASS: render merge pixels, actions, boundaries, mip hazards, partial areas, rollback and two flights");
+ puts("PASS: render merge pixels, fetch/normal blending, CPU shadows, transfer dependencies, actions, mip hazards, rollback and two flights");
 }

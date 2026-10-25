@@ -1081,14 +1081,29 @@ GMEM hangs on A740, so this is a diagnostic opt-in only.
 about 115 draws, with `render_passes/frame == draws/frame`. Median `gpu_exec`
 is about 9.6 ms, or 83 microseconds per draw. The GMEM trial did not change
 that result. These are supplied measurements; no device was accessed here.
-The old backend records a separate `vkCmdBeginRenderPass`/`vkCmdEndRenderPass`
+The pre-merge backend recorded a separate `vkCmdBeginRenderPass`/`vkCmdEndRenderPass`
 and attachment/sample transitions plus a memory barrier for every draw.
+
+**OBSERVED (supplied follow-up, merge + overlap + submit + feedback):** about
+300 frames per window show 114–119 draws and 71–73 passes per frame, with
+`gpu_exec` median 8.6 ms versus the supplied unmerged 9.6 ms. Window split
+totals were `encoder:2176,fetch:4599,shadow:2194,non_draw:301`, all other
+reasons zero. Ordered framebuffer fetch was enabled through
+`VK_EXT_rasterization_order_attachment_access`. CA still presented around
+28 Hz; backboardd reported 1,757 late frames out of 5,435. These measurements
+precede the fetch/shadow extension below; they are not results of this change.
+Split reasons report the first blocker: removing fetch/shadow isolation may
+expose encoder or other boundaries. Subtracting those totals from passes is
+not a valid prediction of the new pass count.
 
 **GUESS:** repeated sysmem render-pass boundaries trigger Turnip CCU
 flush/invalidate/wait work and now dominate the GPU interval, contributing to
 CA's roughly 30 Hz presentation. Equal pass/draw counts and the unchanged GMEM
 result motivate this experiment; they do not measure CCU costs or establish
-that merging will reach 60 Hz.
+that merging will reach 60 Hz. The follow-up identifies fetch and shadow
+refresh isolation as removable boundaries; legitimate encoder boundaries
+remain. Whether their removal improves CA latency or presentation is still
+a device experiment.
 
 Enable **`fuxigpumerge=1`**, independently of feedback, overlap, descriptor reuse
 and GMEM. Only one exact `=1` boot token enables it; absent, zero, malformed and
@@ -1104,6 +1119,28 @@ when they reuse identical attachments and start with Load. Identity zero means
 unknown and cannot merge. Command submissions and event segments are also
 boundaries; runs never cross them.
 
+The fetch extension retains the **existing** pipeline render-pass layout. On
+an ordered-capable device, every pipeline (ordinary, fetch, topology and runtime
+variant) already uses one subpass with all present colors also referenced as
+inputs, `VK_SUBPASS_DESCRIPTION_RASTERIZATION_ORDER_ATTACHMENT_COLOR_ACCESS_BIT_EXT`,
+and `GENERAL` layouts. Sparse slots retain `VK_ATTACHMENT_UNUSED` in both
+reference arrays; actual framebuffer views are compact. This common layout is
+essential: input attachment references participate in render-pass compatibility.
+Changing loads/stores does not change that compatibility. Input descriptors
+bind the current operation's target view at the fetched slot; merged runs require
+identical targets/levels, so those are the active merged framebuffer's views.
+The color-blend pipeline state also enables rasterization-order attachment access.
+
+No new pipeline mode or `fuxigpumerge2` is needed: pipeline creation remains
+unchanged with merge off/on. The device's enabled ordered-access value is already
+in `CompileOptions`, translator identities/product keys and device cache identity.
+Runtime variants belong to their original pipeline and inherit its options;
+topology variants use its render pass. The render-pass action cache is local to
+a pipeline with those fixed formats and ordered mode. There is no cache entry
+shared between incompatible merge/nonmerge layouts. Without ordered support,
+the old ordinary merge behavior and per-operation fetch fallback/refusal remain;
+this change does not admit unordered fetch.
+
 The opt-in planner runs after runtime variants, descriptor plans, sampling
 access proofs and skipped draws have been resolved. A run requires identical
 nonzero encoder identity, attachment mask/count, texture objects and mip
@@ -1117,13 +1154,31 @@ stores. Intermediate logical attachment definition checks and final
 Viewport, scissor, pipeline, descriptors, push constants, vertex/index bindings
 and the draw command are still recorded individually.
 
-All sampled-image and attachment transitions for a merged run move before its
-begin. Repeated image/mip transitions in that hoist are emitted once. This is
-safe because admitted runs only sample read-only, nonattachment images and
-write their unchanged attachments. The per-operation memory barrier remains
-at the end of the run. Singleton operations retain all their old transitions
-and barriers. Texture layout/definition snapshots still roll back together on
-a pre-submit failure; deferred retirement keeps the existing lane ownership.
+A texture shadow is a read-only optimal image used when a buffer-backed linear
+sampled texture cannot satisfy Vulkan's format/memory/layout requirements.
+`readShadow` records a backing-buffer-to-optimal-image refresh before use. This
+GPU transfer is separate from the frontend's CPU copy of no-copy buffer snapshots
+on the submission worker. CPU writes must precede commit; overlap's existing
+snapshot, shared-range drain, flush/invalidate and retirement rules still apply.
+
+All refresh transfers for a run now execute **once per distinct shadow before
+any sampling/attachment transitions**, then all image/mip transitions execute
+before begin. Read-layout transitions are deduplicated separately from refresh
+transfers; otherwise a repeated sample could copy in a shader-read layout.
+Deduplication ends with the run, so a later frame or run sees new backing bytes.
+A later shadow consumer splits if its backing buffer shares memory or host
+ranges with the unchanged attachments written by earlier draws in that run.
+A refresh needed only on the first draw can precede the run, even with such an
+alias. Shader storage writers and explicit transfers already form boundaries,
+so their dependent refreshes stay after the write. Ordinary read-only shadows
+no longer split.
+
+Ordered input reads can follow earlier color writes inside this one subpass;
+ordinary sampled attachment feedback still splits. The per-operation memory
+barrier remains at the end of the run. Singleton operations retain their old
+transitions and barriers. Texture layout/definition snapshots, including refreshed
+shadows, still roll back together on a pre-submit failure; deferred retirement
+keeps the existing lane ownership.
 
 Splits are deliberately conservative:
 
@@ -1139,8 +1194,10 @@ Splits are deliberately conservative:
   Member-only/unknown contracts stay isolated. An earlier shader's buffer write
   cannot lose its barrier.
 - `buffer_alias`: an index buffer sharing attachment memory or host ranges.
-- `shadow`: sampled linear-shadow refreshes, which record transfers.
-- `fetch`: framebuffer fetch or input attachments.
+- `shadow`: a later refresh reads backing storage written by an earlier
+  attachment draw in the run (memory or host-range alias).
+- `fetch`: framebuffer fetch/input attachments without enabled ordered access;
+  the existing pipeline contract normally refuses these before recording.
 - `non_draw`: uploads, image/buffer copies, mip blits, fills and empty passes,
   including render-area-limited `clearOnly` passes and skipped shader draws.
 
@@ -1158,7 +1215,7 @@ adjacent operation boundaries involving a draw, classified by the first
 blocking reason; a hazard can count on both sides. They are neither counts of
 failed draws nor per-frame averages. The default trace has no appended fields.
 
-The new `test-fuxi-metal-merge.py --glslang "$GLSLANG"` runs production Backend
+The `test-fuxi-metal-merge.py --glslang "$GLSLANG"` suite runs production Backend
 A/B pixel controls on local lavapipe with authored GLSL, ASan/UBSan and a Vulkan
 recording proxy. It compares every defined output byte with merging off/on
 for blending, first Clear/Load, discard followed by clear, partial render areas,
@@ -1169,10 +1226,34 @@ submit/overlap combinations run in fresh processes; true feedback compares
 only an untouched mip. Discard checks verify Vulkan storeOp and undefined
 bookkeeping, not unspecified discarded pixels. The proxy checks real
 pass/draw counts, actual load/store operations and the absence of barriers
-inside a pass. Recording rollback and two outstanding retirement tickets are
-also exercised. M9l adds byte-identical mixed-format 2/4/8 MRT runs, sparse
-slots, and ordered framebuffer-fetch splits. Native MRT frontend assertions
-check encoder identities across `endEncoding`; these require a Mac.
+inside a pass. It also compares pipeline/pass attachment-reference compatibility,
+checks input descriptor views against the active framebuffer, and verifies that
+buffer-to-image copies use their most recently transitioned layouts outside passes.
+Recording rollback and two outstanding retirement tickets are also exercised.
+
+**OBSERVED (host correctness controls):** lavapipe exposes enabled ordered color
+access. Nineteen interleaved programmable-blend fetch/ordinary blend draws reduce
+from 19 passes to one with byte-identical output. A cleared first fetch checks
+an independently calculated color/alpha as well as A/B identity. Mip-target
+changes and two outstanding fetch flights check descriptor-view selection.
+The proxy forces production linear-shadow fallback by hiding linear sampling
+support: eleven draws alternating two shadows reduce from 11 passes / 11 copies
+to one pass / two copies. Three frames change CPU backing bytes and require new
+output each frame. Backing-buffer fills and attachment-memory aliases prove
+refreshes stay after producers; a first-draw-only alias refresh still merges.
+Shadow rollback and two outstanding shadow flights pass; the latter changes
+CPU bytes between submissions using independent per-frame backing allocations,
+so it exercises overlap without racing bytes still read by the earlier flight.
+All controls run with feedback off/on and with overlap/submit reuse combined. Hiding the ordered
+extension tests the fallback separately. When ordered color access is absent,
+fetch pixel controls print an explicit SKIP; ordinary/shadow controls still run.
+
+M9l adds byte-identical mixed-format 2/4/8 MRT runs, sparse slots, and ordered
+four-input fetch merges across fetch/ordinary pipeline changes in both directions.
+The portable `OperationAPITests` compiles the Mac model's `TestBackend.hpp` and
+checks encoder identity plus sparse attachment helpers/copies; no Operation/API
+fields changed in this extension. Native frontend assertions across `endEncoding`
+and full Objective-C compilation still require a Mac.
 
 **OBSERVED (host benchmark):** optimized C++, local lavapipe, 140 sampled draws
 in one encoder identity, two alternating bindings, three warm-up frames and 40
@@ -1184,10 +1265,10 @@ in every benchmark; timings have no pass/fail threshold.
 
 | Descriptor reuse | Merge | Passes/frame | Submit CPU ms/frame, runs 1 / 2 | GPU timestamp ms/frame, runs 1 / 2 |
 | --- | --- | ---: | ---: | ---: |
-| Off | Off | 140 | 2.387 / 3.024 | 5.561 / 6.290 |
-| Off | On | 1 | 2.310 / 1.507 | 4.889 / 4.359 |
-| On | Off | 140 | 1.340 / 1.061 | 8.920 / 5.645 |
-| On | On | 1 | 0.354 / 0.347 | 3.190 / 3.293 |
+| Off | Off | 140 | 1.941 / 3.236 | 4.061 / 6.871 |
+| Off | On | 1 | 2.359 / 1.751 | 5.057 / 4.540 |
+| On | Off | 140 | 0.931 / 1.016 | 5.512 / 4.939 |
+| On | On | 1 | 0.391 / 0.558 | 3.375 / 5.036 |
 
 Each merged frame reports 139 merged continuations and still executes all 140
 draws. Sets/frame remain 140 with descriptor reuse off and two with it on.
@@ -1195,15 +1276,40 @@ Scheduling variance is substantial, especially in the reference GPU interval;
 these results establish host pass reduction and correctness, not a stable
 speedup percentage or an Adreno latency prediction.
 
+**OBSERVED (encoder boundary cost control):** the same runner also holds merge
+and descriptor reuse **on**, varying only one encoder versus 140 encoder IDs.
+It requires all 139 encoder split reasons and all 140 draws on the split path.
+Fresh-process A/B/B/A, three warm-up / 40 measured frames, same local lavapipe:
+
+| Encoders/frame | Passes/frame | Submit CPU ms/frame, runs 1 / 2 | GPU timestamp ms/frame, runs 1 / 2 |
+| ---: | ---: | ---: | ---: |
+| 140 | 140 | 0.818 / 1.356 | 3.257 / 9.497 |
+| 1 | 1 | 0.373 / 0.437 | 3.381 / 3.659 |
+
+The merged draw's amortized submit CPU cost is **2.663 / 3.121 microseconds**;
+the split draw costs **5.839 / 9.687 microseconds**. The paired difference
+divided by 139 extra boundaries is **3.201 / 6.612 microseconds CPU** and
+**−0.892 / 42.000 microseconds GPU** per boundary. This measures the backend's
+boundary plus transitions/barrier path, not an isolated Vulkan begin/end call.
+The negative first GPU difference and large second outlier show that this host
+run cannot establish a stable marginal GPU boundary cost. No timing threshold
+is asserted, and none of these numbers estimates Turnip CCU cost.
+
 Linux verification passed: the new merge suite; frontend portable controls
 (including exact-token policy, storage declaration proofs and trace/reset
 fields); backend fill/copy plus timeout/loss/corruption controls; frame trace;
 M6 with authored GLSL; mipfeedback; overlap; cache, cache-hits and translation;
 M9a through M9b (offline Rust bridge tests and production cache controls);
 M9g/H/I/K/L/M/N/O; staging's policy/storage controls; and the metal build
-dry-run. M9g/H/I/K/L/O also run with merge, overlap and descriptor reuse enabled.
+dry-run. M9g/H/I/K/L/O also passed with merge, overlap and descriptor reuse enabled.
+M9g/I/L/O additionally ran with feedback enabled. H/K contain strict feedback/
+undefined-read refusal assertions: enabling feedback intentionally defeats those
+assertions, so their supported combined run keeps feedback off; feedback-on
+pixels and overlap are covered by the merge/mipfeedback suites. Portable checks
+also include the Mac model Operation API guard. The older metal/metal2/metal2g/
+metal2h kernel/ABI suites passed as well.
 M9l compares byte-identical MRT output across pipeline changes and checks mixed
-final attachment discard actions as well as sparse attachments and fetch splits.
+final attachment discard actions as well as sparse attachments and fetch merges.
 All external inputs were already cached; no downloads or upstream source edits
 were used. Reproduction of the new controls and MRT comparison:
 
@@ -1223,10 +1329,12 @@ run here. The authored AIR paths were covered by the listed Linux suites.
 No firmware or Apple binaries were used. The recording proxy is not full
 Vulkan validation-layer qualification.
 
-Actual CA encoder grouping, merge rate, Turnip CCU behavior under
+CA grouping, pass counts and timing for the original merge opt-in are supplied
+above. The fetch/shadow extension's device merge rate, Turnip CCU behavior under
 `TU_DEBUG=sysmem,nocb`, pixels, memory pressure, latency and presentation Hz
-remain unverified. Conservative attachment-sampling, storage and shadow splits
-can leave many passes intact, especially in mip chains. Hoisting adds
+remain unverified. Attachment-sampling, storage and dependent shadow refresh splits
+can leave passes intact, especially in mip chains. Actual encoder boundaries
+remain regardless of the cost measured on a host. Hoisting adds
 submission-owned planning/transition state; it does not add Vulkan in-flight
 lanes or extend work across encoder/submission boundaries. Feedback's existing
 same-draw undefined texels remain undefined. Compare identical warm device

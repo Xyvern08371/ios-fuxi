@@ -666,6 +666,10 @@ public:
    refs[i]={used++,VK_IMAGE_LAYOUT_GENERAL};
   }
   VkSubpassDescription sub{};sub.pipelineBindPoint=VK_PIPELINE_BIND_POINT_GRAPHICS;sub.colorAttachmentCount=count;sub.pColorAttachments=refs;
+  // One device-wide layout for both fetch and ordinary pipelines, including
+  // runtime variants: input references participate in pass compatibility.
+  // orderedColorAccess is already in CompileOptions / translator identity;
+  // variants inherit those options. Merge changes recording only, not this ABI.
   if(orderedColorAccess){sub.flags=VK_SUBPASS_DESCRIPTION_RASTERIZATION_ORDER_ATTACHMENT_COLOR_ACCESS_BIT_EXT;sub.inputAttachmentCount=count;sub.pInputAttachments=refs;}
   VkSubpassDependency deps[2]{};deps[0].srcSubpass=VK_SUBPASS_EXTERNAL;deps[0].dstSubpass=0;
   deps[0].srcStageMask=VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;deps[0].dstStageMask=VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
@@ -1042,18 +1046,17 @@ public:
     mergeEnds.resize(ops.size());
     auto isolated=[&](size_t n)->MergeSplit {
      auto &op=ops[n];if(!op.texture || !op.pipeline || op.clearOnly || op.upload || op.generateMips || op.src || op.dst)return MergeSplit::nonDraw;
-     if(op.pipeline->fetchMask)return MergeSplit::fetch;
+     if(op.pipeline->fetchMask && !orderedColorAccess)return MergeSplit::fetch;
      if(op.indices)for(unsigned i=0;i<op.colorCount;++i){auto *t=op.color(i).texture;auto *b=op.indices;
       if(t && (b->memory==t->memory || hostRangesOverlap(b->contents,b->length,t->mapped,t->allocated)))return MergeSplit::bufferAlias;
      }
      for(unsigned j=0;j<draws[n].descriptorCount;++j){auto &d=draws[n].descriptors[j];auto type=d.type;
-      if(type==VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT)return MergeSplit::fetch;
+      if(type==VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT && !orderedColorAccess)return MergeSplit::fetch;
       if(type==VK_DESCRIPTOR_TYPE_STORAGE_IMAGE || type==VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER)return MergeSplit::storage;
       if(type==VK_DESCRIPTOR_TYPE_STORAGE_BUFFER)for(unsigned stage=0;stage<2;++stage)
        if((d.stages&(stage?16u:1u)) && (d.binding>=16 || !(op.pipeline->readOnlyStorage[stage]&(1u<<d.binding))))return MergeSplit::storage;
      }
      for(unsigned slot=0;slot<resourceSlots;++slot){auto *sample=op.samples[slot];if(!slot && !sample)sample=op.sourceTexture;if(!sample)continue;
-      if(sample->shadow)return MergeSplit::shadow;
       for(unsigned i=0;i<op.colorCount;++i){auto *t=op.color(i).texture;if(t && (sample==t || sample->image==t->image || sample->memory==t->memory || hostRangesOverlap(sample->mapped,sample->allocated,t->mapped,t->allocated)))return MergeSplit::attachmentSample;}
      }
      return MergeSplit::none;
@@ -1068,6 +1071,17 @@ public:
       if(c.texture!=d.texture || c.level!=d.level || x.pipeline->options.color(i).format!=y.pipeline->options.color(i).format)return MergeSplit::attachments;
       // Only encoder-internal load/store boundaries may disappear.
       if(c.texture && (c.store!=1 || d.load!=1))return MergeSplit::actions;
+     }
+     // A refresh reads backing storage, not the optimal sample image. Any
+     // earlier draw in this run writes these same attachments, so only a
+     // consumer on the right needs a split if its backing storage aliases
+     // them. A refresh on the first draw can still move before the whole run.
+     // Shader storage writers and explicit transfers are isolated above.
+     for(unsigned slot=0;slot<resourceSlots;++slot){auto *sample=y.samples[slot];if(!slot && !sample)sample=y.sourceTexture;
+      if(!sample || !sample->shadow)continue;auto *backing=sample->backingBuffer;
+      for(unsigned i=0;i<x.colorCount;++i){auto *t=x.color(i).texture;
+       if(t && backing && (backing->memory==t->memory || hostRangesOverlap(backing->contents,backing->length,t->mapped,t->allocated)))return MergeSplit::shadow;
+      }
      }
      return MergeSplit::none;
     };
@@ -1164,12 +1178,15 @@ public:
     region.imageSubresource={VK_IMAGE_ASPECT_COLOR_BIT,0,0,1};region.imageExtent={t->width,t->height,1};
     CmdCopyBufferToImage(cmd,t->backingBuffer->buffer,t->image,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,1,&region);t->setDefined(0);
    };
-   auto prepareImages=[&](size_t opIndex){diagnosticOp=opIndex;const auto &op=ops[opIndex];
-    // Refresh outside the render pass, after any preceding buffer writes.
-    std::vector<Texture *> refreshed;
+   std::vector<Texture *> refreshed;
+   auto refreshImages=[&](size_t opIndex){diagnosticOp=opIndex;const auto &op=ops[opIndex];
+    // Once per run, after preceding writes and before any sample transitions.
+    // Never deduplicate the transfer-destination transition with a read layout.
     auto readShadow=[&](Texture *t){if(t && t->shadow && std::find(refreshed.begin(),refreshed.end(),t)==refreshed.end()){refresh(t);refreshed.push_back(t);}};
     for(auto *sample:op.samples)readShadow(sample);readShadow(op.sourceTexture);
     if(!op.pipeline && !op.upload && !op.sourceTexture && !op.clearOnly)readShadow(op.texture);
+   };
+   auto prepareImages=[&](size_t opIndex){diagnosticOp=opIndex;const auto &op=ops[opIndex];
     for(unsigned slot=0;slot<resourceSlots;++slot)if(auto *t=op.samples[slot]){
      uint32_t base=op.sampleBase[slot],count=op.sampleCount[slot]?op.sampleCount[slot]:t->levels-base;
      if(base>=t->levels || !count || count>t->levels-base)throw std::runtime_error("sample mip range");
@@ -1190,7 +1207,8 @@ public:
    for(size_t opIndex=0;opIndex<ops.size();++opIndex) {diagnosticOp=opIndex;const auto &op=ops[opIndex];const auto &draw=draws[opIndex];
     size_t passEnd=mergeEnds.empty()?opIndex:mergeEnds[opIndex];
     bool continuation=opIndex && !mergeEnds.empty() && mergeEnds[opIndex-1]>=opIndex;
-    if(!continuation){hoisting=passEnd>opIndex;hoisted.clear();for(size_t i=opIndex;i<=passEnd;++i)prepareImages(i);hoisting=false;diagnosticOp=opIndex;}
+    if(!continuation){refreshed.clear();for(size_t i=opIndex;i<=passEnd;++i)refreshImages(i);
+     hoisting=passEnd>opIndex;hoisted.clear();for(size_t i=opIndex;i<=passEnd;++i)prepareImages(i);hoisting=false;diagnosticOp=opIndex;}
     if(op.generateMips){auto *t=op.texture;
      if(!t->isDefined(op.mipBase))throw std::runtime_error("undefined mip generation source");
      for(uint32_t l=op.mipBase+1;l<op.mipBase+op.mipCount;++l){
