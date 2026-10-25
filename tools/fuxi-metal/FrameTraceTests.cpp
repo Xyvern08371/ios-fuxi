@@ -20,7 +20,7 @@ int main(){
  assert(strstr(line,"submits/frame=2.00 image_barriers/frame=7.00 read_barriers_skipped/frame=3.00 cross_encoder_merges/frame=1.00 wait_reasons=drain:100,conflict:0,slots:0"));
  assert(strstr(line,"commit_call=0.050/0.090 commit_gap=0.100/0.180"));
  assert(strstr(line,"prior_wait_completed=0.000/0.000 backend_cpu=0.500/0.900 frontend_cpu=1.000/1.800 frontend_wall=1.500/2.700 pipe=2.000/3.600 desc=2.500/4.500 record=3.000/5.400 kernel_io=3.500/6.300"));
- assert(strstr(line,"pipe_cpu=0.400/0.720 desc_cpu=0.000/0.000 record_cpu=0.000/0.000 flush_cpu=0.000/0.000 kernel_io_cpu=0.000/0.000 queue_submit_cpu=0.000/0.000\n"));
+ assert(strstr(line,"pipe_cpu=0.400/0.720 desc_cpu=0.000/0.000 record_cpu=0.000/0.000 flush_cpu=0.000/0.000 kernel_io_cpu=0.000/0.000 queue_submit_cpu=0.000/0.000 cpu_sampled_submits/frame=0.00 cpu_omitted_submits/frame=0.00\n"));
  assert(!window.size());fclose(out);
  // Overflow retains the newest 1024 samples; window max includes evicted data.
  FrameSample s;s.wall=9999999999;window.add(s);

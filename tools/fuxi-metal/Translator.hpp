@@ -1,6 +1,7 @@
 /* Original dynamic boundary. The translator and all its dependencies stay external. */
 #pragma once
 #include <cstddef>
+#include <cstring>
 #include "ConstantLayout.hpp"
 #include "CAState.hpp"
 #include "TranslationPolicy.hpp"
@@ -34,6 +35,17 @@ struct VertexBinding {uint32_t binding{},slot{},stride{};};
 struct VertexAttribute {uint32_t location{},binding{},format{},offset{};};
 struct BoundBuffer {uint64_t length{},offset{};uint32_t bytes{};};
 struct DrawInput {BoundBuffer buffers[2][resourceSlots]{};uint32_t formats[resourceSlots]{},filters[resourceSlots]{};float lodMin[resourceSlots]{},lodMax[resourceSlots]{};uint32_t count{},start{},indexed{},strip{};uint64_t indexLength{},indexOffset{};};
+// Compare every ABI input field, without struct padding or float arithmetic.
+// The draw planner reads only these values and the immutable product. Buffer
+// contents, image layouts and resource identity are validated by Backend later.
+inline bool sameDrawInput(const DrawInput &a,const DrawInput &b) {
+ if(a.count!=b.count || a.start!=b.start || a.indexed!=b.indexed || a.strip!=b.strip || a.indexLength!=b.indexLength || a.indexOffset!=b.indexOffset)return false;
+ for(unsigned i=0;i<resourceSlots;++i){
+  if(a.formats[i]!=b.formats[i] || a.filters[i]!=b.filters[i] || memcmp(&a.lodMin[i],&b.lodMin[i],sizeof(float)) || memcmp(&a.lodMax[i],&b.lodMax[i],sizeof(float)))return false;
+  for(unsigned stage=0;stage<2;++stage){auto &x=a.buffers[stage][i];auto &y=b.buffers[stage][i];if(x.length!=y.length || x.offset!=y.offset || x.bytes!=y.bytes)return false;}
+ }
+ return true;
+}
 struct Push {uint32_t offset{},size{},stages{};uint8_t bytes[128]{};};
 struct DrawOutput {uint32_t descriptorCount{},pushCount{},vertexCount{},indexed{},count{},first{};uint64_t indexOffset{};Descriptor descriptors[16]{};Push pushes[2]{};uint32_t vertexBindings[4]{},vertexSlots[4]{};uint64_t vertexOffsets[4]{};};
 struct Specialization {uint32_t id{},offset{},size{};};

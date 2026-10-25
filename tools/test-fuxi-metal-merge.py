@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Production render-pass merge A/B pixels and 140-draw host benchmark; no downloads."""
+"""Production render-pass merge A/B pixels and 120-draw host benchmark; no downloads."""
 import argparse
 import importlib.util
 import os
@@ -15,7 +15,11 @@ def main():
     ap.add_argument('--headers', type=Path, default=Path('/usr/include'))
     ap.add_argument('--icd', type=Path, default=Path('/lib/x86_64-linux-gnu/libvulkan_lvp.so'))
     ap.add_argument('--glslang', default=shutil.which('glslangValidator'))
+    ap.add_argument('--translator', type=Path, help='optional external bridge for authored AIR planning benchmark')
+    ap.add_argument('--llvm-as', default=shutil.which('llvm-as-18'))
     a = ap.parse_args()
+    if a.translator and not a.llvm_as:
+        ap.error('supply --llvm-as with --translator')
     if not a.glslang:
         ap.error('supply an existing glslangValidator with --glslang')
     spec = importlib.util.spec_from_file_location('m6', ROOT/'tools/test-fuxi-metal-m6.py')
@@ -45,8 +49,8 @@ void main() {color=textureLod(image,vec2(0.5),constants.lod);}
         definitions = ['-DFUXI_MTL_HOST_TEST', '-DFUXI_MTL_ICD="'+str(d/'proxy.so')+'"', '-DFUXI_MTL_TRANSLATOR="'+str(d/'bridge.so')+'"']
         subprocess.run(common+sanitized+['-shared', '-fPIC', str(ROOT/'tools/fuxi-metal/RenderMergeBridge.cpp'), '-o', str(d/'bridge.so')], check=True)
         subprocess.run(common+sanitized+definitions+[str(ROOT/'tools/fuxi-metal/RenderMergeTests.cpp'), '-ldl', '-pthread', '-o', str(d/'test')], check=True)
-        def invoke(binary, args, **overrides):
-            p = subprocess.run([str(binary)], env=dict(env, FUXI_MTL_TEST_BOOTARGS='fuxigpuframetrace=1 '+args, **overrides), text=True, capture_output=True, timeout=90)
+        def invoke(binary, args, cli=(), trace="1", **overrides):
+            p = subprocess.run([str(binary), *map(str, cli)], env=dict(env, FUXI_MTL_TEST_BOOTARGS='fuxigpuframetrace='+trace+' '+args, **overrides), text=True, capture_output=True, timeout=90)
             assert p.returncode == 0, p.stderr
             assert 'AddressSanitizer' not in p.stderr and 'runtime error:' not in p.stderr, p.stderr
             return p.stdout
@@ -58,6 +62,8 @@ void main() {color=textureLod(image,vec2(0.5),constants.lod);}
             if not extra:
                 skips = [line for line in baseline.splitlines() if line.startswith('SKIP:')]
                 print('\n'.join(skips) if skips else 'PASS: lavapipe exposes ordered attachment access; fetch clear/interleaved/mip/two-flight pixels tested')
+        assert invoke(d/'test', 'fuxigpumerge=1 fuxigpusubmit=1', trace='2') == invoke(d/'test', 'fuxigpumerge=1 fuxigpusubmit=1')
+        print('PASS: level-2 bounded CPU sampling preserves merged pixels')
         # Both bits independently and together, including two flights and the
         # feedback path. Pixels must match the unchanged singleton baseline.
         baseline = invoke(d/'test', 'fuxigpuoverlap=1 fuxigpusubmit=1 fuxigpufeedback=1')
@@ -83,12 +89,14 @@ void main() {color=textureLod(image,vec2(0.5),constants.lod);}
         subprocess.run(common+['-O2', '-shared', '-fPIC', str(ROOT/'tools/fuxi-metal/MipFeedbackBridge.cpp'), '-o', str(d/'bench-bridge.so')], check=True)
         definitions[1] = '-DFUXI_MTL_ICD="'+str(a.icd.resolve())+'"'
         definitions[-1] = '-DFUXI_MTL_TRANSLATOR="'+str(d/'bench-bridge.so')+'"'
+        subprocess.run(common+sanitized+definitions+[str(ROOT/'tools/fuxi-metal/VariantPlanTests.cpp'), '-ldl', '-pthread', '-o', str(d/'variants')], check=True)
+        print(invoke(d/'variants', 'fuxigpumerge=1 fuxigpusubmit=1', CONTROL_REQUIRE_VARIANT='1'), end='')
         subprocess.run(common+['-O2']+definitions+[str(ROOT/'tools/fuxi-metal/SubmitBench.cpp'), '-ldl', '-pthread', '-o', str(d/'bench')], check=True)
         for fast in ('', 'fuxigpusubmit=1'):
             for args in ('', 'fuxigpumerge=1', 'fuxigpumerge=1', ''):
                 print(invoke(d/'bench', fast+' '+args), end='')
         # Keep merge and descriptor policy fixed; only real encoder boundaries
-        # vary. Attribute the delta over 139 additional boundaries per frame.
+        # vary. Attribute the delta over 119 additional boundaries per frame.
         results = []
         for split in (True, False, False, True):
             overrides = {'MERGE_BENCH_ENCODERS': '1'} if split else {}
@@ -99,8 +107,16 @@ void main() {color=textureLod(image,vec2(0.5),constants.lod);}
         for mask in ('1', '2', '3'):
             print(invoke(d/'bench', 'fuxigpumerge=1 fuxigpusubmit=1 fuxigpuperf='+mask, MERGE_BENCH_ENCODERS='1'), end='')
         for a_index, b_index in ((0, 1), (3, 2)):
-            delta = [(results[a_index][i]-results[b_index][i])*1000/139 for i in range(2)]
+            delta = [(results[a_index][i]-results[b_index][i])*1000/119 for i in range(2)]
             print('BOUNDARY_DELTA cpu_us/boundary=%.3f gpu_us/boundary=%.3f (host only; no threshold)' % tuple(delta))
+
+        if a.translator:
+            air = d/'control.bc'
+            subprocess.run([a.llvm_as, str(ROOT/'tools/shaders/metal-m7-control.ll'), '-o', str(air)], check=True)
+            definitions[-1] = '-DFUXI_MTL_TRANSLATOR="'+str(a.translator.resolve())+'"'
+            subprocess.run(common+['-O2']+definitions+[str(ROOT/'tools/fuxi-metal/SubmitBench.cpp'), '-ldl', '-pthread', '-o', str(d/'air-bench')], check=True)
+            for fast in ('', 'fuxigpusubmit=1'):
+                print(invoke(d/'air-bench', 'fuxigpumerge=1 '+fast, cli=(air,)), end='')
 
 if __name__ == '__main__':
     main()

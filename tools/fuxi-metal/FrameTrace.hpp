@@ -5,6 +5,7 @@
 #include <array>
 #include <atomic>
 #include <ctime>
+#include <thread>
 #if defined(__APPLE__)
 #include <mach/mach.h>
 #include <pthread.h>
@@ -52,6 +53,7 @@ enum class MergeSplit : size_t {none,encoder,attachments,area,actions,attachment
 inline constexpr const char *mergeSplitNames[]={"none","encoder","attachments","area","actions","attachment_sample","storage","shadow","fetch","non_draw","buffer_alias"};
 struct FrameSample {
  uint64_t backendCPU=0,frontendCPU=0,frontendWall=0;
+ uint64_t cpuSampledSubmits=0,cpuOmittedSubmits=0;
  uint64_t pipe=0,desc=0,record=0,kernelIO=0;
  uint64_t backendLockCPU=0,slotWaitCPU=0,pipeCPU=0,descCPU=0,recordCPU=0,flushCPU=0,kernelIOCPU=0,queueSubmitCPU=0;
  uint64_t wall=0,cpuBeforeCommit=0,shadowCopy=0,leaseLock=0,backendSubmit=0,gpuWait=0,gpuExec=0;
@@ -75,13 +77,13 @@ struct FrameTraceScope {
 };
 // Disabled scopes read no clocks, touch no atomics and allocate nothing.
 class FrameStageTimer {
- FrameSample *sample;uint64_t FrameSample::*wall;uint64_t FrameSample::*cpu;
- FrameClock::time_point start{};uint64_t cpuStart=UINT64_MAX;
+ FrameSample *sample;uint64_t FrameSample::*wall;
+ FrameClock::time_point start{};
 public:
- FrameStageTimer(FrameSample *s,uint64_t FrameSample::*w,uint64_t FrameSample::*c):sample(s),wall(w),cpu(c) {
-  if(sample){start=FrameClock::now();cpuStart=frameThreadCPU();}
+ FrameStageTimer(FrameSample *s,uint64_t FrameSample::*w):sample(s),wall(w) {
+  if(sample)start=FrameClock::now();
  }
- void stop(){if(sample){auto end=frameThreadCPU();sample->*wall+=frameNanos(start);sample->*cpu+=frameCPUDelta(cpuStart,end);sample=nullptr;}}
+ void stop(){if(sample){sample->*wall+=frameNanos(start);sample=nullptr;}}
  ~FrameStageTimer(){stop();}
  FrameStageTimer(const FrameStageTimer &)=delete;
  FrameStageTimer &operator=(const FrameStageTimer &)=delete;
@@ -89,26 +91,42 @@ public:
 // These are API envelopes: the external Vulkan driver owns its actual GPU ABI
 // syscalls. Do not interpret this as kernel-only execution or add it to submit.
 template<class Call> decltype(auto) frameKernelCall(Call &&call) {
- FrameStageTimer timer(systemTranslationPolicy().frameTrace?currentFrame:nullptr,&FrameSample::kernelIO,&FrameSample::kernelIOCPU);
+ FrameStageTimer timer(systemTranslationPolicy().frameTrace?currentFrame:nullptr,&FrameSample::kernelIO);
  return call();
 }
+// CPU sampling brackets the first frontend method through commit preparation.
+// This includes client work between methods; never subtract clocks from different
+// threads. Valid Metal encoding serializes access to a command buffer's encoders.
 struct FrontendTimes {
- std::atomic<uint64_t> cpu{0},wall{0};
- void copyTo(FrameSample &s) const {s.frontendCPU=cpu.load(std::memory_order_relaxed);s.frontendWall=wall.load(std::memory_order_relaxed);}
+ std::atomic<uint64_t> wall{0};
+ uint64_t cpuStart=UINT64_MAX,cpu=0;bool started=false,migrated=false,finished=false;
+ std::thread::id thread;
+ void begin(){
+  if(finished)return;
+  if(!started){started=true;thread=std::this_thread::get_id();cpuStart=frameThreadCPU();}
+  else if(thread!=std::this_thread::get_id())migrated=true;
+ }
+ void copyTo(FrameSample &s) {
+  s.frontendWall=wall.load(std::memory_order_relaxed);
+  if(started && !finished){finished=true;
+   if(!migrated && thread==std::this_thread::get_id())cpu=frameCPUDelta(cpuStart,frameThreadCPU());
+  }
+  s.frontendCPU=cpu;
+ }
 };
-// Sum only method residence, never gaps between calls. Nesting on the same
-// command buffer is counted once; different encoding threads take local deltas.
+// Only level 2 enables frontend method wall timing. Nesting counts once; the
+// CPU clock is read at most twice per command buffer, never once per method.
 class FrontendTimer {
  FrontendTimes *times;FrontendTimer *previous=nullptr;
  inline static thread_local FrontendTimer *active=nullptr;
- FrameClock::time_point start{};uint64_t cpuStart=UINT64_MAX;
+ FrameClock::time_point start{};
 public:
- explicit FrontendTimer(FrontendTimes *t):times(t) {
+ explicit FrontendTimer(FrontendTimes *t):times(systemTranslationPolicy().frameCPU?t:nullptr) {
   if(!times)return;
-  for(auto *p=active;p;p=p->previous)if(p->times==t){times=nullptr;return;}
-  previous=active;active=this;start=FrameClock::now();cpuStart=frameThreadCPU();
+  for(auto *p=active;p;p=p->previous)if(p->times==times){times=nullptr;return;}
+  times->begin();previous=active;active=this;start=FrameClock::now();
  }
- void stop(){if(times){auto end=frameThreadCPU();times->wall.fetch_add(frameNanos(start),std::memory_order_relaxed);times->cpu.fetch_add(frameCPUDelta(cpuStart,end),std::memory_order_relaxed);active=previous;times=nullptr;}}
+ void stop(){if(times){times->wall.fetch_add(frameNanos(start),std::memory_order_relaxed);active=previous;times=nullptr;}}
  ~FrontendTimer(){stop();}
  FrontendTimer(const FrontendTimer &)=delete;
  FrontendTimer &operator=(const FrontendTimer &)=delete;
@@ -131,6 +149,7 @@ public:
   if(s.createdNs)lastCreated=s.createdNs;++count;wallMax=std::max(wallMax,s.wall);
   draws+=s.draws;passes+=s.passes;counts.pipelines+=s.counts.pipelines;counts.descriptors+=s.counts.descriptors;counts.allocations+=s.counts.allocations;
   mergedDraws+=s.mergedDraws;for(size_t i=1;i<mergeSplits.size();++i)mergeSplits[i]+=s.mergeSplits[i];
+  totals.cpuSampledSubmits+=s.cpuSampledSubmits;totals.cpuOmittedSubmits+=s.cpuOmittedSubmits;
   totals.queueSubmits+=s.queueSubmits;totals.imageBarriers+=s.imageBarriers;totals.readBarriersSkipped+=s.readBarriersSkipped;totals.crossEncoderMerges+=s.crossEncoderMerges;
   totals.drainWaits+=s.drainWaits;totals.conflictWaits+=s.conflictWaits;totals.slotWaits+=s.slotWaits;
   gpuUnavailable+=!s.gpuSamples;++cpus[s.cpu<8?s.cpu:8];encodeUnknown+=s.encodeCountsUnknown;
@@ -169,6 +188,7 @@ public:
   stage("pipe",&FrameSample::pipe);stage("desc",&FrameSample::desc);stage("record",&FrameSample::record);stage("kernel_io",&FrameSample::kernelIO);
   stage("backend_lock_cpu",&FrameSample::backendLockCPU);stage("slot_wait_cpu",&FrameSample::slotWaitCPU);
   stage("pipe_cpu",&FrameSample::pipeCPU);stage("desc_cpu",&FrameSample::descCPU);stage("record_cpu",&FrameSample::recordCPU);stage("flush_cpu",&FrameSample::flushCPU);stage("kernel_io_cpu",&FrameSample::kernelIOCPU);stage("queue_submit_cpu",&FrameSample::queueSubmitCPU);
+  fprintf(out," cpu_sampled_submits/frame=%.2f cpu_omitted_submits/frame=%.2f",totals.cpuSampledSubmits/n,totals.cpuOmittedSubmits/n);
   fputc('\n',out);
   funlockfile(out);
   count=wallMax=draws=passes=encodeUnknown=gpuUnavailable=mergedDraws=0;mergeSplits.fill(0);counts={};totals={};cpus.fill(0);cadence.fill(0);

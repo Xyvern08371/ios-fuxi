@@ -18,6 +18,8 @@ int main(int argc,char **argv){
  assert(!translationPolicy(nullptr).merge && translationPolicy("fuxigpumerge=1").merge);
  assert(!translationPolicy(nullptr).gmem && translationPolicy("fuxigpugmem=1").gmem && !translationPolicy("fuxigpugmem=1").allowFeedback);
  assert(!translationPolicy(nullptr).allowFeedback && translationPolicy("fuxigpufeedback=1").allowFeedback && !translationPolicy("fuxigpufeedback=1").skipSampling);
+ for(unsigned level=0;level<=2;++level){auto p=translationPolicy(("fuxigpuframetrace="+std::to_string(level)).c_str());assert(p.frameTrace==(level!=0) && p.frameCPU==(level==2));}
+ for(auto suffix:{"3","-1","02","2x","","2 fuxigpuframetrace=1","1 fuxigpuframetrace=2","2 fuxigpuframetrace=2"}){auto p=translationPolicy((std::string("fuxigpuframetrace=")+suffix).c_str());assert(!p.frameTrace && !p.frameCPU);}
  assert(!translationPolicy(nullptr).frameTrace && !translationPolicy(nullptr).pipelined);
  assert(translationPolicy("fuxigpuframetrace=1").frameTrace && !translationPolicy("fuxigpuframetrace=1").pipelined);
  assert(translationPolicy("fuxigpupipelined=1").pipelined && !translationPolicy("fuxigpupipelined=1").frameTrace);

@@ -77,13 +77,15 @@ struct Texture : TextureLevels {VkImage image{};VkDeviceMemory memory{};VkImageV
  // layout is level zero; levelLayouts[1..levels) track the remaining mips.
  VkImageTiling tiling=VK_IMAGE_TILING_OPTIMAL;VkImageLayout layout=VK_IMAGE_LAYOUT_UNDEFINED;std::array<VkImageLayout,32> levelLayouts{};void *mapped{};bool imported=false,borrowedMemory=false;
  Buffer *backingBuffer{};size_t backingOffset{},backingRow{};bool shadow=false;
- std::vector<VkImageView> attachmentViews;bool canGenerate=false,filterable=true;};
+ std::vector<VkImageView> attachmentViews;bool canGenerate=false,filterable=true,blendable=false;};
 struct Sampler {size_t references=1;VkSampler sampler{};uint32_t filters=1;float lodMin=0,lodMax=0;};
 struct VariantKey {
- std::string legacy;std::array<uint32_t,resourceSlots*8> words{};
- bool operator==(const VariantKey &other) const {return !legacy.empty() || !other.legacy.empty()?legacy==other.legacy:words==other.words;}
+ std::array<uint32_t,resourceSlots*8> words{};
+ explicit VariantKey(const DrawInput &input){for(unsigned i=0;i<resourceSlots;++i){auto *w=&words[i*8];w[0]=input.formats[i];w[1]=input.filters[i];memcpy(w+2,&input.lodMin[i],4);memcpy(w+3,&input.lodMax[i],4);for(unsigned stage=0;stage<2;++stage){w[4+stage*2]=input.buffers[stage][i].length!=0;w[5+stage*2]=input.buffers[stage][i].bytes;}}}
+ bool operator==(const VariantKey &other) const {return words==other.words;}
 };
-struct Pipeline {std::array<uint32_t,resourceSlots> textureTypes{};size_t references=1,retainedBytes=0;void *translation{};CompileOptions options{};uint32_t fetchMask{};bool orderedColorAccess=false;std::vector<std::pair<uint32_t,VkRenderPass>> renders;VkPipeline pipeline{},stripPipeline{};std::array<VkPipeline,2> linePipelines{};Translation recipe{};VkPipelineLayout layout{};VkRenderPass render{};uint32_t pushOffset{},pushSize{},pushStages{};uint8_t pushBytes[128]{};VkDescriptorSetLayout setLayout{};VkSampler bakedSamplers[16]{};BakedSampler bakedSamplerInfo[16]{};MipAccess mipAccess[2];uint32_t readOnlyStorage[2]{};std::vector<Descriptor> descriptors;std::vector<Buffer *> constantBlobs;std::vector<std::array<uint8_t,32>> blobHashes;std::vector<std::pair<VariantKey,Pipeline *>> variants;};
+struct Pipeline {std::array<uint32_t,resourceSlots> textureTypes{};size_t references=1,retainedBytes=0;void *translation{};CompileOptions options{};uint32_t fetchMask{};bool orderedColorAccess=false;std::vector<std::pair<uint32_t,VkRenderPass>> renders;VkPipeline pipeline{},stripPipeline{};std::array<VkPipeline,2> linePipelines{};Translation recipe{};VkPipelineLayout layout{};VkRenderPass render{};uint32_t pushOffset{},pushSize{},pushStages{};uint8_t pushBytes[128]{};VkDescriptorSetLayout setLayout{};VkSampler bakedSamplers[16]{};BakedSampler bakedSamplerInfo[16]{};MipAccess mipAccess[2];uint32_t readOnlyStorage[2]{};std::vector<Descriptor> descriptors;std::vector<Buffer *> constantBlobs;std::vector<std::array<uint8_t,32>> blobHashes;std::vector<std::pair<VariantKey,Pipeline *>> variants;
+};
 struct BufferBind {Buffer *buffer{};uint64_t offset{};bool bytes=false;};
 struct ColorTarget {Texture *texture{};uint32_t level{},load=2,store=1;float clear[4]{};};
 struct Operation {
@@ -429,7 +431,7 @@ public:
    check(frameKernelCall([&]{return BindImageMemory(device,t->image,b->memory,offset);}));t->memory=b->memory;t->memoryType=b->memoryType;t->borrowedMemory=true;t->allocated=req.size;
    t->mapped=(uint8_t *)b->contents+offset;t->layout=ci.initialLayout;t->defined=true;t->usage=ci.usage;
    VkImageViewCreateInfo vi{};vi.sType=VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;vi.image=t->image;vi.viewType=VK_IMAGE_VIEW_TYPE_2D;vi.format=t->vkFormat;vi.subresourceRange={VK_IMAGE_ASPECT_COLOR_BIT,0,1,0,1};
-   check(CreateImageView(device,&vi,nullptr,&t->view));t->filterable=formatProperties.linearTilingFeatures&VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT;t->backingBuffer=b;++b->references;return t;
+   check(CreateImageView(device,&vi,nullptr,&t->view));t->blendable=formatProperties.linearTilingFeatures&VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT;t->filterable=formatProperties.linearTilingFeatures&VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT;t->backingBuffer=b;++b->references;return t;
   }catch(...){destroyTextureUnlocked(t);throw;}
  }
  void destroyUnlocked(Buffer *b) {
@@ -495,7 +497,7 @@ public:
   if(!(features&VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT) || (features&VK_EXTERNAL_MEMORY_FEATURE_DEDICATED_ONLY_BIT) ||
      !(ep.externalMemoryProperties.compatibleHandleTypes&external.handleType) || props.imageFormatProperties.maxExtent.width<width || props.imageFormatProperties.maxExtent.height<height)
    throw std::runtime_error("IOSurface linear BGRA8 sampled/render/transfer import unsupported");
-  auto *t=new Texture{};t->width=width;t->height=height;t->usage=info.usage;t->tiling=VK_IMAGE_TILING_LINEAR;t->imported=true;t->defined=true;t->layout=VK_IMAGE_LAYOUT_PREINITIALIZED;
+  auto *t=new Texture{};t->blendable=linearFeatures&VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT;t->width=width;t->height=height;t->usage=info.usage;t->tiling=VK_IMAGE_TILING_LINEAR;t->imported=true;t->defined=true;t->layout=VK_IMAGE_LAYOUT_PREINITIALIZED;
   try {
    VkExternalMemoryImageCreateInfo ei{};ei.sType=VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO;ei.handleTypes=external.handleType;
    VkImageCreateInfo ii{};ii.sType=VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;ii.pNext=&ei;ii.imageType=info.type;ii.format=info.format;
@@ -538,7 +540,7 @@ public:
   if(usage&4)needed|=VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT;
   if((features.optimalTilingFeatures&needed)!=needed)throw std::runtime_error("texture format features unavailable");
   auto *t=new Texture{};t->width=width;t->height=height;t->levels=levels;t->textureType=type;t->format=format;t->vkFormat=pixelFormat(format);
-  t->filterable=features.optimalTilingFeatures&VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT;
+  t->blendable=features.optimalTilingFeatures&VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT;t->filterable=features.optimalTilingFeatures&VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT;
   t->canGenerate=(features.optimalTilingFeatures&(VK_FORMAT_FEATURE_BLIT_SRC_BIT|VK_FORMAT_FEATURE_BLIT_DST_BIT|VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT))==(VK_FORMAT_FEATURE_BLIT_SRC_BIT|VK_FORMAT_FEATURE_BLIT_DST_BIT|VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT);
   try {
    VkImageCreateInfo ii{};ii.sType=VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;ii.imageType=type==0?VK_IMAGE_TYPE_1D:VK_IMAGE_TYPE_2D;ii.format=t->vkFormat;
@@ -826,9 +828,7 @@ public:
   auto submitStart=std::chrono::steady_clock::now();auto submitQueued=submitStart;
   auto since=[](std::chrono::steady_clock::time_point t){return (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-t).count();};
   auto *timing=systemTranslationPolicy().frameTrace?currentFrame:nullptr;
-  auto lockCPU=timing?frameThreadCPU():UINT64_MAX;
   std::unique_lock<std::mutex> guard(mutex);
-  if(timing)timing->backendLockCPU+=frameCPUDelta(lockCPU,frameThreadCPU());
   if(currentFrame)currentFrame->backendLock+=since(submitStart);
   requireLive();std::vector<HostUse> hostUses;
   if(retirement || systemTranslationPolicy().overlap){
@@ -843,9 +843,7 @@ public:
   bool drain=bool(prepare) || (retirement && std::any_of(ops.begin(),ops.end(),[](const auto &op){return op.indices!=nullptr;}));
   auto slotStart=FrameClock::now();
   if(currentFrame){currentFrame->drainWaits+=drain && (slots[0].busy || slots[1].busy);currentFrame->conflictWaits+=conflicts();currentFrame->slotWaits+=slots[0].busy && (!retirement || slots[1].busy);}
-  auto slotCPU=timing?frameThreadCPU():UINT64_MAX;
   submitWake.wait(guard,[&]{return (!slots[0].busy || (retirement && !slots[1].busy)) && (!drain || (!slots[0].busy && !slots[1].busy)) && !conflicts();});
-  if(timing)timing->slotWaitCPU+=frameCPUDelta(slotCPU,frameThreadCPU());
   if(currentFrame)currentFrame->slotWait+=since(slotStart);
   requireLive();auto &slot=slots[slots[0].busy?1:0];
   auto &commandPool=slot.commandPool;auto &command=slot.command;auto &submitFence=slot.submitFence;auto &queryPool=slot.queryPool;
@@ -855,7 +853,10 @@ public:
 #endif
   auto locked=currentFrame?FrameClock::now():FrameClock::time_point{};if(currentFrame)currentFrame->leaseLock+=uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(locked-submitStart).count());
   if(prepare){prepare();if(currentFrame)locked=FrameClock::now();}
-  auto backendCPU=timing?frameThreadCPU():UINT64_MAX;
+  auto *cpuTiming=systemTranslationPolicy().frameCPU && timing && !timing->cpuSampledSubmits?timing:nullptr;
+  if(cpuTiming)++cpuTiming->cpuSampledSubmits;
+  else if(timing && systemTranslationPolicy().frameCPU)++timing->cpuOmittedSubmits;
+  auto backendCPU=cpuTiming?frameThreadCPU():UINT64_MAX;
   CacheActivity activity{cacheMode==CacheMode::persistent?&cacheActivity:nullptr};
   ArtifactCache::Access artifactAccess(artifactCache);
   Translator::Scope cacheScope(artifactCallbacks,artifactCache.available()?&artifactAccess:nullptr,ArtifactCache::read,ArtifactCache::write,ArtifactCache::outcome,artifactCallbacksVerified,ArtifactCache::readVerified);
@@ -868,21 +869,26 @@ public:
     !primitiveCount(op.topology,op.vertices);
   }),ops.end());
   // Empty completion participates in the same lock/order, but creates no BO or GPU fence.
-  if(ops.empty()){if(timing)timing->backendCPU+=frameCPUDelta(backendCPU,frameThreadCPU());if(currentFrame)currentFrame->backendSubmit+=frameNanos(locked);++emptySubmits;if(scheduled)scheduled();return;}
+  if(ops.empty()){if(cpuTiming)cpuTiming->backendCPU+=frameCPUDelta(backendCPU,frameThreadCPU());if(currentFrame)currentFrame->backendSubmit+=frameNanos(locked);++emptySubmits;if(scheduled)scheduled();return;}
   bool submitted=false,completed=false;std::vector<VkImageView> sampleViews;std::vector<VkFramebuffer> frames;std::vector<VkRenderPass> emptyRenders;std::vector<Texture *> textures;
   struct TextureState {Texture *texture;VkImageLayout layout;std::array<VkImageLayout,32> levelLayouts;bool defined;uint32_t definedLevels;};std::vector<TextureState> oldTextures;
   size_t diagnosticOp=0;Buffer *neutralBuffer=nullptr,*aliasBuffer=nullptr;size_t aliasBytes=0;
   std::vector<bool> aliasCopies(ops.size(),false);
   auto cleanup=[&] {if(aliasBuffer!=aliasScratch)destroyUnlocked(aliasBuffer);destroyUnlocked(neutralBuffer);for(auto v:sampleViews)DestroyImageView(device,v,nullptr);for(auto frame:frames)DestroyFramebuffer(device,frame,nullptr);for(auto render:emptyRenders)DestroyRenderPass(device,render,nullptr);};
   // Exclusive prepare phases: object API/cache time is subtracted from recording.
-  uint64_t objectNanos=0,descriptorNanos=0,objectCPU=0,descriptorCPU=0;
+  uint64_t objectNanos=0,descriptorNanos=0;
   struct Measure {
-   uint64_t &total;uint64_t *cpu;std::chrono::steady_clock::time_point start=std::chrono::steady_clock::now();uint64_t cpuStart;
-   Measure(uint64_t &t,uint64_t *c=nullptr):total(t),cpu(c),cpuStart(c?frameThreadCPU():UINT64_MAX){}
-   ~Measure(){if(cpu)*cpu+=frameCPUDelta(cpuStart,frameThreadCPU());total+=frameNanos(start);}
+   uint64_t &total;FrameClock::time_point start=FrameClock::now();
+   explicit Measure(uint64_t &t):total(t){}
+   ~Measure(){total+=frameNanos(start);}
   };
   try {
    std::vector<DrawOutput> draws(ops.size());
+   // One entry per submission: no allocation or resource ownership. Cache the
+   // translator's value output before access analysis can rewrite/skip draws.
+   // Diagnostic mode deliberately continues calling the external planner.
+   Pipeline *plannedOriginal=nullptr,*plannedPipeline=nullptr;
+   DrawInput plannedInput{};DrawOutput plannedOutput{};
    std::vector<std::array<MipRange,resourceSlots>> accessed(ops.size());
    std::vector<std::array<bool,resourceSlots>> generalSamples(ops.size());
    std::vector<Buffer *> buffers;
@@ -924,7 +930,7 @@ public:
       if(orderedColorAccess && op.pipeline && !(t->usage&VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT))throw std::runtime_error("ordered target lacks INPUT_ATTACHMENT");
       if(op.pipeline && (op.pipeline->fetchMask&(1u<<i)) && c.load==0)throw std::runtime_error("fetch from DontCare attachment");
       if(!(t->usage&VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) || t->textureType!=2)throw std::runtime_error("texture is not a 2D render attachment");
-      if(op.pipeline && op.pipeline->options.color(i).blend){VkFormatProperties props{};GetPhysicalDeviceFormatProperties(physical,t->vkFormat,&props);auto features=t->tiling==VK_IMAGE_TILING_LINEAR?props.linearTilingFeatures:props.optimalTilingFeatures;if(!(features&VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT))throw std::runtime_error("attachment blending unavailable");}
+      if(op.pipeline && op.pipeline->options.color(i).blend && !t->blendable)throw std::runtime_error("attachment blending unavailable");
       for(unsigned j=0;j<i;++j){auto other=op.color(j);if(!other.texture)continue;if(t->memory==other.texture->memory || hostRangesOverlap(t->mapped,t->allocated,other.texture->mapped,other.texture->allocated))throw std::runtime_error("render attachment alias");}
       for(unsigned stage=0;stage<2;++stage)for(auto binding:op.buffers[stage])if(binding.buffer && (binding.buffer->memory==t->memory || hostRangesOverlap(binding.buffer->contents,binding.buffer->length,t->mapped,t->allocated)))throw std::runtime_error("attachment/buffer feedback");
      }
@@ -949,22 +955,35 @@ public:
      if(t && sam && !t->filterable && (sam->filters&(2u|4u|16u)))throw std::runtime_error("texture format linear filtering unavailable");
      if(sam){input.filters[i]=sam->filters;input.lodMin[i]=sam->lodMin;input.lodMax[i]=sam->lodMax;}
     }
-    FrameStageTimer pipelineTimer(timing,&FrameSample::pipe,&FrameSample::pipeCPU);
-    char why[512]{};auto &translator=Translator::get();
-    Translator::OptionsScope translationScope(translator);
-    if(!translator.draw(op.pipeline->translation,&input,&draws[n],why,sizeof(why))){
-     if(strcmp(why,"draw requires runtime variant") && strcmp(why,"draw requires different specialization"))throw std::runtime_error(why);
-     VariantKey key;
-     if(systemTranslationPolicy().submitFast){for(unsigned i=0;i<resourceSlots;++i){auto *w=&key.words[i*8];w[0]=input.formats[i];w[1]=input.filters[i];memcpy(w+2,&input.lodMin[i],4);memcpy(w+3,&input.lodMax[i],4);for(unsigned stage=0;stage<2;++stage){w[4+stage*2]=input.buffers[stage][i].length!=0;w[5+stage*2]=input.buffers[stage][i].bytes;}}}
-     else for(unsigned i=0;i<resourceSlots;++i){auto &text=key.legacy;text+=std::to_string(input.formats[i])+","+std::to_string(input.filters[i])+",";text.append((const char *)&input.lodMin[i],sizeof(float));text.append((const char *)&input.lodMax[i],sizeof(float));for(auto &stage:input.buffers)text+=std::to_string(stage[i].length!=0)+":"+std::to_string(stage[i].bytes)+",";}
-     auto *original=op.pipeline;auto found=std::find_if(original->variants.begin(),original->variants.end(),[&](const auto &v){return v.first==key;});
-     if(found!=original->variants.end())op.pipeline=found->second;
-     else {if(original->variants.size()>=8)throw std::runtime_error("runtime variant bound");Translation variant{};
-      CompileBoostScope compileBoost("variant");
-      if(!translator.variant(original->translation,&input,&variant,why,sizeof(why)))throw std::runtime_error(why);
-      auto *pipeline=createPipeline(variant,original->options);try{original->variants.push_back({key,pipeline});}catch(...){destroyPipelineUnlocked(pipeline);throw;}original->retainedBytes+=pipeline->retainedBytes;objects.reweigh(original,original->retainedBytes,[&](Pipeline *old){destroyPipelineUnlocked(old);});op.pipeline=pipeline;
+    FrameStageTimer pipelineTimer(timing,&FrameSample::pipe);
+    auto *requestedPipeline=op.pipeline;
+    if(!systemTranslationPolicy().trace && plannedOriginal==requestedPipeline && sameDrawInput(plannedInput,input)){
+     op.pipeline=plannedPipeline;draws[n]=plannedOutput;
+    }else {
+     char why[512]{};auto &translator=Translator::get();
+     Translator::OptionsScope translationScope(translator);
+     auto *original=op.pipeline;std::optional<VariantKey> key;
+     auto findVariant=[&]{if(!key)key.emplace(input);return std::find_if(original->variants.begin(),original->variants.end(),[&](const auto &v){return v.first==*key;});};
+     // The packed key is deliberately coarse: a candidate must still pass the
+     // translator's complete draw validation. On rejection retry the baseline,
+     // which can accept a different length/offset/specialization of this shape.
+     bool ready=false;
+     if(!systemTranslationPolicy().trace && !original->variants.empty()){
+      auto found=findVariant();
+      if(found!=original->variants.end() && translator.draw(found->second->translation,&input,&draws[n],why,sizeof(why))){op.pipeline=found->second;ready=true;}
      }
-     if(!translator.draw(op.pipeline->translation,&input,&draws[n],why,sizeof(why)))throw std::runtime_error(why);
+     if(!ready && !translator.draw(original->translation,&input,&draws[n],why,sizeof(why))){
+      if(strcmp(why,"draw requires runtime variant") && strcmp(why,"draw requires different specialization"))throw std::runtime_error(why);
+      auto found=findVariant();
+      if(found!=original->variants.end())op.pipeline=found->second;
+      else {if(original->variants.size()>=8)throw std::runtime_error("runtime variant bound");Translation variant{};
+       CompileBoostScope compileBoost("variant");
+       if(!translator.variant(original->translation,&input,&variant,why,sizeof(why)))throw std::runtime_error(why);
+       auto *pipeline=createPipeline(variant,original->options);try{original->variants.push_back({*key,pipeline});}catch(...){destroyPipelineUnlocked(pipeline);throw;}original->retainedBytes+=pipeline->retainedBytes;objects.reweigh(original,original->retainedBytes,[&](Pipeline *old){destroyPipelineUnlocked(old);});op.pipeline=pipeline;
+      }
+      if(!translator.draw(op.pipeline->translation,&input,&draws[n],why,sizeof(why)))throw std::runtime_error(why);
+     }
+     plannedOriginal=requestedPipeline;plannedPipeline=op.pipeline;plannedInput=input;plannedOutput=draws[n];
     }
     pipelineTimer.stop();
     // Analyze the final runtime variant and this draw's descriptors, not the
@@ -1112,7 +1131,7 @@ public:
    size_t neutralSize=0;for(const auto &draw:draws)for(unsigned i=0;i<draw.descriptorCount;++i){const auto &d=draw.descriptors[i];if(d.source==2){
     if((d.type!=VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER && d.type!=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER) || d.offset || !d.range || d.range>maxBufferLength)throw std::runtime_error("planned neutral buffer bounds/type");
     neutralSize=std::max(neutralSize,size_t(d.range));}}
-   if(aliasBytes){Measure measure{objectNanos,timing?&objectCPU:nullptr};
+   if(aliasBytes){Measure measure{objectNanos};
     // Single synchronous lane: prior fence is complete before scratch is reused.
     // Larger requests keep the transient path; retained memory is quota charged.
     if(systemTranslationPolicy().pipelined && aliasBytes<=aliasScratchLimit){
@@ -1122,15 +1141,14 @@ public:
     }else aliasBuffer=allocateUnlocked(aliasBytes);
     addBuffer(aliasBuffer);
    }
-   if(neutralSize){Measure measure{objectNanos,timing?&objectCPU:nullptr};neutralBuffer=allocateUnlocked(neutralSize);addBuffer(neutralBuffer);}
+   if(neutralSize){Measure measure{objectNanos};neutralBuffer=allocateUnlocked(neutralSize);addBuffer(neutralBuffer);}
    for(auto *t:textures)oldTextures.push_back({t,t->layout,t->levelLayouts,t->defined,t->definedLevels});
-   auto flushStart=std::chrono::steady_clock::now();auto flushCPU=timing?frameThreadCPU():UINT64_MAX;
+   auto flushStart=std::chrono::steady_clock::now();
    // Direct shared host writes are not tracked. Only Vulkan HOST_COHERENT permits omission.
    for(auto *t:textures)if(t->mapped && !coherent(t->memoryType)) {VkMappedMemoryRange r{};r.sType=VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;r.memory=t->memory;r.size=VK_WHOLE_SIZE;++flushCalls;check(FlushMappedMemoryRanges(device,1,&r));}
    for(auto *b:buffers)if(!coherent(b->memoryType)) {VkMappedMemoryRange r{};r.sType=VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;r.memory=b->memory;r.size=VK_WHOLE_SIZE;++flushCalls;check(FlushMappedMemoryRanges(device,1,&r));}
-   if(timing)timing->flushCPU+=frameCPUDelta(flushCPU,frameThreadCPU());
    {auto ns=since(flushStart);submitFlushNanos+=ns;if(currentFrame)currentFrame->flush+=ns;}
-   {Measure measure{objectNanos,timing?&objectCPU:nullptr};
+   {Measure measure{objectNanos};
     if(!commandPool){VkCommandPoolCreateInfo pi{};pi.sType=VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;pi.queueFamilyIndex=family;check(CreateCommandPool(device,&pi,nullptr,&commandPool));++reuseCounts.commandPools;++submitObjectCreates;++submitPoolCreates;
      VkCommandBufferAllocateInfo ai{};ai.sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;ai.commandPool=commandPool;ai.level=VK_COMMAND_BUFFER_LEVEL_PRIMARY;ai.commandBufferCount=1;
      check(AllocateCommandBuffers(device,&ai,&command));++reuseCounts.commandBuffers;++submitObjectCreates;++submitPoolCreates;
@@ -1141,7 +1159,6 @@ public:
    }
    VkCommandBuffer cmd=command;VkQueryPool timestamps=queryPool;VkFence fence=submitFence;
    auto recordStart=std::chrono::steady_clock::now();uint64_t recordObjects=objectNanos;
-   auto recordCPU=timing?frameThreadCPU():UINT64_MAX;uint64_t recordObjectCPU=objectCPU;
    VkCommandBufferBeginInfo bi{};bi.sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;bi.flags=VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;check(BeginCommandBuffer(cmd,&bi));
    if(timestamps){CmdResetQueryPool(cmd,timestamps,0,2);CmdWriteTimestamp(cmd,VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,timestamps,0);}
    VkMemoryBarrier barrier{};barrier.sType=VK_STRUCTURE_TYPE_MEMORY_BARRIER;barrier.srcAccessMask=VK_ACCESS_HOST_WRITE_BIT;barrier.dstAccessMask=VK_ACCESS_MEMORY_READ_BIT|VK_ACCESS_MEMORY_WRITE_BIT;
@@ -1172,7 +1189,7 @@ public:
    };
    // Bound each descriptor type and sets independently; grow geometrically, retain one pool.
    VkDescriptorPool submitPool{};
-   {Measure measure{objectNanos,timing?&objectCPU:nullptr};std::vector<VkDescriptorPoolSize> sizes;uint32_t sets=0;
+   {Measure measure{objectNanos};std::vector<VkDescriptorPoolSize> sizes;uint32_t sets=0;
     for(size_t i=0;i<ops.size();++i){if(!ops[i].texture || !ops[i].pipeline || !draws[i].descriptorCount)continue;if(sets==4096)throw std::runtime_error("submit descriptor set bound");++sets;
      for(unsigned j=0;j<draws[i].descriptorCount;++j){auto ty=(VkDescriptorType)draws[i].descriptors[j].type;auto it=std::find_if(sizes.begin(),sizes.end(),[&](const VkDescriptorPoolSize &z){return z.type==ty;});if(it==sizes.end())sizes.push_back({ty,1});else {if(it->descriptorCount==65536)throw std::runtime_error("submit descriptor type bound");++it->descriptorCount;}}}
     if(sets>4096)throw std::runtime_error("submit descriptor set bound");
@@ -1227,10 +1244,12 @@ public:
     if(op.texture && !op.pipeline && !op.clearOnly)transition(op.texture,VK_IMAGE_LAYOUT_GENERAL,op.generateMips?op.mipBase:(!op.upload && !op.sourceTexture?op.srcLevel:op.dstLevel),op.generateMips?op.mipCount:1);
     if(op.pipeline || op.clearOnly)for(unsigned i=0;i<op.colorCount;++i){auto c=op.color(i);if(c.texture)transition(c.texture,VK_IMAGE_LAYOUT_GENERAL,c.level,1);}
    };
+   VkPipeline boundPipeline{};VkPipelineLayout boundLayout{};VkDescriptorSet boundSet{};
+   VkViewport boundViewport{};VkRect2D boundScissor{};bool dynamicBound=false;
    for(size_t opIndex=0;opIndex<ops.size();++opIndex) {diagnosticOp=opIndex;const auto &op=ops[opIndex];const auto &draw=draws[opIndex];
     size_t passEnd=mergeEnds.empty()?opIndex:mergeEnds[opIndex];
     bool continuation=opIndex && !mergeEnds.empty() && mergeEnds[opIndex-1]>=opIndex;
-    if(!continuation){refreshed.clear();for(size_t i=opIndex;i<=passEnd;++i)refreshImages(i);
+    if(!continuation){boundPipeline={};boundLayout={};boundSet={};dynamicBound=false;refreshed.clear();for(size_t i=opIndex;i<=passEnd;++i)refreshImages(i);
      hoisting=passEnd>opIndex;hoisted.clear();for(size_t i=opIndex;i<=passEnd;++i)prepareImages(i);hoisting=false;diagnosticOp=opIndex;}
     if(op.generateMips){auto *t=op.texture;
      if(!t->isDefined(op.mipBase))throw std::runtime_error("undefined mip generation source");
@@ -1252,7 +1271,7 @@ public:
      auto render=renderPass(op.pipeline,passOp?&*passOp:&op);
      VkFramebufferCreateInfo fi{};fi.sType=VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;fi.renderPass=render;
      fi.attachmentCount=used;fi.pAttachments=compactViews;fi.width=op.texture->levelWidth(op.dstLevel);fi.height=op.texture->levelHeight(op.dstLevel);fi.layers=1;VkFramebuffer frame{};
-     {Measure measure{objectNanos,timing?&objectCPU:nullptr};auto found=std::find_if(frameCache.begin(),frameCache.end(),[&](auto c){return c.textures==targets && c.render==render && c.levels==levels;});
+     {Measure measure{objectNanos};auto found=std::find_if(frameCache.begin(),frameCache.end(),[&](auto c){return c.textures==targets && c.render==render && c.levels==levels;});
       if(found!=frameCache.end())frame=found->frame;
       else {check(CreateFramebuffer(device,&fi,nullptr,&frame));++reuseCounts.frames;++submitObjectCreates;++submitFrameCreates;
        try {if(frameCache.size()<frameCacheLimit)frameCache.push_back({targets,render,levels,frame});else frames.push_back(frame);}catch(...){DestroyFramebuffer(device,frame,nullptr);throw;}}
@@ -1261,13 +1280,17 @@ public:
      ri.renderArea={{0,0},{op.areaWidth?op.areaWidth:op.texture->levelWidth(op.dstLevel),op.areaHeight?op.areaHeight:op.texture->levelHeight(op.dstLevel)}};ri.clearValueCount=used;ri.pClearValues=clears;
      if(currentFrame)++currentFrame->passes;CmdBeginRenderPass(cmd,&ri,VK_SUBPASS_CONTENTS_INLINE);
      }else if(currentFrame)++currentFrame->mergedDraws;
-     CmdBindPipeline(cmd,VK_PIPELINE_BIND_POINT_GRAPHICS,topologyPipeline(op.pipeline,op.topology));
-     if(currentFrame)++currentFrame->draws;CmdSetViewport(cmd,0,1,&op.viewport);CmdSetScissor(cmd,0,1,&op.scissor);
+     auto pipeline=topologyPipeline(op.pipeline,op.topology);
+     if(pipeline!=boundPipeline){CmdBindPipeline(cmd,VK_PIPELINE_BIND_POINT_GRAPHICS,pipeline);boundPipeline=pipeline;}
+     if(currentFrame)++currentFrame->draws;
+     if(!dynamicBound || memcmp(&boundViewport,&op.viewport,sizeof(op.viewport))){CmdSetViewport(cmd,0,1,&op.viewport);boundViewport=op.viewport;}
+     if(!dynamicBound || memcmp(&boundScissor,&op.scissor,sizeof(op.scissor))){CmdSetScissor(cmd,0,1,&op.scissor);boundScissor=op.scissor;}
+     dynamicBound=true;
      if(draw.descriptorCount) {
       VkDescriptorSetAllocateInfo sai{};sai.sType=VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;sai.descriptorPool=submitPool;sai.descriptorSetCount=1;sai.pSetLayouts=&op.pipeline->setLayout;
       bool fast=systemTranslationPolicy().submitFast;
       std::optional<std::array<BindingValue,16>> bindings;if(fast)bindings.emplace();std::array<VkWriteDescriptorSet,16> writes;
-      VkDescriptorSet set{};if(!fast){Measure measure{descriptorNanos,timing?&descriptorCPU:nullptr};check(AllocateDescriptorSets(device,&sai,&set));if(systemTranslationPolicy().frameTrace)++frameCounts.descriptors;}
+      VkDescriptorSet set{};if(!fast){Measure measure{descriptorNanos};check(AllocateDescriptorSets(device,&sai,&set));if(systemTranslationPolicy().frameTrace)++frameCounts.descriptors;}
       for(unsigned i=0;i<draw.descriptorCount;++i){const auto &d=draw.descriptors[i];
        VkWriteDescriptorSet write{};write.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;write.dstSet=set;write.dstBinding=d.binding;write.descriptorCount=1;write.descriptorType=(VkDescriptorType)d.type;
        VkDescriptorImageInfo image{};VkDescriptorBufferInfo buffer{};
@@ -1291,7 +1314,7 @@ public:
         if(!t || (d.type==VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER && d.sampler!=UINT32_MAX && !sam) || d.format!=(uint32_t)t->vkFormat)throw std::runtime_error("planned texture format mismatch");
         VkImageViewCreateInfo vi{};vi.sType=VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;vi.image=t->image;vi.viewType=t->textureType==0?VK_IMAGE_VIEW_TYPE_1D:VK_IMAGE_VIEW_TYPE_2D;vi.format=(VkFormat)d.format;vi.components={(VkComponentSwizzle)d.components[0],(VkComponentSwizzle)d.components[1],(VkComponentSwizzle)d.components[2],(VkComponentSwizzle)d.components[3]};uint32_t base=op.sampleBase[d.slot],count=op.sampleCount[d.slot]?op.sampleCount[d.slot]:t->levels-base;vi.subresourceRange={VK_IMAGE_ASPECT_COLOR_BIT,base,count,0,1};
         VkImageView view{};
-        {Measure measure{objectNanos,timing?&objectCPU:nullptr};std::array<uint32_t,4> components{d.components[0],d.components[1],d.components[2],d.components[3]};
+        {Measure measure{objectNanos};std::array<uint32_t,4> components{d.components[0],d.components[1],d.components[2],d.components[3]};
          auto found=std::find_if(viewCache.begin(),viewCache.end(),[&](auto c){return c.texture==t && c.format==vi.format && c.components==components && c.base==base && c.count==count;});
          if(found!=viewCache.end())view=found->view;
          else {check(CreateImageView(device,&vi,nullptr,&view));++reuseCounts.views;++submitObjectCreates;++submitViewCreates;
@@ -1302,16 +1325,16 @@ public:
 #endif
        }else {auto b=op.buffers[d.stages==1?0:1][d.slot];if(!b.buffer || !d.range || d.offset>((b.buffer->length+15)&~size_t(15)) || d.range>((b.buffer->length+15)&~size_t(15))-d.offset)throw std::runtime_error("planned buffer range mismatch");buffer={b.buffer->buffer,d.offset,d.range};write.pBufferInfo=&buffer;}
        if(fast){auto &value=(*bindings)[i];value={d.binding,d.type,image,buffer};writes[i]=write;writes[i].pImageInfo=write.pImageInfo?&value.image:nullptr;writes[i].pBufferInfo=write.pBufferInfo?&value.buffer:nullptr;}
-       else {Measure measure{descriptorNanos,timing?&descriptorCPU:nullptr};UpdateDescriptorSets(device,1,&write,0,nullptr);}
+       else {Measure measure{descriptorNanos};UpdateDescriptorSets(device,1,&write,0,nullptr);}
       }
-      if(fast){Measure measure{descriptorNanos,timing?&descriptorCPU:nullptr};auto found=std::find_if(boundSets.begin(),boundSets.end(),[&](const auto &entry){return entry.layout==op.pipeline->setLayout && entry.count==draw.descriptorCount && entry.bindings==*bindings;});
+      if(fast){Measure measure{descriptorNanos};auto found=std::find_if(boundSets.begin(),boundSets.end(),[&](const auto &entry){return entry.layout==op.pipeline->setLayout && entry.count==draw.descriptorCount && std::equal(bindings->begin(),bindings->begin()+draw.descriptorCount,entry.bindings.begin());});
        if(found!=boundSets.end())set=found->set;
        else {check(AllocateDescriptorSets(device,&sai,&set));if(systemTranslationPolicy().frameTrace)++frameCounts.descriptors;
         for(unsigned i=0;i<draw.descriptorCount;++i)writes[i].dstSet=set;UpdateDescriptorSets(device,draw.descriptorCount,writes.data(),0,nullptr);
         if(boundSets.size()<256)boundSets.push_back({op.pipeline->setLayout,draw.descriptorCount,*bindings,set});
        }
       }
-      CmdBindDescriptorSets(cmd,VK_PIPELINE_BIND_POINT_GRAPHICS,op.pipeline->layout,0,1,&set,0,nullptr);
+      if(set!=boundSet || op.pipeline->layout!=boundLayout){CmdBindDescriptorSets(cmd,VK_PIPELINE_BIND_POINT_GRAPHICS,op.pipeline->layout,0,1,&set,0,nullptr);boundSet=set;boundLayout=op.pipeline->layout;}
      }
      for(unsigned i=0;i<draw.pushCount;++i){auto &w=draw.pushes[i];CmdPushConstants(cmd,op.pipeline->layout,w.stages,w.offset,w.size,w.bytes);}
      for(unsigned i=0;i<draw.vertexCount;++i){auto b=op.buffers[0][draw.vertexSlots[i]].buffer;VkDeviceSize offset=draw.vertexOffsets[i];CmdBindVertexBuffers(cmd,draw.vertexBindings[i],1,&b->buffer,&offset);}
@@ -1379,10 +1402,7 @@ public:
    check(EndCommandBuffer(cmd));
    auto recordNS=since(recordStart)-(objectNanos-recordObjects)-descriptorNanos;
    submitRecordNanos+=recordNS;
-   if(timing){timing->record+=recordNS;timing->desc+=descriptorNanos;timing->descCPU+=descriptorCPU;
-    auto cpu=frameCPUDelta(recordCPU,frameThreadCPU());auto excluded=objectCPU-recordObjectCPU+descriptorCPU;
-    timing->recordCPU+=cpu>=excluded?cpu-excluded:0;
-   }
+   if(timing){timing->record+=recordNS;timing->desc+=descriptorNanos;}
    submitObjectsNanos+=objectNanos;submitDescriptorsNanos+=descriptorNanos;
 #ifdef FUXI_MTL_HOST_TEST
    if(failBeforeQueue){failBeforeQueue=false;throw std::runtime_error("injected pre-submit failure");}
@@ -1395,11 +1415,10 @@ public:
    if(failQueueAttempt){failQueueAttempt=false;check(VK_ERROR_DEVICE_LOST);}
 #endif
    auto submitToQueue=[&]{
-    auto start=FrameClock::now();auto queueCPU=timing?frameThreadCPU():UINT64_MAX;
+    auto start=FrameClock::now();
     check(frameKernelCall([&]{return QueueSubmit(queue,1,&si,fence);}));
-    if(timing)timing->queueSubmitCPU+=frameCPUDelta(queueCPU,frameThreadCPU());
     if(currentFrame){++currentFrame->queueSubmits;currentFrame->queueSubmit+=frameNanos(start);}
-    if(timing)timing->backendCPU+=frameCPUDelta(backendCPU,frameThreadCPU());
+    if(cpuTiming)cpuTiming->backendCPU+=frameCPUDelta(backendCPU,frameThreadCPU());
     if(currentFrame)currentFrame->backendSubmit+=frameNanos(locked);
    };
    if(!retirement){

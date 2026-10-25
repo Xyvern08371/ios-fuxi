@@ -11,8 +11,26 @@ int main(){
  Operation draw{};draw.encoderID=1;draw.pipeline=p;draw.texture=dst;draw.samples[0]=src;draw.sampleCount[0]=1;draw.samplers[0]=sam;draw.vertices=6;draw.viewport={0,16,16,-16,0,1};draw.scissor={{0,0},{16,16}};draw.clear[0]=.2f;draw.clear[1]=.4f;draw.clear[2]=.6f;draw.clear[3]=1;
  void *proxy=dlopen(FUXI_MTL_ICD,RTLD_NOW|RTLD_LOCAL);assert(proxy);
  auto counter=[&](const char *name){auto fn=reinterpret_cast<uint64_t (*)()>(dlsym(proxy,name));assert(fn);return fn();};
- auto run=[&](const std::vector<Operation> &ops,unsigned passes,unsigned merged){auto beforePass=counter("render_merge_passes"),beforeDraw=counter("render_merge_draws");auto beforeImages=counter("render_merge_image_barriers"),beforeSubmits=counter("render_merge_submits");FrameSample s;{FrameTraceScope scope(&s);b.submit(ops);}assert(s.queueSubmits==1 && counter("render_merge_submits")-beforeSubmits==1);if(s.draws)assert(s.pipe && s.pipeCPU && s.record && s.recordCPU && s.backendCPU && s.desc && s.descCPU);assert(counter("render_merge_image_barriers")-beforeImages==s.imageBarriers);assert(s.passes==(merge?passes:s.draws+std::count_if(ops.begin(),ops.end(),[](const Operation &o){return o.clearOnly && (o.areaWidth || o.areaHeight);})));assert(counter("render_merge_passes")-beforePass==s.passes && counter("render_merge_draws")-beforeDraw==s.draws);assert(s.mergedDraws==(merge?merged:0));return s;};
+ auto run=[&](const std::vector<Operation> &ops,unsigned passes,unsigned merged){auto beforePass=counter("render_merge_passes"),beforeDraw=counter("render_merge_draws");auto beforeImages=counter("render_merge_image_barriers"),beforeSubmits=counter("render_merge_submits");FrameSample s;{FrameTraceScope scope(&s);b.submit(ops);}assert(s.queueSubmits==1 && counter("render_merge_submits")-beforeSubmits==1);if(s.draws){assert(s.pipe && s.record && s.desc && !s.pipeCPU && !s.recordCPU && !s.descCPU);assert(bool(s.backendCPU)==systemTranslationPolicy().frameCPU);}assert(counter("render_merge_image_barriers")-beforeImages==s.imageBarriers);assert(s.passes==(merge?passes:s.draws+std::count_if(ops.begin(),ops.end(),[](const Operation &o){return o.clearOnly && (o.areaWidth || o.areaHeight);})));assert(counter("render_merge_passes")-beforePass==s.passes && counter("render_merge_draws")-beforeDraw==s.draws);assert(s.mergedDraws==(merge?merged:0));return s;};
  auto pixels=[&](const char *label,uint32_t level=0){Operation get{};get.texture=dst;get.dst=read;get.srcLevel=level;b.submit({get});printf("PIXELS %s ",label);for(size_t i=0;i<dst->levelWidth(level)*dst->levelHeight(level)*4;++i)printf("%02x",((uint8_t *)read->contents)[i]);puts("");};
+ // Exact metadata reuse keeps all 120 draws and resource identities. The
+ // independent proxy confirms redundant binds are absent inside a merged run.
+ void *bridge=dlopen(FUXI_MTL_TRANSLATOR,RTLD_NOW|RTLD_LOCAL);assert(bridge);
+ auto plans=reinterpret_cast<uint64_t (*)()>(dlsym(bridge,"render_merge_plan_calls"));assert(plans);
+ std::vector<Operation> repeated(120,draw);for(unsigned i=0;i<120;++i)repeated[i].load=i?1:2;
+ auto beforePlans=plans(),beforePipelines=counter("render_merge_pipeline_binds"),beforeSets=counter("render_merge_set_binds");
+ auto beforeViewports=counter("render_merge_viewport_sets"),beforeScissors=counter("render_merge_scissor_sets");
+ auto beforeFormats=counter("render_merge_format_queries");
+ run(repeated,1,119);assert(plans()-beforePlans==1 && counter("render_merge_format_queries")==beforeFormats);
+ auto expected=merge?1u:120u;
+ assert(counter("render_merge_pipeline_binds")-beforePipelines==expected);
+ assert(counter("render_merge_viewport_sets")-beforeViewports==expected && counter("render_merge_scissor_sets")-beforeScissors==expected);
+ assert(counter("render_merge_set_binds")-beforeSets==(merge && systemTranslationPolicy().submitFast?1u:120u));
+ pixels("repeated-plan-and-state");
+ // A changed draw input invalidates the cache; returning to the old input is
+ // another miss in the deliberately single-entry cache.
+ repeated[60].first=1;repeated[60].vertices=3;beforePlans=plans();run(repeated,1,119);assert(plans()-beforePlans==3);
+ pixels("changed-plan-input");dlclose(bridge);
  if(b.supportsOrderedColorAccess()){
   auto *fetch=b.compilePipeline(nullptr,"control",nullptr,"fetch");assert(fetch->fetchMask==1);
   auto f=draw;f.pipeline=fetch;run({f},1,0);pixels("fetch-clear");

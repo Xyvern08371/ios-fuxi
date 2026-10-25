@@ -29,10 +29,11 @@ int main() {
    auto *src=backend.allocate(65536),*dst=backend.allocate(65536);
    for(unsigned i=0;i<16;i++) {
     uint8_t value=uint8_t(0xa0+i);memset(src->contents,0x39,src->length);memset(dst->contents,0x52,dst->length);
-    fuxi::FrameSample timing;
+    auto readsBefore=cpuReads.load();fuxi::FrameSample timing;
     {fuxi::FrameTraceScope scope(&timing);backend.submit({{nullptr,src,0,4,65528,value},{src,dst,4,8,65520,0}});}
-    if(fuxi::systemTranslationPolicy().frameTrace)assert(timing.backendCPU && timing.recordCPU && timing.queueSubmitCPU);
-    else assert(cpuReads==0 && !timing.backendCPU && !timing.recordCPU && !timing.kernelIO);
+    if(fuxi::systemTranslationPolicy().frameCPU)assert(timing.backendCPU && cpuReads==readsBefore+2);
+    else assert(cpuReads==0 && !timing.backendCPU);
+    assert(!timing.recordCPU && !timing.queueSubmitCPU && !timing.kernelIOCPU);
     verify(src,0,4,0x39);verify(src,4,65528,value);verify(src,65532,4,0x39);
     verify(dst,0,8,0x52);verify(dst,8,65520,value);verify(dst,65528,8,0x52);
    }
@@ -44,8 +45,14 @@ int main() {
    fuxi::FrameSample blocked;
    {fuxi::FrameTraceScope scope(&blocked);backend.submit({{nullptr,src,0,0,64,1}});}
    holder.join();
-   if(fuxi::systemTranslationPolicy().frameTrace)assert(blocked.backendLock>20000000 && blocked.backendLockCPU<blocked.backendLock/2);
-   else assert(cpuReads==0);
+   if(fuxi::systemTranslationPolicy().frameTrace)assert(blocked.backendLock>20000000);
+   if(fuxi::systemTranslationPolicy().frameCPU)assert(blocked.backendCPU && blocked.backendCPU<blocked.backendLock/2);
+   if(!fuxi::systemTranslationPolicy().frameCPU)assert(cpuReads==0);
+   // Event-segmented frames retain a fixed two-read backend CPU budget.
+   fuxi::FrameSample segmented;auto before=cpuReads.load();
+   {fuxi::FrameTraceScope scope(&segmented);for(unsigned i=0;i<120;++i)backend.submit({{nullptr,src,0,0,64,1}});}
+   if(fuxi::systemTranslationPolicy().frameCPU)assert(cpuReads==before+2 && segmented.cpuSampledSubmits==1 && segmented.cpuOmittedSubmits==119);
+   else assert(cpuReads==before);
    backend.destroy(src);backend.destroy(dst);
   }
   puts("PASS: actual backend 32 GPU fill/copy submissions, CPU cache transitions, sentinel edges, reuse, reopen");
@@ -68,7 +75,7 @@ def main():
         subprocess.run(flags+['-fsanitize=address,undefined','-DFUXI_MTL_HOST_TEST','-DFUXI_MTL_ICD="'+str(d/'proxy.so')+'"',
             '-I'+str(ROOT/'tools'),str(d/'test.cpp'),'-ldl','-pthread','-o',str(d/'test')],check=True)
         env=dict(os.environ,SOFTWARE_ICD=str(a.icd),ASAN_OPTIONS='detect_leaks=0',FUXI_MTL_TEST_BOOTARGS='')
-        for extra,expected in (({},0),({'FUXI_MTL_TEST_BOOTARGS':'fuxigpuframetrace=1'},0),({'TIMEOUT':'1'},1),({'LOST':'1'},1),({'BAD_FILL':'1'},1)):
+        for extra,expected in (({},0),({'FUXI_MTL_TEST_BOOTARGS':'fuxigpuframetrace=1'},0),({'FUXI_MTL_TEST_BOOTARGS':'fuxigpuframetrace=2'},0),({'TIMEOUT':'1'},1),({'LOST':'1'},1),({'BAD_FILL':'1'},1)):
             p=subprocess.run([str(d/'test')],env=dict(env,**extra),text=True,capture_output=True,timeout=30)
             assert p.returncode==expected,(extra,p.stdout,p.stderr)
             assert 'AddressSanitizer' not in p.stderr and 'runtime error:' not in p.stderr,p.stderr

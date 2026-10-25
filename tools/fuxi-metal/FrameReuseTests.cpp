@@ -24,8 +24,9 @@ int main(){
   auto overlapping=alias(t,128,128);overlapping.srcX=i;overlapping.dstX=i+1;overlapping.dstY=1;
   {FrameTraceScope scope(&s);backend.submit({upload,overlapping,read});}
   assert(!memcmp(out->contents,expected.data(),expected.size()));
-  assert(!s.draws && !s.passes && s.backendSubmit && s.backendCPU && s.gpuWait);
-  assert(s.record && s.recordCPU && s.kernelIO && s.kernelIOCPU && s.queueSubmit && s.queueSubmitCPU);prepare+=s.backendSubmit;
+  assert(!s.draws && !s.passes && s.backendSubmit && s.gpuWait);
+  assert(bool(s.backendCPU)==systemTranslationPolicy().frameCPU);
+  assert(s.record && s.kernelIO && s.queueSubmit && !s.recordCPU && !s.kernelIOCPU && !s.queueSubmitCPU);prepare+=s.backendSubmit;
   if(backend.supportsTimestamps())assert(s.gpuExec);
   assert(backend.resourceBytes()==charged+(reuse?65536:0));
  }
@@ -48,7 +49,7 @@ int main(){
  // Async retirement must not extend submit-thread CPU time through the fence.
  FrameSample deferred;std::function<void()> retire;
  {FrameTraceScope scope(&deferred);backend.submit({upload,read},{},&retire);}
- auto submittedCPU=deferred.backendCPU;assert(retire && submittedCPU && !deferred.gpuWait);
+ auto submittedCPU=deferred.backendCPU;assert(retire && bool(submittedCPU)==systemTranslationPolicy().frameCPU && !deferred.gpuWait);
  std::thread retireWorker([&]{FrameTraceScope scope(&deferred);retire();});retireWorker.join();
  assert(deferred.backendCPU==submittedCPU && deferred.gpuWait);
  backend.destroy(t);backend.destroy(up);backend.destroy(out);

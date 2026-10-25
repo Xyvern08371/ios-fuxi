@@ -155,36 +155,66 @@ Zero means unavailable/not observed where appropriate.
 | `image_barriers/frame`, `read_barriers_skipped/frame`, `cross_encoder_merges/frame` | Actual image barriers emitted, read barriers omitted by bit 0, and encoder boundaries removed by bit 1. Global memory barriers are not part of image_barriers. |
 | `render_passes/frame`, `merged_draws/frame`, `merged_splits`, `interval` | Check that passes and encoder splits fall without losing draws, then compare actual frame cadence, not reciprocal wall latency. |
 
-Thread CPU diagnostics are appended after every existing field, only with
-`fuxigpuframetrace=1`. Every new value is a p50/p90 pair in milliseconds:
+`fuxigpuframetrace=1` uses only wall timers, with no thread CPU clock
+reads or frontend method timing. `fuxigpuframetrace=2` adds bounded thread CPU
+sampling and frontend method wall timing. Unknown values and duplicate tokens
+disable tracing. The existing fields retain their positions in both modes;
+unavailable CPU measurements are zero, never substituted with wall time.
 
-| New fields | Interpretation |
+| Appended fields | Interpretation |
 | --- | --- |
-| `backend_cpu` | Calling thread's user + system CPU time over the same interval as `backend_submit`: after backend mutex/slot admission and any `prepare` shadow refresh, through successful `vkQueueSubmit`. Empty submits stop at empty completion. Event segments accumulate; fence waits, retirement and scheduled callbacks are excluded. |
-| `frontend_cpu`, `frontend_wall` | Sum of residence inside FuxiMetal render/blit encoder and command-buffer preparation methods, per command buffer. Nested convenience/helper calls count once. Each call uses its own thread CPU delta, so sequential encoding across threads works. Includes overlap commit admission/snapshot work up to releasing the worker; synchronous commit stops before backend submission. Excludes callbacks, explicit completion waits, backend/retire workers, object teardown and CA's gaps between methods. This is a measured subset of client/commit work, not thread CPU for the whole `cpu_before_commit` span. |
-| `pipe`, `pipe_cpu` | Draw planning/translation and runtime pipeline specialization/variant lookup or creation. |
-| `desc`, `desc_cpu` | Descriptor allocation/update and fast descriptor-set lookup, using the existing backend descriptor measurement intervals. |
-| `record`, `record_cpu` | Vulkan command recording, excluding separately measured object/cache and descriptor API work. Resource planning/setup outside recording is still included in `backend_submit`/`backend_cpu`. |
-| `kernel_io`, `kernel_io_cpu` | Observable API envelopes for Vulkan allocation/free, memory binding/mapping/unmapping, `vkQueueSubmit`, and IOSurface lock/unlock while a frame is attributed. The external driver owns the actual GPU ABI/IOKit syscalls: these fields include userspace driver work and cannot isolate kernel time or intercept every internal syscall. IOSurface leases occur outside `backend_submit`; unlock can occur during retirement. This pair overlaps `queue_submit`, `pipe` and other containing stages; do not add them. |
-| `backend_lock_cpu`, `slot_wait_cpu`, `flush_cpu`, `queue_submit_cpu` | Thread CPU counterparts of the existing wall pairs `backend_lock`, `slot_wait`, `flush`, `queue_submit`. |
+| `backend_cpu` | Submit thread user + system CPU, after mutex/slot admission and any `prepare` shadow refresh through successful `vkQueueSubmit`. Two clock reads sample the first submit in a frame only; empty submits stop at empty completion. Fence waits, retirement and scheduled callbacks are excluded. |
+| `frontend_cpu` | Two clock reads bracket the first traced frontend method through commit preparation, before backend submission or releasing the overlap worker. This **includes client CPU work between methods**, unlike the previous per-method sum. Interleaved command buffers can have overlapping spans. Zero if encoding migrates between threads or a clock fails. |
+| `frontend_wall` | Level 2 only: summed residence inside render/blit encoder and command-buffer preparation methods. Nested convenience calls count once. Gaps between methods are excluded, so this is not the wall counterpart of the new `frontend_cpu` span. |
+| `pipe`, `desc`, `record` | Wall time for translation/variant lookup, descriptor allocation/update/cache lookup, and recording excluding separately measured object/cache and descriptor API work. Present at both trace levels. |
+| `kernel_io` | Wall envelopes around Vulkan memory APIs, queue submission and IOSurface leases. Includes userspace driver work; does not isolate actual kernel execution. Overlaps containing stages and must not be added to them. |
+| `pipe_cpu`, `desc_cpu`, `record_cpu`, `kernel_io_cpu`, `backend_lock_cpu`, `slot_wait_cpu`, `flush_cpu`, `queue_submit_cpu` | Retained for append-only parser compatibility; zero in both modes. Detailed CPU attribution required expensive per-draw clock reads and is no longer collected. Use the corresponding wall stages. |
+| `cpu_sampled_submits/frame`, `cpu_omitted_submits/frame` | Newly appended counters. Event-segmented command buffers still use at most two backend CPU reads: later segments contribute wall timers but no CPU samples. Compare `backend_cpu` to `backend_submit` only when no segments were omitted. |
 
-Linux uses `clock_gettime(CLOCK_THREAD_CPUTIME_ID)`. Darwin uses
-`thread_info(THREAD_BASIC_INFO)` on `pthread_mach_thread_np(pthread_self())`,
-which needs no new Mach send right and is available on iOS 16 arm64. Darwin's
-microsecond CPU resolution can quantize short stages. Failed clock reads yield
-zero CPU contribution, never a wall-clock fallback. Timing is diagnostic and
-includes instrumentation overhead; disabled scopes make no clock calls,
-allocations or atomic updates. Host tests supply `FUXI_MTL_THREAD_CPU_NS` to
-exercise failures and deterministic CPU deltas.
+An ordinary level-2 frame uses at most four CPU clock reads, independent of its
+draw/encoder count. Frontend migration can invalidate its CPU sample; no clocks
+from different threads are subtracted. Linux uses
+`clock_gettime(CLOCK_THREAD_CPUTIME_ID)`; Darwin uses
+`thread_info(THREAD_BASIC_INFO)` without creating a Mach send right. Mode 1
+restores the low-overhead wall-only diagnostic path that preceded commit
+`4e892d2`. No device timing improvement is claimed from host tests.
 
-Compare each CPU pair with its matching wall pair. Much smaller CPU time
-supports off-CPU waiting/preemption; comparable times support on-CPU work,
-which can include kernel execution or spinning. Percentiles are calculated
-independently, so subtracting medians does not produce a wait-time percentile.
-The supplied approximately 5 ms `cpu_before_commit`, 4.7 ms `backend_submit`,
-7 ms `gpu_exec` and 18 ms `wall`, unchanged by the CPU clock increase, motivate
-this distinction but do not establish which wait dominates. No device was
-accessed for this extension.
+The reported device measurements with per-method CPU instrumentation roughly
+doubled the frontend/backend costs. They identify planning and descriptors as
+useful targets, but should not be treated as the uninstrumented frame budget.
+
+### CPU work removed
+
+* Exact `DrawInput` metadata and its value-only `DrawOutput` are cached once per
+  submission. Repeated draws with the same pipeline and all input fields reuse
+  the selected variant and plan. No heap allocation or resource ownership is
+  added. Every draw still performs resource, alias, mip-access and vertex/index
+  validation; changes to any buffer length/offset/bytes flag, format, filter,
+  LOD bits, draw count/start or index metadata invalidate the cache. Translation
+  diagnostic mode bypasses it. Each submission starts fresh, including after
+  rollback, avoiding stale plans from mutable test-adapter controls.
+* Runtime variant keys always use packed integer/float bits, eliminating decimal
+  conversion and string growth even without `fuxigpusubmit=1`. When exact draw
+  inputs differ, try an existing variant before paying for a failed baseline
+  plan. The candidate still undergoes complete translator validation; rejection
+  retries the baseline because packed shape keys omit lengths and offsets.
+  A forced-collision test verifies this fallback, and 120 changing draw inputs
+  verify that warmed variants avoid repeated baseline failures.
+* Texture creation/import caches blend support for the actual tiling, replacing
+  a physical-device format query on every blended draw.
+* Merged passes omit unchanged pipeline, viewport, scissor and descriptor-set
+  binds. Descriptor reuse compares only active bindings and still requires the
+  exact set-layout handle; bind suppression requires the exact pipeline layout.
+  The existing `fuxigpusubmit=1` cache remains bounded and submit-local, with
+  batched descriptor writes. The external ABI exposes descriptor metadata and
+  draw instantiation, not descriptor update templates; no translator changes
+  or assumptions about its private structures are needed.
+* Frontend resource ownership is deduplicated by object identity while retaining
+  first-use order. Repeated bindings/draws no longer add duplicate array retains
+  or cause repeated synchronous shadow copies at commit. Pipeline diagnostic
+  text is formatted on state changes and moved into the operation snapshot;
+  identical texture/sampler/pipeline
+  setters avoid retain/release churn after validation.
 
 Large commit_gap with small admission/submit-queue/backend waits points outside
 submission (CA work, drawable availability, callback or tick scheduling).
@@ -205,8 +235,9 @@ CPU/wall and commit/admission/handler attribution, but cannot execute on this
 Linux host.
 
 The frame tests cover a real sleep versus CPU work, bounded appended fields,
-nested method attribution, gaps outside the frontend, encoding on different
-threads, failed clocks, and no CPU reads with tracing disabled. Backend controls
+nested method wall attribution, frontend CPU spans including gaps, migration
+refusal, failed clocks, zero CPU reads at level 1, and a fixed CPU-read budget
+for 120 methods and 120 event segments. Backend controls
 also exercise contended mutex acquisition and deferred retirement without
 extending the submit CPU interval.
 
@@ -220,12 +251,13 @@ old policy. The benchmark keeps shader/descriptor/merge settings fixed and
 varies encoder boundaries and the new mask. Host timings are observations,
 not A740 predictions or pass thresholds.
 
-The CPU-time extension passed the frontend/model, backend (trace on/off,
+The CPU optimization controls cover frontend/model, backend (levels 0/1/2,
 contention and fault injection), frametrace/reuse (including deferred
 retirement), merge, overlap, mipfeedback, M6 and local M9m/M9n/M9o suites,
 plus the portable metal/metal2/metal2g/metal2h ABI controls and
-`sync-fuxi-metal.py --check`. Native Objective-C and external-translator/Apple
-input suites remain outside Linux-only verification.
+`sync-fuxi-metal.py --check`. Native Objective-C and Apple-input suites require
+separate macOS/CI inputs.
+Authored LLVM AIR controls exercise the external pinned translator on Linux.
 
 Throughput-change Linux verification commands:
 
@@ -237,14 +269,51 @@ Throughput-change Linux verification commands:
 * `python3 tools/test-fuxi-metal-mipfeedback.py --glslang <host-validator>`
 * `python3 tools/test-fuxi-metal-m6.py --headers <vulkan-headers> --glslang <host-validator>`
 * `python3 tools/test-fuxi-metal-m9m.py`, `test-fuxi-metal-m9n.py`,
-  `test-fuxi-metal-m9o.py` (M9o's optional external-translator shader controls
-  skipped; local memory/ownership controls passed).
+  `test-fuxi-metal-m9o.py --translator <host-bridge>` (authored shader controls).
 * `python3 tools/test-fuxi-metal.py`, `test-fuxi-metal2.py`,
   `test-fuxi-metal2g.py`, `test-fuxi-metal2h.py`.
 * `python3 tools/test-fuxi-gpu-k1.py`, `test-fuxi-gpu-clock.py`,
   `test-fuxi-gpu-probe.py`, `test-fuxi-gpu-scanout.py`.
 * `python3 tools/sync-fuxi-metal.py --check` and `git diff --check`.
 
-External-translator/Apple-input qualification suites were not run: no matching
-external translator or Apple artifacts are present. The new optimization tests
-use the existing authored GLSL adapter and local software Vulkan instead.
+The Linux run also executes M9a/b/g/h/i/k/l, translation, cache and cache-hit
+suites against a pristine external checkout at the recipe pin. The M7 authored
+AIR runner can execute directly with `metal-m7-control.ll` assembled by LLVM;
+it does not qualify the Xcode metallib wrapper. M6b, pipeline and CA-offline
+runners compile on Linux, but execution needs CI metallibs or Apple-extracted
+inputs. Artifact qualification needs signed bundles/boot inputs. Those inputs
+are intentionally not fetched or used here; defaults and native Objective-C
+tests remain for macOS.
+
+For the real-translator 120-draw benchmark, add
+`--translator <host-bridge> --llvm-as <host-llvm-as>` to the merge test command.
+It compiles the checked-in authored AIR control, warms three frames, measures
+40 frames, checks every output byte, and checks two-flight object lifetime.
+`CPUOPT_BENCH` reports median submit preparation and planning wall time; the
+fence wait and cold shader compilation are excluded. Use identical descriptor,
+merge and encoder-boundary flags when comparing revisions.
+
+### 120-draw host results
+
+Compared the pre-change headers at `6a46556` with the same extended benchmark
+harness on both sides: clang++ `-O2`, the pinned external bridge built with
+Cargo `--release`, lavapipe with two worker threads, one encoder, two alternating
+sampled images, and `fuxigpumerge=1 fuxigpusubmit=1`. These are nonblending
+16x16 full-quad draws through the real translator. Cold compilation and GPU
+fence waits are outside the measured submit-preparation interval.
+
+Each process warms three frames and measures 40. Fresh-process A/B/B/A gives
+two p50 observations per version; the table reports their median, with their
+range in parentheses. Host scheduling noise is visible in those ranges.
+
+| Timing mode | Before submit ms/frame | After submit ms/frame |
+| --- | --- | --- |
+| Trace off | 1.824 (1.530–2.118) | 0.548 (0.347–0.748) |
+| `fuxigpuframetrace=1` | 2.472 (2.114–2.829) | 0.522 (0.345–0.698) |
+
+With level 1, the median of the planning p50s falls from 1.697 to 0.103 ms.
+The new level 2 measures 0.595 ms submit preparation (0.512–0.678); its backend
+CPU clock budget is two reads per sampled frame. Both versions allocate two
+descriptor sets per traced frame with this workload. Every measured process
+checks exact pixels and deferred two-flight ownership. These numbers establish
+host CPU-work reduction, not achievement of the device's 16.6 ms/heat target.

@@ -12,6 +12,8 @@
 #undef fuxi_m2v_identity
 #undef fuxi_m2v_product_hash
 #undef fuxi_m2v_free
+static uint64_t planCalls;
+extern "C" uint64_t render_merge_plan_calls(){return planCalls;}
 static fuxi::Descriptor storageDescriptor(){fuxi::Descriptor d{};d.binding=1;d.type=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;d.stages=16;d.slot=1;d.range=16;return d;}
 static fuxi::Descriptor fetchDescriptor(){fuxi::Descriptor d{};d.binding=1;d.type=VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT;d.stages=16;d.format=VK_FORMAT_B8G8R8A8_UNORM;return d;}
 static std::unordered_map<void *,bool> fetchProducts;
@@ -31,5 +33,5 @@ extern "C" int fuxi_m2v_compile(void *v,const char *vn,void *f,const char *fn,vo
  return result;
 }
 extern "C" int fuxi_m2v_draw(void *product,const fuxi::DrawInput *in,fuxi::DrawOutput *out,char *why,size_t n){
- auto *p=(Product *)product;int result=mip_fixture_draw(product,in,out,why,n);if(p->multi)out->descriptors[1]=storageDescriptor();if(fetchProducts[product]){out->descriptorCount=2;out->descriptors[1]=fetchDescriptor();}return result;
+ ++planCalls;auto *p=(Product *)product;int result=mip_fixture_draw(product,in,out,why,n);if(p->multi)out->descriptors[1]=storageDescriptor();if(fetchProducts[product]){out->descriptorCount=2;out->descriptors[1]=fetchDescriptor();}return result;
 }

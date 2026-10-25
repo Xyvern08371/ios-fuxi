@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Local Vulkan overlap correctness and 140 sampled draw A/B benchmark. No downloads."""
+"""Local Vulkan overlap correctness and 120 sampled draw A/B benchmark. No downloads."""
 import argparse
 import importlib.util
 import os
