@@ -3,7 +3,7 @@
 #include <cassert>
 #include <cstdio>
 int main(){
- using namespace fuxi;Backend b;bool merge=systemTranslationPolicy().merge;
+ using namespace fuxi;Backend b;bool merge=systemTranslationPolicy().merge;bool cross=merge && (systemTranslationPolicy().perf&2);
  auto *src=b.allocateTexture(80,5,16,16),*other=b.allocateTexture(80,5,16,16),*dst=b.allocateTexture(80,5,16,16,3);
  auto *bytes=b.allocate(1024),*read=b.allocate(1024);auto *p=b.compilePipeline(nullptr,"control",nullptr,"control");auto *sam=b.allocateSampler(false,false,1);
  auto put=[&](Texture *t,uint8_t value,uint32_t level=0){memset(bytes->contents,value,1024);if(t==src || t==other)for(unsigned i=3;i<1024;i+=4)((uint8_t *)bytes->contents)[i]=t==src?16:32;Operation op{};op.src=bytes;op.texture=t;op.upload=true;op.dstLevel=level;b.submit({op});};
@@ -11,7 +11,7 @@ int main(){
  Operation draw{};draw.encoderID=1;draw.pipeline=p;draw.texture=dst;draw.samples[0]=src;draw.sampleCount[0]=1;draw.samplers[0]=sam;draw.vertices=6;draw.viewport={0,16,16,-16,0,1};draw.scissor={{0,0},{16,16}};draw.clear[0]=.2f;draw.clear[1]=.4f;draw.clear[2]=.6f;draw.clear[3]=1;
  void *proxy=dlopen(FUXI_MTL_ICD,RTLD_NOW|RTLD_LOCAL);assert(proxy);
  auto counter=[&](const char *name){auto fn=reinterpret_cast<uint64_t (*)()>(dlsym(proxy,name));assert(fn);return fn();};
- auto run=[&](const std::vector<Operation> &ops,unsigned passes,unsigned merged){auto beforePass=counter("render_merge_passes"),beforeDraw=counter("render_merge_draws");FrameSample s;{FrameTraceScope scope(&s);b.submit(ops);}assert(s.passes==(merge?passes:s.draws+std::count_if(ops.begin(),ops.end(),[](const Operation &o){return o.clearOnly && (o.areaWidth || o.areaHeight);})));assert(counter("render_merge_passes")-beforePass==s.passes && counter("render_merge_draws")-beforeDraw==s.draws);assert(s.mergedDraws==(merge?merged:0));return s;};
+ auto run=[&](const std::vector<Operation> &ops,unsigned passes,unsigned merged){auto beforePass=counter("render_merge_passes"),beforeDraw=counter("render_merge_draws");auto beforeImages=counter("render_merge_image_barriers"),beforeSubmits=counter("render_merge_submits");FrameSample s;{FrameTraceScope scope(&s);b.submit(ops);}assert(s.queueSubmits==1 && counter("render_merge_submits")-beforeSubmits==1);assert(counter("render_merge_image_barriers")-beforeImages==s.imageBarriers);assert(s.passes==(merge?passes:s.draws+std::count_if(ops.begin(),ops.end(),[](const Operation &o){return o.clearOnly && (o.areaWidth || o.areaHeight);})));assert(counter("render_merge_passes")-beforePass==s.passes && counter("render_merge_draws")-beforeDraw==s.draws);assert(s.mergedDraws==(merge?merged:0));return s;};
  auto pixels=[&](const char *label,uint32_t level=0){Operation get{};get.texture=dst;get.dst=read;get.srcLevel=level;b.submit({get});printf("PIXELS %s ",label);for(size_t i=0;i<dst->levelWidth(level)*dst->levelHeight(level)*4;++i)printf("%02x",((uint8_t *)read->contents)[i]);puts("");};
  if(b.supportsOrderedColorAccess()){
   auto *fetch=b.compilePipeline(nullptr,"control",nullptr,"fetch");assert(fetch->fetchMask==1);
@@ -68,6 +68,10 @@ int main(){
  // once; blending makes ordering, repeated clears and missing draws observable.
  std::vector<Operation> many(23,draw);for(unsigned i=0;i<many.size();++i){auto &op=many[i];op.load=i?1:2;op.samples[0]=i%2?other:src;op.scissor.extent.width=16-i%5;op.viewport.width=16-float(i%3);}
  run(many,1,22);assert(counter("render_merge_load")==uint64_t(merge?VK_ATTACHMENT_LOAD_OP_CLEAR:VK_ATTACHMENT_LOAD_OP_LOAD));pixels("blend-clear");assert(dst->isDefined(0));
+ for(unsigned i=0;i<many.size();++i)many[i].encoderID=i+1;
+ auto s=run(many,cross?1:23,cross?22:0);assert(s.crossEncoderMerges==(cross?22u:0u));pixels("many-encoders");
+ if(systemTranslationPolicy().perf&1)assert(s.readBarriersSkipped>0);
+ for(auto &op:many)op.encoderID=1;
  // A load first draw must preserve earlier pixels.
  for(auto &op:many)op.load=1;run(many,1,22);pixels("blend-load");
  // The final discard is observable through defined tracking, never through
@@ -75,8 +79,8 @@ int main(){
  many.back().store=0;run(many,1,22);assert(!dst->isDefined(0));assert(counter("render_merge_store")==VK_ATTACHMENT_STORE_OP_DONT_CARE);
  bool refused=false;try{b.submit({many.back()});}catch(const std::runtime_error &e){refused=std::string(e.what()).find("load undefined")!=std::string::npos;}assert(refused && !b.poisoned);
  run({draw},1,0);pixels("after-discard-clear");
- // Encoder identity is essential even if the next encoder starts with LOAD.
- auto a=draw,c=draw;c.load=1;c.encoderID=2;auto s=run({a,c},2,0);if(merge)assert(s.mergeSplits[size_t(MergeSplit::encoder)]==1);pixels("encoders");
+ // Crossing a known encoder requires the extra opt-in, preserving STORE/LOAD.
+ auto a=draw,c=draw;c.load=1;c.encoderID=2;s=run({a,c},cross?1:2,cross?1:0);if(merge)assert(s.mergeSplits[size_t(MergeSplit::encoder)]==unsigned(!cross));assert(s.crossEncoderMerges==unsigned(cross));pixels("encoders");
  c.encoderID=0;s=run({a,c},2,0);if(merge)assert(s.mergeSplits[size_t(MergeSplit::encoder)]==1);
  c=draw;c.load=1;c.areaWidth=8;c.areaHeight=8;c.scissor.extent={8,8};s=run({a,c},2,0);if(merge)assert(s.mergeSplits[size_t(MergeSplit::area)]==1);pixels("area-split");
  // Partial render areas must preserve uploaded pixels outside their rectangle.

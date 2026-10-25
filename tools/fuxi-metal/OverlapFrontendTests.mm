@@ -25,6 +25,8 @@ int main(){@autoreleasepool{
  dispatch_queue_set_specific(delivery,&deliveryKey,&deliveryKey,nullptr);[queue setCompletionQueue:delivery];dispatch_suspend(queue->_retireQueue);
  __block unsigned callbacks=0,scheduled=0;
  FuxiCommandBuffer *a=[(FuxiCommandBuffer *)[queue commandBuffer] retain],*b=[(FuxiCommandBuffer *)[queue commandBuffer] retain];
+ // Enable attribution directly without requiring a backboardd process gate.
+ for(auto *command:{a,b}){command->_frameTrace=YES;command->_traceCreated=fuxi::FrameClock::now();command->_traceThread=std::this_thread::get_id();}
  FuxiOverlapDrawable *drawable=[FuxiOverlapDrawable new];
  FuxiBuffer *buffer=(FuxiBuffer *)[device newBufferWithLength:4096 options:0];
  id<MTLBlitCommandEncoder> encoder=[a blitCommandEncoder];[encoder fillBuffer:(id)buffer range:NSMakeRange(0,4096) value:42];[encoder endEncoding];
@@ -37,12 +39,14 @@ int main(){@autoreleasepool{
  [a waitUntilScheduled];[b waitUntilScheduled];assert(scheduled==1 && callbacks==0 && !drawable->presents && fuxi::Backend::live==1);
  // Late registration while a fence is pending must join that completion.
  [b addCompletedHandler:^(id<MTLCommandBuffer> command){(void)command;assert(callbacks==2);++callbacks;}];
- FuxiCommandBuffer *third=[(FuxiCommandBuffer *)[queue commandBuffer] retain];
+ FuxiCommandBuffer *third=[(FuxiCommandBuffer *)[queue commandBuffer] retain];third->_frameTrace=YES;third->_traceCreated=fuxi::FrameClock::now();third->_traceThread=std::this_thread::get_id();
  [third addCompletedHandler:^(id<MTLCommandBuffer> command){assert(command.status==MTLCommandBufferStatusCompleted && callbacks==3);++callbacks;}];
  std::promise<void> started;auto blocked=std::async(std::launch::async,[&]{@autoreleasepool{started.set_value();[third commit];}});
  started.get_future().wait();assert(blocked.wait_for(std::chrono::milliseconds(30))==std::future_status::timeout);
  dispatch_resume(queue->_retireQueue);blocked.get();[third waitUntilCompleted];[b waitUntilCompleted];[a waitUntilCompleted];
  assert(callbacks==4 && drawable->presents==1 && fuxi::Backend::live==0);
+ assert(a->_flightTrace.commitCall && b->_flightTrace.submitQueue && third->_flightTrace.admissionWait);
+ assert(queue->_traceReturn && queue->_traceDelivery && queue->_traceHandlers && queue->_traceWaitCompleted);
  [a addCompletedHandler:^(id<MTLCommandBuffer> command){assert(command.status==MTLCommandBufferStatusCompleted);++callbacks;}];[a waitUntilCompleted];assert(callbacks==5);
  [a release];[b release];[third release];[drawable release];
  // Snapshot no-copy CPU bytes at commit, even while the submit worker is paused.

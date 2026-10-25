@@ -900,12 +900,12 @@ static id surveyPipeline(id refused,NSError **error,id device){
 struct FuxiEventPoint {size_t operation;FuxiEvent *event;uint64_t value;bool signal;};
 @class FuxiCommandBuffer;
 static thread_local FuxiCommandBuffer *completionCommand;
-@interface FuxiQueue : FuxiLabeledObject { @public id _device;dispatch_queue_t _completionQueue,_submitQueue,_retireQueue,_deliveryQueue;dispatch_semaphore_t _inflight;std::atomic<unsigned> _depth; }
+@interface FuxiQueue : FuxiLabeledObject { @public id _device;dispatch_queue_t _completionQueue,_submitQueue,_retireQueue,_deliveryQueue;dispatch_semaphore_t _inflight;std::atomic<unsigned> _depth;std::atomic<uint64_t> _traceReturn,_traceDelivery,_traceHandlers,_traceWaitCompleted; }
 @end
 @interface FuxiCommandBuffer : FuxiLabeledObject {
  @public FuxiQueue *_queue; NSMutableArray *_resources,*_handlers,*_scheduledHandlers; NSError *_error;dispatch_group_t _completionGroup;
  dispatch_group_t _scheduledGroup,_commitReady;BOOL _overlap,_finished;
- fuxi::FrameSample _flightTrace;fuxi::FrameClock::time_point _commitStart;uint64_t _gpuBefore;bool _surfaceFrame;
+ fuxi::FrameSample _flightTrace;fuxi::FrameClock::time_point _commitStart,_commitReturn;uint64_t _gpuBefore;bool _surfaceFrame;
  std::function<void()> _retirement;std::shared_ptr<fuxi::SurfaceLease> _lease;
  struct ShadowCopy {FuxiBuffer *buffer;std::vector<uint8_t> bytes;};std::vector<ShadowCopy> _shadows;
  BOOL _frameTrace;fuxi::FrameClock::time_point _traceCreated;fuxi::FrameCounts _traceCounts;std::thread::id _traceThread;
@@ -1206,9 +1206,12 @@ static NSString *renderPassText(MTLRenderPassDescriptor *d){
 }
 - (void)deliverCompletedHandlers:(NSArray *)handlers {
  if(!handlers.count)return;dispatch_group_enter(_completionGroup);
- void (^run)(void)=^{FuxiCommandBuffer *before=completionCommand;completionCommand=self;
+ auto queued=_frameTrace?fuxi::FrameClock::now():fuxi::FrameClock::time_point{};
+ void (^run)(void)=^{auto start=_frameTrace?fuxi::FrameClock::now():fuxi::FrameClock::time_point{};
+  if(_frameTrace)_queue->_traceDelivery=fuxi::frameNanos(queued);
+  FuxiCommandBuffer *before=completionCommand;completionCommand=self;
   for(MTLCommandBufferHandler handler in handlers)handler((id)self);
-  completionCommand=before;dispatch_group_leave(_completionGroup);};
+  completionCommand=before;if(_frameTrace)_queue->_traceHandlers=fuxi::frameNanos(start);dispatch_group_leave(_completionGroup);};
  if(_overlap)dispatch_async(_queue->_deliveryQueue,run);
  else if(_queue->_completionQueue)dispatch_async(_queue->_completionQueue,run);else run();
 }
@@ -1303,7 +1306,10 @@ static NSString *renderPassText(MTLRenderPassDescriptor *d){
  if(_status!=MTLCommandBufferStatusNotEnqueued)return;
  if(_encoding)[self rejectSelector:_cmd];
  _commitStart=fuxi::FrameClock::now();
- if(_frameTrace){_flightTrace.cpuBeforeCommit=uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(_commitStart-_traceCreated).count());_flightTrace.createdNs=uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(_traceCreated.time_since_epoch()).count());_flightTrace.cpu=fuxi::frameCPU();
+ if(_frameTrace){
+  auto previous=_queue->_traceReturn.load();auto now=uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(_commitStart.time_since_epoch()).count());
+  if(previous && now>previous && now-previous<100000000)_flightTrace.commitGap=now-previous;
+  _flightTrace.priorDelivery=_queue->_traceDelivery.load();_flightTrace.priorHandlers=_queue->_traceHandlers.load();_flightTrace.priorWaitCompleted=_queue->_traceWaitCompleted.load();_flightTrace.cpuBeforeCommit=uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(_commitStart-_traceCreated).count());_flightTrace.createdNs=uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(_traceCreated.time_since_epoch()).count());_flightTrace.cpu=fuxi::frameCPU();
   _flightTrace.encodeCountsUnknown=_traceThread!=std::this_thread::get_id();
   if(!_flightTrace.encodeCountsUnknown)_flightTrace.counts={fuxi::frameCounts.pipelines-_traceCounts.pipelines,fuxi::frameCounts.descriptors-_traceCounts.descriptors,fuxi::frameCounts.allocations-_traceCounts.allocations};
  }
@@ -1313,11 +1319,14 @@ static NSString *renderPassText(MTLRenderPassDescriptor *d){
  if(!_enqueued)[self reserveOverlap];
  // Snapshot caller-owned no-copy bytes before commit returns. The worker drains
  // prior submissions before refreshing a shared shadow allocation.
+ auto snapshotStart=_frameTrace?fuxi::FrameClock::now():fuxi::FrameClock::time_point{};
  try{for(id r in _resources){FuxiBuffer *buffer=nil;if([r isKindOfClass:[FuxiBuffer class]])buffer=r;else if([r isKindOfClass:[FuxiTexture class]])buffer=[(FuxiTexture *)r buffer];
   if(buffer && buffer->_shadow && std::none_of(_shadows.begin(),_shadows.end(),[&](const auto &copy){return copy.buffer==buffer;})){
    auto *bytes=(const uint8_t *)buffer->_wrapped;_shadows.push_back({buffer,std::vector<uint8_t>(bytes,bytes+buffer->_wrappedLength)});
   }
  }}catch(const std::exception &e){[self submissionError:e.what()];}
+ _commitReturn=fuxi::FrameClock::now();
+ if(_frameTrace){_flightTrace.snapshot=fuxi::frameNanos(snapshotStart);_flightTrace.commitCall=fuxi::frameNanos(_commitStart);_queue->_traceReturn=uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(_commitReturn.time_since_epoch()).count());}
  dispatch_group_leave(_commitReady);
 }
 - (void)submissionError:(const char *)message {
@@ -1325,6 +1334,7 @@ static NSString *renderPassText(MTLRenderPassDescriptor *d){
  @synchronized(self){_status=MTLCommandBufferStatusError;if(!_error)_error=[[NSError alloc] initWithDomain:MTLCommandBufferErrorDomain code:MTLCommandBufferErrorInternal userInfo:@{NSLocalizedDescriptionKey:[NSString stringWithUTF8String:message]}];}
 }
 - (void)executeCommitted {
+ if(_frameTrace)_flightTrace.submitQueue=fuxi::frameNanos(_commitReturn);
  bool backboard=!strcmp(clientProcess,"backboardd");_gpuBefore=backboard?fuxi::Backend::gpuNanos.load():0;
  auto before=fuxi::frameCounts;
  {fuxi::FrameTraceScope scope((_frameTrace || _overlap)?&_flightTrace:nullptr);
@@ -1371,14 +1381,15 @@ static NSString *renderPassText(MTLRenderPassDescriptor *d){
   // Start the fence wait before user scheduled handlers. Retirement can free a
   // flight slot even if a handler enqueues another command on this queue.
   dispatch_async(_queue->_retireQueue,^{@autoreleasepool{[self retireCommitted];}});
-  [self publishScheduled];dispatch_group_leave(_scheduledGroup);
+  auto start=_frameTrace?fuxi::FrameClock::now():fuxi::FrameClock::time_point{};[self publishScheduled];if(_frameTrace)_flightTrace.scheduledHandlers=fuxi::frameNanos(start);dispatch_group_leave(_scheduledGroup);
  }
  else [self retireCommitted];
 }
 - (void)retireCommitted {
  {fuxi::FrameTraceScope scope((_frameTrace || _overlap)?&_flightTrace:nullptr);
  try{if(_retirement){_retirement();_retirement={};}}catch(const std::exception &e){[self submissionError:e.what()];}
- _lease.reset(); // Never hand scanout a surface before its fence; poison keeps it locked.
+ auto releaseStart=_frameTrace?fuxi::FrameClock::now():fuxi::FrameClock::time_point{};
+ _lease.reset();if(_frameTrace)_flightTrace.surfaceRelease=fuxi::frameNanos(releaseStart); // Never hand scanout a surface before its fence; poison keeps it locked.
  if(_status!=MTLCommandBufferStatusError){
   for(const auto &op:_ops)if(op.pipeline)completedDraws.fetch_add(1);
  }
@@ -1399,7 +1410,7 @@ static NSString *renderPassText(MTLRenderPassDescriptor *d){
  @synchronized(self){[_scheduledHandlers removeAllObjects];}[_resources removeAllObjects];_ops.clear();_events.clear();_shadows.clear();
  if(_overlap)dispatch_group_leave(_completionGroup);
 }
-- (void)waitUntilCompleted {CENSUS();if(completionCommand!=self)dispatch_group_wait(_completionGroup,DISPATCH_TIME_FOREVER);}
+- (void)waitUntilCompleted {CENSUS();if(completionCommand!=self){auto start=_frameTrace?fuxi::FrameClock::now():fuxi::FrameClock::time_point{};dispatch_group_wait(_completionGroup,DISPATCH_TIME_FOREVER);if(_frameTrace)_queue->_traceWaitCompleted=fuxi::frameNanos(start);}}
 - (void)waitUntilScheduled {CENSUS();if(!_overlap)return;@synchronized(self){if(_scheduled || _finished || _status==MTLCommandBufferStatusError)return;}dispatch_group_wait(_scheduledGroup,DISPATCH_TIME_FOREVER);}
 - (BOOL)commitAndWaitUntilSubmitted {CENSUS();[self commit];[self waitUntilScheduled];return _scheduled && self.status!=MTLCommandBufferStatusError;}
 - (CFTimeInterval)kernelStartTime {CENSUS();return 0;}
@@ -1416,7 +1427,8 @@ static NSString *renderPassText(MTLRenderPassDescriptor *d){
  [self encodeCacheHintTag:tag resourceGroups:groups count:count];
 }
 - (void)reserveOverlap {
- dispatch_semaphore_wait(_queue->_inflight,DISPATCH_TIME_FOREVER);_flightTrace.inflight=++_queue->_depth;
+ auto start=_frameTrace?fuxi::FrameClock::now():fuxi::FrameClock::time_point{};
+ dispatch_semaphore_wait(_queue->_inflight,DISPATCH_TIME_FOREVER);if(_frameTrace)_flightTrace.admissionWait+=fuxi::frameNanos(start);_flightTrace.inflight=++_queue->_depth;
  _enqueued=YES;dispatch_group_enter(_commitReady);
  dispatch_async(_queue->_submitQueue,^{@autoreleasepool{
   dispatch_group_wait(_commitReady,DISPATCH_TIME_FOREVER);
@@ -1649,7 +1661,7 @@ static NSString *surfaceDescriptorText(IOSurfaceRef surface,NSUInteger plane){
 - (id)newCommandQueueWithMaxCommandBufferCount:(NSUInteger)n {CENSUS();
  if(!n || n>64) {unsupported(self,_cmd);return nil;}FuxiQueue *q=[self newCommandQueue];if(n==1 && q && q->_inflight){dispatch_release(q->_inflight);q->_inflight=dispatch_semaphore_create(1);}return q;
 }
-- (id)newCommandQueue {CENSUS();if(clientMode==fuxi::ClientMode::census)return nil;FuxiQueue *q=[FuxiQueue new];q->_device=[self retain];q->_depth=0;if(fuxi::systemTranslationPolicy().overlap){
+- (id)newCommandQueue {CENSUS();if(clientMode==fuxi::ClientMode::census)return nil;FuxiQueue *q=[FuxiQueue new];q->_device=[self retain];q->_depth=0;q->_traceReturn=0;q->_traceDelivery=0;q->_traceHandlers=0;q->_traceWaitCompleted=0;if(fuxi::systemTranslationPolicy().overlap){
  // The compositor's submit/retire/handler work is on the frame path; at default
  // QoS it competes with background daemons (UniXNU AdrenoMetal c6d29ca does the same).
  dispatch_queue_attr_t attr=dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL,compositorQoS(),0);

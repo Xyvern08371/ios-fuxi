@@ -58,9 +58,21 @@ void main() {color=textureLod(image,vec2(0.5),constants.lod);}
             if not extra:
                 skips = [line for line in baseline.splitlines() if line.startswith('SKIP:')]
                 print('\n'.join(skips) if skips else 'PASS: lavapipe exposes ordered attachment access; fetch clear/interleaved/mip/two-flight pixels tested')
+        # Both bits independently and together, including two flights and the
+        # feedback path. Pixels must match the unchanged singleton baseline.
+        baseline = invoke(d/'test', 'fuxigpuoverlap=1 fuxigpusubmit=1 fuxigpufeedback=1')
+        assert invoke(d/'test', 'fuxigpuperf=1') == invoke(d/'test', '')
+        for mask in ('1', '2', '3'):
+            actual = invoke(d/'test', 'fuxigpuoverlap=1 fuxigpusubmit=1 fuxigpufeedback=1 fuxigpumerge=1 fuxigpuperf='+mask)
+            assert actual == baseline, 'perf mask changed pixels: '+mask
+            print('PASS: perf mask '+mask+' pixels, independent Vulkan barrier/submit counts and encoder boundaries')
+        for bad in ('0', '4', '-1', '01', 'bad', '3 fuxigpuperf=1'):
+            actual = invoke(d/'test', 'fuxigpumerge=1 fuxigpuperf='+bad)
+            assert actual == invoke(d/'test', 'fuxigpumerge=1')
+        print('PASS: perf disabled/unknown/malformed/duplicate tokens preserve recording policy')
         # Exercise the production fallback without requiring a second ICD.
         baseline = invoke(d/'test', '', MERGE_TEST_NO_ORDER='1')
-        merged = invoke(d/'test', 'fuxigpumerge=1 fuxigpuoverlap=1 fuxigpusubmit=1', MERGE_TEST_NO_ORDER='1')
+        merged = invoke(d/'test', 'fuxigpumerge=1 fuxigpuoverlap=1 fuxigpusubmit=1 fuxigpuperf=3', MERGE_TEST_NO_ORDER='1')
         assert baseline == merged, 'no-extension fallback pixels differ'
         print('PASS: extension-hidden fallback keeps ordinary merge/shadow pixels; fetch skipped')
         for bad in ('0', 'bad', '1 fuxigpumerge=1'):
@@ -84,6 +96,8 @@ void main() {color=textureLod(image,vec2(0.5),constants.lod);}
             print(output, end='')
             match = re.search(r'cpu_ms/frame=([\d.]+) gpu_ms/frame=([\d.]+)', output)
             results.append(tuple(float(x) for x in match.groups()))
+        for mask in ('1', '2', '3'):
+            print(invoke(d/'bench', 'fuxigpumerge=1 fuxigpusubmit=1 fuxigpuperf='+mask, MERGE_BENCH_ENCODERS='1'), end='')
         for a_index, b_index in ((0, 1), (3, 2)):
             delta = [(results[a_index][i]-results[b_index][i])*1000/139 for i in range(2)]
             print('BOUNDARY_DELTA cpu_us/boundary=%.3f gpu_us/boundary=%.3f (host only; no threshold)' % tuple(delta))

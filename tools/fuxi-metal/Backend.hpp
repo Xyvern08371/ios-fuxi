@@ -826,6 +826,7 @@ public:
   auto submitStart=std::chrono::steady_clock::now();auto submitQueued=submitStart;
   auto since=[](std::chrono::steady_clock::time_point t){return (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-t).count();};
   std::unique_lock<std::mutex> guard(mutex);
+  if(currentFrame)currentFrame->backendLock+=since(submitStart);
   requireLive();std::vector<HostUse> hostUses;
   if(retirement || systemTranslationPolicy().overlap){
    auto use=[&](VkDeviceMemory memory,const void *address,size_t bytes){if(std::none_of(hostUses.begin(),hostUses.end(),[&](const auto &old){return old.memory==memory && old.address==address && old.bytes==bytes;}))hostUses.push_back({memory,address,bytes});};
@@ -837,7 +838,10 @@ public:
   // Noncoherent whole-allocation flush/invalidate cannot race another flight on
   // the same host range. CPU index inspection and shadow refresh also drain.
   bool drain=bool(prepare) || (retirement && std::any_of(ops.begin(),ops.end(),[](const auto &op){return op.indices!=nullptr;}));
+  auto slotStart=FrameClock::now();
+  if(currentFrame){currentFrame->drainWaits+=drain && (slots[0].busy || slots[1].busy);currentFrame->conflictWaits+=conflicts();currentFrame->slotWaits+=slots[0].busy && (!retirement || slots[1].busy);}
   submitWake.wait(guard,[&]{return (!slots[0].busy || (retirement && !slots[1].busy)) && (!drain || (!slots[0].busy && !slots[1].busy)) && !conflicts();});
+  if(currentFrame)currentFrame->slotWait+=since(slotStart);
   requireLive();auto &slot=slots[slots[0].busy?1:0];
   auto &commandPool=slot.commandPool;auto &command=slot.command;auto &submitFence=slot.submitFence;auto &queryPool=slot.queryPool;
   auto &descriptorPool=slot.descriptorPool;auto &descriptorSets=slot.descriptorSets;auto &descriptorCapacity=slot.descriptorCapacity;auto &aliasScratch=slot.aliasScratch;
@@ -1064,12 +1068,12 @@ public:
     auto boundary=[&](size_t a,size_t b)->MergeSplit {
      auto &x=ops[a];auto &y=ops[b];auto reason=isolated(a);if(reason!=MergeSplit::none)return reason;
      reason=isolated(b);if(reason!=MergeSplit::none)return reason;
-     if(!x.encoderID || x.encoderID!=y.encoderID)return MergeSplit::encoder;
+     if(!x.encoderID || !y.encoderID || (x.encoderID!=y.encoderID && !(systemTranslationPolicy().perf&2)))return MergeSplit::encoder;
      if(x.colorCount!=y.colorCount || x.colorMask!=y.colorMask)return MergeSplit::attachments;
      if(x.areaWidth!=y.areaWidth || x.areaHeight!=y.areaHeight)return MergeSplit::area;
      for(unsigned i=0;i<x.colorCount;++i){auto c=x.color(i),d=y.color(i);
       if(c.texture!=d.texture || c.level!=d.level || x.pipeline->options.color(i).format!=y.pipeline->options.color(i).format)return MergeSplit::attachments;
-      // Only encoder-internal load/store boundaries may disappear.
+      // Intermediate STORE then LOAD preserves attachment contents across encoders too.
       if(c.texture && (c.store!=1 || d.load!=1))return MergeSplit::actions;
      }
      // A refresh reads backing storage, not the optimal sample image. Any
@@ -1087,7 +1091,7 @@ public:
     };
     size_t first=0;
     for(size_t n=1;n<=ops.size();++n){auto reason=n==ops.size()?MergeSplit::none:boundary(n-1,n);
-     if(n<ops.size() && reason==MergeSplit::none)continue;
+     if(n<ops.size() && reason==MergeSplit::none){if(currentFrame && ops[n-1].encoderID!=ops[n].encoderID)++currentFrame->crossEncoderMerges;continue;}
      for(size_t i=first;i<n;++i)mergeEnds[i]=n-1;
      if(currentFrame && n<ops.size() && (ops[n-1].pipeline || ops[n].pipeline))++currentFrame->mergeSplits[size_t(reason)];
      first=n;
@@ -1112,7 +1116,7 @@ public:
    // Direct shared host writes are not tracked. Only Vulkan HOST_COHERENT permits omission.
    for(auto *t:textures)if(t->mapped && !coherent(t->memoryType)) {VkMappedMemoryRange r{};r.sType=VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;r.memory=t->memory;r.size=VK_WHOLE_SIZE;++flushCalls;check(FlushMappedMemoryRanges(device,1,&r));}
    for(auto *b:buffers)if(!coherent(b->memoryType)) {VkMappedMemoryRange r{};r.sType=VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;r.memory=b->memory;r.size=VK_WHOLE_SIZE;++flushCalls;check(FlushMappedMemoryRanges(device,1,&r));}
-   submitFlushNanos+=since(flushStart);
+   {auto ns=since(flushStart);submitFlushNanos+=ns;if(currentFrame)currentFrame->flush+=ns;}
    {Measure measure{objectNanos};
     if(!commandPool){VkCommandPoolCreateInfo pi{};pi.sType=VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;pi.queueFamilyIndex=family;check(CreateCommandPool(device,&pi,nullptr,&commandPool));++reuseCounts.commandPools;++submitObjectCreates;++submitPoolCreates;
      VkCommandBufferAllocateInfo ai{};ai.sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;ai.commandPool=commandPool;ai.level=VK_COMMAND_BUFFER_LEVEL_PRIMARY;ai.commandBufferCount=1;
@@ -1137,6 +1141,11 @@ public:
     for(uint32_t l=base;l<base+count;++l){
      if(hoisting){auto &mips=hoisted[t->image];uint32_t bit=1u<<l;if(mips&bit)continue;mips|=bit;}
      auto &layout=l?t->levelLayouts[l]:t->layout;
+     // Read-only -> read-only cannot introduce a write hazard. Retain GENERAL
+     // (attachments/fetch/aliases), actual layout changes and all global barriers.
+     // A preceding transfer/alias writer is still covered by the inter-op barrier.
+     if((systemTranslationPolicy().perf&1) && layout==next && next==VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL){if(currentFrame)++currentFrame->readBarriersSkipped;continue;}
+     if(currentFrame)++currentFrame->imageBarriers;
      VkImageMemoryBarrier ib{};ib.sType=VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;ib.oldLayout=layout;ib.newLayout=next;
      ib.srcAccessMask=layout==VK_IMAGE_LAYOUT_UNDEFINED?0:VK_ACCESS_MEMORY_READ_BIT|VK_ACCESS_MEMORY_WRITE_BIT|VK_ACCESS_HOST_WRITE_BIT;
      ib.dstAccessMask=VK_ACCESS_MEMORY_READ_BIT|VK_ACCESS_MEMORY_WRITE_BIT;ib.srcQueueFamilyIndex=ib.dstQueueFamilyIndex=VK_QUEUE_FAMILY_IGNORED;
@@ -1367,7 +1376,7 @@ public:
    if(failQueueAttempt){failQueueAttempt=false;check(VK_ERROR_DEVICE_LOST);}
 #endif
    if(!retirement){
-   check(QueueSubmit(queue,1,&si,fence));if(currentFrame)currentFrame->backendSubmit+=frameNanos(locked);if(scheduled)scheduled();
+   {auto start=FrameClock::now();check(QueueSubmit(queue,1,&si,fence));if(currentFrame){++currentFrame->queueSubmits;currentFrame->queueSubmit+=frameNanos(start);}}if(currentFrame)currentFrame->backendSubmit+=frameNanos(locked);if(scheduled)scheduled();
    auto waitStart=currentFrame?FrameClock::now():FrameClock::time_point{}; // Lavapipe can JIT a generic CA shader on its submission worker. The
    // offline qualifier may extend only its host wait; production stays 2 s.
 #if defined(FUXI_MTL_HOST_TEST) && defined(FUXI_MTL_HOST_FENCE_NS)
@@ -1385,12 +1394,12 @@ public:
    auto invalidateStart=std::chrono::steady_clock::now();
    for(auto *t:textures)if(t->mapped && !coherent(t->memoryType)) {VkMappedMemoryRange r{};r.sType=VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;r.memory=t->memory;r.size=VK_WHOLE_SIZE;++invalidateCalls;check(InvalidateMappedMemoryRanges(device,1,&r));}
    for(auto *b:buffers)if(!coherent(b->memoryType)) {VkMappedMemoryRange r{};r.sType=VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;r.memory=b->memory;r.size=VK_WHOLE_SIZE;++invalidateCalls;check(InvalidateMappedMemoryRanges(device,1,&r));}
-   submitInvalidateNanos+=since(invalidateStart);
+   {auto ns=since(invalidateStart);submitInvalidateNanos+=ns;if(currentFrame)currentFrame->invalidate+=ns;}
    cleanup();
 #ifdef FUXI_MTL_HOST_TEST
    if(!reuseSubmitObjects){clearSubmitObjects(slot);clearFrames();clearViews();}
 #endif
-   ++submits;submitRetireNanos+=since(submitDone);
+   {auto ns=since(submitDone);++submits;submitRetireNanos+=ns;if(currentFrame)currentFrame->retireHost+=ns;}
    return;
    }
    // Build/pin retirement before QueueSubmit: allocation failure cannot abandon DMA.
@@ -1409,7 +1418,8 @@ public:
     result=WaitForFences(device,1,&fence,VK_TRUE,2000000000ULL);
 #endif
     if(currentFrame)currentFrame->gpuWait+=frameNanos(waitStart);
-    std::lock_guard<std::mutex> lock(mutex);
+    auto lockStart=FrameClock::now();std::lock_guard<std::mutex> lock(mutex);
+    if(currentFrame)currentFrame->retireLock+=frameNanos(lockStart);
     auto releaseSlot=[&]{slot.hostUses.clear();slot.busy=false;submitWake.notify_all();};
     try {
      if(result!=VK_SUCCESS){poisoned=true;check(result);}
@@ -1424,19 +1434,19 @@ public:
      auto invalidateStart=FrameClock::now();
      for(auto *t:pinnedTextures)if(t->mapped && !coherent(t->memoryType)){VkMappedMemoryRange r{};r.sType=VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;r.memory=t->memory;r.size=VK_WHOLE_SIZE;++invalidateCalls;check(InvalidateMappedMemoryRanges(device,1,&r));}
      for(auto *b:pinnedBuffers)if(!coherent(b->memoryType)){VkMappedMemoryRange r{};r.sType=VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;r.memory=b->memory;r.size=VK_WHOLE_SIZE;++invalidateCalls;check(InvalidateMappedMemoryRanges(device,1,&r));}
-     submitInvalidateNanos+=frameNanos(invalidateStart);
+     {auto ns=frameNanos(invalidateStart);submitInvalidateNanos+=ns;if(currentFrame)currentFrame->invalidate+=ns;}
      if(aliasBuffer!=slot.aliasScratch)destroyUnlocked(aliasBuffer);destroyUnlocked(neutralBuffer);
      for(auto v:sampleViews)DestroyImageView(device,v,nullptr);for(auto f:frames)DestroyFramebuffer(device,f,nullptr);for(auto r:emptyRenders)DestroyRenderPass(device,r,nullptr);
      for(auto *b:pinnedBuffers)destroyUnlocked(b);for(auto *t:pinnedTextures)destroyTextureUnlocked(t);for(auto *p:pinnedPipelines)destroyPipelineUnlocked(p);for(auto *s:pinnedSamplers)destroySamplerUnlocked(s);
 #ifdef FUXI_MTL_HOST_TEST
      if(!reuseSubmitObjects){clearSubmitObjects(slot);clearFrames();clearViews();}
 #endif
-     ++submits;submitRetireNanos+=frameNanos(done);releaseSlot();
+     {auto ns=frameNanos(done);++submits;submitRetireNanos+=ns;if(currentFrame)currentFrame->retireHost+=ns;}releaseSlot();
     }catch(...){poisoned=true;releaseSlot();throw;} // Quarantine all pinned GPU objects on uncertain ownership.
    };
    for(auto *b:pinnedBuffers)++b->references;for(auto *t:pinnedTextures)++t->references;for(auto *p:pinnedPipelines)++p->references;for(auto *s:pinnedSamplers)++s->references;
    slot.hostUses=std::move(hostUses);slot.busy=true;
-   check(QueueSubmit(queue,1,&si,fence));if(currentFrame)currentFrame->backendSubmit+=frameNanos(locked);if(scheduled)scheduled();
+   {auto start=FrameClock::now();check(QueueSubmit(queue,1,&si,fence));if(currentFrame){++currentFrame->queueSubmits;currentFrame->queueSubmit+=frameNanos(start);}}if(currentFrame)currentFrame->backendSubmit+=frameNanos(locked);if(scheduled)scheduled();
    submitted=false;completed=true;
    *retirement=std::move(finish);
   } catch(...) {if(submitted){poisoned=true;slot.busy=false;submitWake.notify_all();}else if(!completed){for(auto old:oldTextures){old.texture->layout=old.layout;old.texture->levelLayouts=old.levelLayouts;old.texture->defined=old.defined;old.texture->definedLevels=old.definedLevels;}clearSubmitObjects(slot);cleanup();}
