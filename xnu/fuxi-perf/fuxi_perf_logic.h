@@ -52,10 +52,13 @@ static int fp_level(const uint32_t *rows, unsigned count, unsigned cap, unsigned
  *khz = freq;
  return best;
 }
+/* A new boost may start at or below fp_start dC (fuxiperfstart, default 600);
+ * a running one continues to 680. The hot/limit trip still vetoes both. */
+static unsigned fp_start = 600;
 static int fp_want_boost(int boosted, int valid, int temp,
     uint64_t now, uint64_t input, uint64_t swap, uint64_t hold)
 {
- if (!valid || temp > 680 || (!boosted && temp > 600)) return 0;
+ if (!valid || temp > 680 || (!boosted && temp > (int)fp_start)) return 0;
  int recent_input = input && now >= input && now-input <= hold;
  uint64_t activity = input > swap ? input : swap;
  int recent_activity = activity && now >= activity && now-activity <= hold;

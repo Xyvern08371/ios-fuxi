@@ -113,6 +113,10 @@ int main(void) {
  assert(fp_want_boost(1,1,400,4000,500,3999,1500)); /* swaps extend */
  assert(!fp_want_boost(1,1,400,5500,500,3999,1500));
  assert(!fp_want_boost(0,1,400,2000,2001,0,1500));
+ fp_start=650; /* fuxiperfstart raises only the start threshold */
+ assert(fp_want_boost(0,1,650,2000,1999,0,1500) && !fp_want_boost(0,1,651,2000,1999,0,1500));
+ assert(!fp_want_boost(1,1,681,2000,1999,0,1500));
+ fp_start=600;
  for(unsigned d=0;d<3;d++) {
   fp_percore[d]=1; assert(fp_vote(d,7)); assert(writes[d]==fp_cores[d]);
   fp_percore[d]=0; assert(fp_vote(d,2)); assert(writes[d]==fp_cores[d]+1);

@@ -529,6 +529,7 @@ static void fp_configure(void)
  if (fp_hot > fp_limit) fp_hot = fp_limit;
  fp_arg("fuxiperfresume",&fp_resume,350,fp_hot-10);
  if (fp_resume > fp_hot-10) fp_resume = fp_hot-10;
+ fp_arg("fuxiperfstart",&fp_start,400,fp_limit);
  fp_arg("fuxiperfrise",&fp_rise,10,1000);
  fp_arg("fuxiperffast",&fp_fast_ms,5,25);
  fp_arg("fuxiperfrate",&fp_rate_ms,fp_fast_ms,1000);
@@ -536,8 +537,8 @@ static void fp_configure(void)
  nanoseconds_to_absolutetime((uint64_t)fp_budget_ms*NSEC_PER_MSEC,&fp_budget);
  nanoseconds_to_absolutetime(NSEC_PER_SEC,&fp_duty_window);
  nanoseconds_to_absolutetime(500ULL*NSEC_PER_MSEC,&fp_recovery);
- printf("FUXI PERF: thermal hot %u limit %u resume %u dC rise %u dC/s fast %u ms slope %u ms duty %u/1000 ms recovery 500 ms predict 100 ms\n",
-     fp_hot,fp_limit,fp_resume,fp_rise,fp_fast_ms,fp_rate_ms,fp_budget_ms);
+ printf("FUXI PERF: thermal hot %u limit %u resume %u start %u dC rise %u dC/s fast %u ms slope %u ms duty %u/1000 ms recovery 500 ms predict 100 ms\n",
+     fp_hot,fp_limit,fp_resume,fp_start,fp_rise,fp_fast_ms,fp_rate_ms,fp_budget_ms);
 }
 static void fp_worker_locked(thread_call_param_t arg, thread_call_param_t result)
 {
