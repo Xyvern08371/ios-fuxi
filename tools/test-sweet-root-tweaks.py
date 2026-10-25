@@ -200,6 +200,19 @@ with tempfile.TemporaryDirectory() as root:
     except SystemExit:
         pass
 
+    m.job_env(root, ['com.apple.lsd:TU_DEBUG=sysmem'])
+    jobs = plistlib.load(open(xpc, 'rb'))['LaunchDaemons']
+    assert jobs['/System/Library/LaunchDaemons/com.apple.lsd.plist']['EnvironmentVariables']['TU_DEBUG'] == 'sysmem'
+    m.job_env(root, ['com.apple.lsd:TU_DEBUG='])
+    jobs = plistlib.load(open(xpc, 'rb'))['LaunchDaemons']
+    assert 'TU_DEBUG' not in jobs['/System/Library/LaunchDaemons/com.apple.lsd.plist']['EnvironmentVariables']
+    for bad in (['com.apple.lsd'], ['com.apple.nonexistent:A=1'], [':A=1']):
+        try:
+            m.job_env(root, bad)
+            raise AssertionError('bad spec accepted: %r' % bad)
+        except SystemExit:
+            pass
+
 with tempfile.TemporaryDirectory() as root:
     owner = (os.getuid(), os.getgid())
     ax = os.path.join(root, 'private/var/mobile/Library/Preferences/com.apple.Accessibility.plist')
@@ -214,4 +227,4 @@ with tempfile.TemporaryDirectory() as root:
     assert plistlib.load(open(ax, 'rb')) == {'Other': 1}             # other keys kept
 
 print('PASS: cpbitmap trailer/length/pixels, legibility style, PNG decode, wallpaper files, colour wallpaper prefs, '
-      'staged apps install/undo, LaunchServices reset, oslog jobs, reduce transparency')
+      'staged apps install/undo, LaunchServices reset, oslog jobs, job env, reduce transparency')

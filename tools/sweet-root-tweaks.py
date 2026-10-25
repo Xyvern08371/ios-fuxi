@@ -236,6 +236,34 @@ def oslog_jobs(root, labels):
     print('launchd.plist: OS_ACTIVITY_DT_MODE=YES for', ', '.join(labels))
 
 
+def job_env(root, specs):
+    """LABEL:KEY=VALUE sets one environment variable on a cached launchd job
+    (e.g. TU_DEBUG for backboardd); LABEL:KEY= removes it."""
+    path = os.path.join(root, 'System/Library/xpc/launchd.plist')
+    st = os.stat(path)
+    plist = load(path)
+    by_label = {j.get('Label'): j for j in plist['LaunchDaemons'].values()}
+    changes = []
+    for spec in specs:
+        label, sep, assignment = spec.partition(':')
+        key, eq, value = assignment.partition('=')
+        if not (sep and eq and label and key):
+            sys.exit('--job-env expects LABEL:KEY=VALUE, got ' + spec)
+        if label not in by_label:
+            sys.exit('launchd.plist: no job labelled ' + label)
+        changes.append((by_label[label], key, value))
+    for job, key, value in changes:
+        env = job.setdefault('EnvironmentVariables', {})
+        if value:
+            env[key] = value
+        else:
+            env.pop(key, None)
+            if not env:
+                del job['EnvironmentVariables']
+    save(path, plist, st.st_uid, st.st_gid, st.st_mode & 0o7777)
+    print('launchd.plist: env', ', '.join(specs))
+
+
 LS_DATABASES = 'private/var/mobile/Containers/Data/InternalDaemon/*/Library/Caches/*com.apple.LaunchServices-*.csstore'
 CHRONO_SNAPSHOTS = 'private/var/mobile/Library/Caches/com.apple.chrono/snapshot-cache'
 
@@ -645,6 +673,7 @@ def main():
     image.add_argument('--legacy-wallpaper-color', nargs='?', const=WALLPAPER_COLOR, metavar='#RRGGBB')
     image.add_argument('--no-legacy-wallpaper-color', action='store_true')
     ap.add_argument('--oslog', metavar='LABEL[,LABEL...]')
+    ap.add_argument('--job-env', action='append', metavar='LABEL:KEY=VALUE')
     ap.add_argument('--rebuild-launchservices', action='store_true')
     staged = ap.add_mutually_exclusive_group()
     staged.add_argument('--install-staged-apps', action='store_true')
@@ -661,6 +690,8 @@ def main():
         posterboard_oslog(root)
     if args.oslog:
         oslog_jobs(root, [label for label in args.oslog.split(',') if label])
+    if args.job_env:
+        job_env(root, args.job_env)
     if args.install_staged_apps:
         install_staged_apps(root)
     if args.no_install_staged_apps:
