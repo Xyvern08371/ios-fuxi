@@ -99,7 +99,7 @@ int main(){
  // Crossing a known encoder requires the extra opt-in, preserving STORE/LOAD.
  auto a=draw,c=draw;c.load=1;c.encoderID=2;s=run({a,c},cross?1:2,cross?1:0);if(merge)assert(s.mergeSplits[size_t(MergeSplit::encoder)]==unsigned(!cross));assert(s.crossEncoderMerges==unsigned(cross));pixels("encoders");
  c.encoderID=0;s=run({a,c},2,0);if(merge)assert(s.mergeSplits[size_t(MergeSplit::encoder)]==1);
- c=draw;c.load=1;c.areaWidth=8;c.areaHeight=8;c.scissor.extent={8,8};s=run({a,c},2,0);if(merge)assert(s.mergeSplits[size_t(MergeSplit::area)]==1);pixels("area-split");
+ c=draw;c.load=1;c.areaWidth=8;c.areaHeight=8;c.scissor.extent={8,8};s=run({a,c},(systemTranslationPolicy().perf&4)?1:2,(systemTranslationPolicy().perf&4)?1:0);if(merge)assert(s.mergeSplits[size_t(MergeSplit::area)]==unsigned(!(systemTranslationPolicy().perf&4)));pixels("area-split");
  // Partial render areas must preserve uploaded pixels outside their rectangle.
  put(dst,173);many.assign(9,c);for(unsigned i=0;i<many.size();++i)many[i].load=i?1:2;run(many,1,8);pixels("partial");
  for(unsigned y=0;y<16;++y)for(unsigned x=0;x<16;++x)if(x>=8 || y>=8)for(unsigned q=0;q<4;++q)assert(((uint8_t *)read->contents)[(y*16+x)*4+q]==173);

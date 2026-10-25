@@ -8,8 +8,8 @@ int main(int argc,char **argv){
  using namespace fuxi;
  static_assert(sizeof("fuxigpuperf")-1<=16);
  assert(!translationPolicy(nullptr).perf);
- for(unsigned i=0;i<4;++i)assert(translationPolicy(("fuxigpuperf="+std::to_string(i)).c_str()).perf==i);
- for(auto value:{"4","255","-1","01","1x","","3 fuxigpuperf=1","3 fuxigpuperf=bad"})assert(!translationPolicy((std::string("fuxigpuperf=")+value).c_str()).perf);
+ for(unsigned i=0;i<8;++i)assert(translationPolicy(("fuxigpuperf="+std::to_string(i)).c_str()).perf==i);
+ for(auto value:{"8","9","255","-1","01","1x","","3 fuxigpuperf=1","3 fuxigpuperf=bad"})assert(!translationPolicy((std::string("fuxigpuperf=")+value).c_str()).perf);
  assert(translationPolicy("other=1\tfuxigpuperf=3\n").perf==3 && !translationPolicy("prefixfuxigpuperf=3").perf);
  static_assert(sizeof("fuxigpuoverlap")-1<=16 && sizeof("fuxigpusubmit")-1<=16);
  assert(!translationPolicy(nullptr).overlap && !translationPolicy(nullptr).submitFast);

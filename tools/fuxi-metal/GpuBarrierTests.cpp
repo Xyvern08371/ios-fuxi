@@ -1,0 +1,51 @@
+/* CA-like ordering and boundary costs on the production backend, authored GLSL. */
+#include "Backend.hpp"
+#include <cassert>
+#include <cstdio>
+int main(){
+ using namespace fuxi;Backend b;bool merge=systemTranslationPolicy().merge,perf=systemTranslationPolicy().perf&4,cross=systemTranslationPolicy().perf&2;
+ auto *target=b.allocateTexture(80,5,16,16),*backdrop=b.allocateTexture(80,5,16,16),*blur=b.allocateTexture(80,5,16,16);
+ Texture *layers[4];for(auto &t:layers)t=b.allocateTexture(80,5,16,16);
+ auto *bytes=b.allocate(1024),*read=b.allocate(1024);auto *p=b.compilePipeline(nullptr,"control",nullptr,"control");auto *sam=b.allocateSampler(false,false,1);
+ void *proxy=dlopen(FUXI_MTL_ICD,RTLD_NOW|RTLD_LOCAL);assert(proxy);
+ auto counter=[&](const char *name){auto fn=reinterpret_cast<uint64_t (*)()>(dlsym(proxy,name));assert(fn);return fn();};
+ auto put=[&](Texture *t,uint8_t value,uint32_t level=0){memset(bytes->contents,value,1024);for(unsigned i=3;i<1024;i+=4)((uint8_t *)bytes->contents)[i]=41;Operation op{};op.src=bytes;op.texture=t;op.upload=true;op.dstLevel=level;b.submit({op});};
+ for(unsigned i=0;i<4;++i)put(layers[i],39+i*47);
+ Operation draw{};draw.encoderID=1;draw.pipeline=p;draw.texture=target;draw.samples[0]=layers[0];draw.sampleCount[0]=1;draw.samplers[0]=sam;draw.vertices=6;
+ draw.viewport={0,16,16,-16,0,1};draw.scissor={{0,0},{16,16}};draw.clear[0]=.2f;draw.clear[1]=.4f;draw.clear[2]=.6f;draw.clear[3]=1;
+ auto run=[&](const char *label,const std::vector<Operation> &ops,unsigned passes){
+  auto before=counter("render_merge_barrier_calls"),images=counter("render_merge_image_barriers"),calls=counter("render_merge_image_barrier_calls"),renders=counter("render_merge_passes");
+  FrameSample s;{FrameTraceScope scope(&s);b.submit(ops);}assert(s.passes==passes && s.passes==counter("render_merge_passes")-renders && s.imageBarriers==counter("render_merge_image_barriers")-images);
+  printf("COUNTS %s images=%llu image_calls=%llu barriers=%llu passes=%llu area=%llu non_draw=%llu\n",label,(unsigned long long)s.imageBarriers,(unsigned long long)(counter("render_merge_image_barrier_calls")-calls),(unsigned long long)(counter("render_merge_barrier_calls")-before),(unsigned long long)s.passes,(unsigned long long)s.mergeSplits[size_t(MergeSplit::area)],(unsigned long long)s.mergeSplits[size_t(MergeSplit::nonDraw)]);
+  return s;
+ };
+ auto pixels=[&](const char *label,Texture *t){Operation get{};get.texture=t;get.dst=read;b.submit({get});printf("PIXELS %s ",label);for(unsigned i=0;i<1024;++i)printf("%02x",((uint8_t *)read->contents)[i]);puts("");};
+ auto multi=draw;for(unsigned i=0;i<4;++i){multi.samples[i]=layers[i];multi.sampleCount[i]=1;}
+ auto s=run("batch",{multi},1);assert(s.imageBarriers==5);pixels("batch",target);
+ auto *mips=b.allocateTexture(80,5,16,16,3);for(unsigned l=0;l<3;++l)put(mips,71+l*31,l);auto mipDraw=draw;mipDraw.samples[0]=mips;mipDraw.sampleCount[0]=3;
+ s=run("mip-batch",{mipDraw},1);assert(s.imageBarriers==(perf?3u:4u));pixels("mip-batch",target);b.destroy(mips);
+ std::vector<Operation> ops;for(unsigned i=0;i<12;++i){auto d=draw;d.encoderID=i+1;d.load=i?1:2;d.areaWidth=i%2?8:16;d.areaHeight=d.areaWidth;d.scissor.extent={d.areaWidth,d.areaHeight};d.samples[0]=layers[i%4];ops.push_back(d);}
+ Operation copy{};copy.sourceTexture=target;copy.texture=backdrop;ops.push_back(copy);
+ auto sampled=draw;sampled.texture=blur;sampled.samples[0]=backdrop;sampled.encoderID=20;ops.push_back(sampled);
+ for(unsigned i=0;i<12;++i){auto d=draw;d.encoderID=30+i;d.load=1;d.areaWidth=i%2?8:16;d.areaHeight=d.areaWidth;d.scissor.extent={d.areaWidth,d.areaHeight};d.samples[0]=i%2?blur:layers[i%4];ops.push_back(d);}
+ s=run("ca",ops,merge && perf && cross?3:25);if(merge)assert(s.mergeSplits[size_t(MergeSplit::nonDraw)]==2);pixels("ca",target);pixels("backdrop",backdrop);pixels("sampled-blur",blur);
+ // LOAD may expand the union; a partial CLEAR/DontCare load must never expand.
+ put(target,173);auto small=draw,large=draw;small.areaWidth=8;small.areaHeight=8;small.scissor.extent={8,8};small.load=1;large.load=1;
+ run("load-expand",{small,large,small},merge && perf?1:3);pixels("load-expand",target);
+ small.load=2;run("clear-expand",{small,large},2);pixels("clear-expand",target);
+ small.load=0;run("discard-load-expand",{small,large},2); // DontCare pixels have no comparison contract.
+ // The growing rectangle must not clear the upper-right corner of its union.
+ put(target,173);small.load=2;large=small;large.areaWidth=4;large.areaHeight=16;large.scissor.extent={4,16};large.load=1;
+ run("crossed-clear",{small,large},2);pixels("crossed-clear",target);
+ for(unsigned y=0;y<16;++y)for(unsigned x=8;x<16;++x)for(unsigned q=0;q<4;++q)assert(((uint8_t *)read->contents)[(y*16+x)*4+q]==(q==3?41:173));
+ small.load=1;large=draw;large.load=1;small.store=0;s=run("partial-discard-store",{large,small},2);assert(!target->isDefined(0));
+ // A producer copy and a sample upload remain between their consumers.
+ put(target,173);small=draw;small.load=1;copy.texture=layers[1];auto consumer=small;consumer.samples[0]=layers[1];run("producer-copy",{small,copy,consumer},2);pixels("producer-copy",target);
+ Operation upload{};upload.src=bytes;upload.texture=layers[1];upload.upload=true;run("sample-upload",{small,upload,consumer},2);pixels("sample-upload",target);
+ // Recording failure restores the layouts and defined bits despite queued batches.
+ auto layout=target->layout,sourceLayout=layers[0]->layout;auto defined=target->definedLevels;b.failBeforeQueue=true;bool failed=false;
+ try{b.submit({draw,consumer});}catch(...){failed=true;}assert(failed && !b.poisoned && target->layout==layout && layers[0]->layout==sourceLayout && target->definedLevels==defined);
+ std::function<void()> first,second;b.submit({draw,consumer},{},&first);auto other=draw;other.texture=backdrop;b.submit({other},{},&second);first();second();pixels("two-flights",target);
+ b.destroy(p);b.destroy(sam);b.destroy(bytes);b.destroy(read);b.destroy(target);b.destroy(backdrop);b.destroy(blur);for(auto *t:layers)b.destroy(t);dlclose(proxy);
+ puts("PASS: boundary batches, area unions, backdrop ordering, upload hazards, rollback and two flights");
+}

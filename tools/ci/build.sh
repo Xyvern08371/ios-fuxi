@@ -239,6 +239,10 @@ metal() {
     # NativeMetal's independent adapter keeps its existing build route.
     if [[ $target == metal ]]; then python3 tools/test-fuxi-metal-frontend.py; fi
     mesa_source # Vulkan headers from the same pinned Mesa include/ tree.
+    # Optional host Vulkan controls use a supplied local ICD and glslang, no downloads.
+    if [[ $target == metal && -n ${FUXI_MTL_TEST_ICD:-} ]]; then
+        python3 tools/test-fuxi-metal-merge.py --headers "$work/mesa/include" --icd "$FUXI_MTL_TEST_ICD" --glslang "${FUXI_MTL_TEST_GLSLANG:-glslangValidator}"
+    fi
     source_checkout metal2vulkan https://github.com/steelbrain/metal2vulkan.git "$M2V_SHA" "$work/metal2vulkan"
     command -v rustup >/dev/null || die 'install rustup before building metal'
     export FUXI_M2V_CACHE=$work/metal2vulkan FUXI_M2V_BRIDGE=$work/metal2vulkan-bridge

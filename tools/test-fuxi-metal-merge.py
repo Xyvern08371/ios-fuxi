@@ -54,6 +54,25 @@ void main() {color=textureLod(image,vec2(0.5),constants.lod);}
             assert p.returncode == 0, p.stderr
             assert 'AddressSanitizer' not in p.stderr and 'runtime error:' not in p.stderr, p.stderr
             return p.stdout
+        subprocess.run(common+sanitized+definitions+[str(ROOT/'tools/fuxi-metal/GpuBarrierTests.cpp'), '-ldl', '-pthread', '-o', str(d/'barriers')], check=True)
+        def pixels(output):
+            return [line for line in output.splitlines() if line.startswith('PIXELS ') or line.startswith('PASS:')]
+        controls = 'fuxigpumerge=1 fuxigpusubmit=1 fuxigpuoverlap=1 '
+        before = invoke(d/'barriers', controls+'fuxigpuperf=3')
+        after = invoke(d/'barriers', controls+'fuxigpuperf=7')
+        assert pixels(before) == pixels(after), 'boundary optimization changed pixels'
+        for label, output in [('before (mask 3)', before), ('after (mask 7)', after)]:
+            print(label+'\n'+'\n'.join(line for line in output.splitlines() if line.startswith('COUNTS ')))
+        counts = lambda output, label: tuple(map(int, re.search(r'COUNTS '+label+r' images=(\d+) image_calls=(\d+) barriers=(\d+) passes=(\d+)', output).groups()))
+        assert counts(before, 'batch') == (5, 5, 8, 1)
+        assert counts(after, 'batch') == (5, 1, 4, 1)
+        ca_before, ca_after = counts(before, 'ca'), counts(after, 'ca')
+        assert ca_before == (29, 29, 57, 25) and ca_after == (4, 3, 9, 3)
+        assert counts(before, 'mip-batch') == (4, 4, 7, 1)
+        assert counts(after, 'mip-batch') == (3, 1, 4, 1)
+        for args in ('', 'fuxigpuperf=4', controls+'fuxigpuperf=4', controls+'fuxigpuperf=5', controls+'fuxigpuperf=6'):
+            assert pixels(invoke(d/'barriers', args)) == pixels(before), 'boundary controls differ: '+args
+        print('PASS: CA boundary A/B pixels, exact batch counts, all independent bit combinations')
         for extra in ('', 'fuxigpufeedback=1', 'fuxigpuoverlap=1 fuxigpusubmit=1', 'fuxigpuoverlap=1 fuxigpusubmit=1 fuxigpufeedback=1'):
             baseline = invoke(d/'test', extra)
             merged = invoke(d/'test', extra+' fuxigpumerge=1')
@@ -64,15 +83,15 @@ void main() {color=textureLod(image,vec2(0.5),constants.lod);}
                 print('\n'.join(skips) if skips else 'PASS: lavapipe exposes ordered attachment access; fetch clear/interleaved/mip/two-flight pixels tested')
         assert invoke(d/'test', 'fuxigpumerge=1 fuxigpusubmit=1', trace='2') == invoke(d/'test', 'fuxigpumerge=1 fuxigpusubmit=1')
         print('PASS: level-2 bounded CPU sampling preserves merged pixels')
-        # Both bits independently and together, including two flights and the
+        # All bits independently and together, including two flights and the
         # feedback path. Pixels must match the unchanged singleton baseline.
         baseline = invoke(d/'test', 'fuxigpuoverlap=1 fuxigpusubmit=1 fuxigpufeedback=1')
         assert invoke(d/'test', 'fuxigpuperf=1') == invoke(d/'test', '')
-        for mask in ('1', '2', '3'):
+        for mask in ('1', '2', '3', '4', '5', '6', '7'):
             actual = invoke(d/'test', 'fuxigpuoverlap=1 fuxigpusubmit=1 fuxigpufeedback=1 fuxigpumerge=1 fuxigpuperf='+mask)
             assert actual == baseline, 'perf mask changed pixels: '+mask
             print('PASS: perf mask '+mask+' pixels, independent Vulkan barrier/submit counts and encoder boundaries')
-        for bad in ('0', '4', '-1', '01', 'bad', '3 fuxigpuperf=1'):
+        for bad in ('0', '8', '9', '-1', '01', 'bad', '3 fuxigpuperf=1'):
             actual = invoke(d/'test', 'fuxigpumerge=1 fuxigpuperf='+bad)
             assert actual == invoke(d/'test', 'fuxigpumerge=1')
         print('PASS: perf disabled/unknown/malformed/duplicate tokens preserve recording policy')
@@ -108,7 +127,7 @@ void main() {color=textureLod(image,vec2(0.5),constants.lod);}
             print(output, end='')
             match = re.search(r'cpu_ms/frame=([\d.]+) gpu_ms/frame=([\d.]+)', output)
             results.append(tuple(float(x) for x in match.groups()))
-        for mask in ('1', '2', '3'):
+        for mask in ('1', '2', '3', '4', '5', '6', '7'):
             print(invoke(d/'bench', 'fuxigpumerge=1 fuxigpusubmit=1 fuxigpuperf='+mask, MERGE_BENCH_ENCODERS='1'), end='')
         for a_index, b_index in ((0, 1), (3, 2)):
             delta = [(results[a_index][i]-results[b_index][i])*1000/119 for i in range(2)]

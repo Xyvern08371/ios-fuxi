@@ -12,7 +12,7 @@ inline bool translationOption(const char *args,const char *key,bool *present=nul
  if(present)*present=count!=0;return count==1 && enabled;
 }
 // One decimal digit, exact token, no duplicates; unknown bits fail closed.
-// bit 0: omit read-only same-layout image barriers; bit 1: merge across encoders.
+// bit 0: omit read-only same-layout image barriers; bit 1: merge across encoders; bit 2: boundary barriers/areas.
 inline unsigned translationLevel(const char *args,const char *key,unsigned maximum) {
  unsigned count=0,value=0;size_t length=strlen(key);
  if(args)for(const char *p=args;*p;){
@@ -21,7 +21,7 @@ inline unsigned translationLevel(const char *args,const char *key,unsigned maxim
  }
  return count==1?value:0;
 }
-inline unsigned translationPerf(const char *args){return translationLevel(args,"fuxigpuperf=",3);}
+inline unsigned translationPerf(const char *args){return translationLevel(args,"fuxigpuperf=",7);}
 inline unsigned translationFrameTrace(const char *args){return translationLevel(args,"fuxigpuframetrace=",2);}
 struct TranslationPolicy {bool stages=false,trace=false,async=false,compileBoost=false,frameTrace=false,pipelined=false,skipSampling=false,allowFeedback=false,overlap=false,submitFast=false,gmem=false,merge=false;unsigned perf=0;bool frameCPU=false;};
 inline TranslationPolicy translationPolicy(const char *args) {
