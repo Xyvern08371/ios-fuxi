@@ -59,9 +59,7 @@ typedef int DTEntry;
 static uint64_t fg_faults;
 static unsigned fg_state, fg_started, fg_limit, fg_force, fg_access_failed;
 static unsigned fg_clock_measure, g_gpu_selected, clock_logs;
-static const unsigned g_gpu_freq[7]={0,220000,295000,348000,401000,475000,550000};
-#define G_GPU_LEVEL_MAX 6u
-static unsigned g_gpu_select(uint64_t n) {return n<=6 ? n : 0;}
+static uint64_t g_gpu_ddr_requested;
 static void fg_clock_log(void) {clock_logs++;}
 static int fuxi_gpu_ready(void) {return fg_state==1;}
 static unsigned g_bank, g3_bank, g3_asid, g3_next, gpu_stage;
@@ -155,10 +153,12 @@ static void thread_call_setup_with_options(thread_call_data_t *c,void (*f)(void 
 static int thread_call_enter_delayed(thread_call_data_t *c,uint64_t d)
 { assert(c->func && d==123); enqueued++;return 0; }
 static unsigned enable_arg=1;
-static uint64_t level_arg;
+static uint64_t level_arg, ddr_arg;
+static unsigned level_present=1, ddr_present, ddr_parses;
 static int PE_parse_boot_argn(const char *name,void *p,size_t n)
 {
- if(!strcmp(name,"fuxigpulevel")) {assert(n==8);memcpy(p,&level_arg,n);return 1;}
+ if(!strcmp(name,"fuxigpulevel")) {assert(n==8);if(level_present)memcpy(p,&level_arg,n);return level_present;}
+ if(!strcmp(name,"fuxigpuddr")) {assert(n==8);ddr_parses++;if(ddr_present)memcpy(p,&ddr_arg,n);return ddr_present;}
  assert(n==4); if(!strcmp(name,"fuxigpu")) memcpy(p,&enable_arg,n); return 0;
 }
 '''
@@ -176,9 +176,11 @@ static void reset(void)
  fg_limit=17; enable_arg=1; gPhysSize=FG_RAM_SIZE;
  valid_handoff=abi_inits=abi_publishes=abi_fail=fg_abi_enabled=0;
  level_arg=clock_logs=g_gpu_selected=fg_clock_measure=0;
+ ddr_arg=g_gpu_ddr_requested=ddr_present=ddr_parses=0;level_present=1;last_log[0]=0;
 }
 int main(void)
 {
+ (void)g_gpu_bw_packet;(void)g_gpu_bw_index;(void)g_gpu_level;
  uint64_t total=0;
  for(unsigned i=0;i<COUNT;i++) total+=fg_windows[i].size;
  assert(total==0x218c000); /* Existing windows + optional DPU and DSI0 windows. */
@@ -225,20 +227,39 @@ int main(void)
  assert(fg_map_window(&bad)==KERN_INVALID_ARGUMENT && !alloc_calls);
  bad=(struct fg_window){UINT64_MAX-PAGE_MASK,PAGE_SIZE,0};
  assert(fg_map_window(&bad)==KERN_INVALID_ARGUMENT && !alloc_calls);
- reset(); enable_arg=0; fuxi_gpu_start(G4_FB_PA,1080,2400,4320); assert(!enqueued);
+ reset(); enable_arg=0; fuxi_gpu_start(G4_FB_PA,1080,2400,4320); assert(!enqueued && !ddr_parses);
  reset(); fuxi_gpu_start(G4_FB_PA,1080,2400,4320);
  assert(enqueued==1 && !alloc_calls && !gpu_calls);
  fuxi_gpu_start(G4_FB_PA,1080,2400,4320); assert(enqueued==1);
- const uint64_t levels[]={1,2,6,7,UINT64_MAX,0x100000001ULL};
+ const uint64_t levels[]={0,1,2,6,7,8,9,UINT64_MAX,0x100000001ULL};
  for(unsigned i=0;i<sizeof(levels)/sizeof(levels[0]);i++) {
   reset();level_arg=levels[i];fuxi_gpu_start(G4_FB_PA,1080,2400,4320);
-  assert(g_gpu_selected==(level_arg<=6?level_arg:0) && enqueued==1);
+  assert(g_gpu_selected==(level_arg<=8?level_arg:0) && enqueued==1);
+  if(level_arg>8)assert(strstr(last_log,"rejected fuxigpulevel=") && strstr(last_log,"allowed 0..8"));
  }
+ // Absent and explicit zero DDR preserve all preexisting levels; overrides
+ // parse at full width, reject index 9/negative/wide and respect bus-max.
+ const uint64_t ddrs[]={0,0,1,2,3,4,5,6,7,8,9,UINT64_MAX,0x100000001ULL};
+ const unsigned maxima[]={0,0,3,3,4,5,7,7,8};
+ const uint32_t defaults[]={6074218,6074218,6074218,6074218,6074218,6074218,6074218,10687500,12449218};
+ for(unsigned level=0;level<=8;level++)
+ for(unsigned i=0;i<sizeof(ddrs)/sizeof(ddrs[0]);i++) {
+  reset();level_arg=level;ddr_arg=ddrs[i];ddr_present=i!=0;
+  fuxi_gpu_start(G4_FB_PA,1080,2400,4320);
+  assert(g_gpu_selected==level && g_gpu_ddr_requested==ddr_arg && ddr_parses==1);
+  unsigned expected=level<2 || ddr_arg>8?0:ddr_arg>maxima[level]?maxima[level]:ddr_arg;
+  assert(g_gpu_ddr_clamp(level,g_gpu_ddr_requested)==expected);
+  if(!expected)assert(g_gpu_ddr_row2(level,g_gpu_ddr_requested)==defaults[level]);
+  if(ddr_arg>8)assert(strstr(last_log,"rejected fuxigpuddr=") && strstr(last_log,"allowed 0..8"));
+ }
+ reset();level_present=0;ddr_present=1;ddr_arg=8;
+ fuxi_gpu_start(G4_FB_PA,1080,2400,4320);
+ assert(!g_gpu_selected && !g_gpu_ddr_clamp(g_gpu_selected,g_gpu_ddr_requested));
  reset(); fuxi_gpu_start(G4_FB_PA,1080,2400,1); assert(fg_state==2 && !enqueued);
  /* The combined ready line must identify the selected request as a vote,
   * including legacy zero and every bounded GPU-CLOCK selection. */
- const unsigned ready_khz[]={220000,220000,295000,348000,401000,475000,550000};
- for(unsigned level=0;level<7;level++) {
+ const unsigned ready_khz[]={220000,220000,295000,348000,401000,475000,550000,615000,680000};
+ for(unsigned level=0;level<9;level++) {
   reset();valid_handoff=1;level_arg=level;
   fuxi_gpu_start(G4_FB_PA,1080,2400,4320);fg_thread(NULL,NULL);
   char expected[96];
@@ -277,9 +298,10 @@ def main():
     functions += 'static thread_call_data_t fg_init_call;\n#define G_PTR(pa) fg_pointer(pa)\n#define G_PTR_RANGE(pa, bytes) fg_pointer_range(pa, bytes)\n'
     functions += ''.join(submit.function(adapter, n) for n in ('fg_thread', 'fuxi_gpu_start'))
     handoff = (ROOT / 'shim/fuxi-probe/gpu-handoff.h').read_text()
+    clock = (ROOT / 'shim/fuxi-probe/gpu-clock.h').read_text()
     with tempfile.TemporaryDirectory() as d:
         path = Path(d) / 'mapping.c'
-        path.write_text('#include <stdint.h>\n' + handoff + PREFIX + declarations + functions + MODEL)
+        path.write_text('#include <stdint.h>\n' + handoff + clock + PREFIX + declarations + functions + MODEL)
         exe = Path(d) / 'mapping'
         subprocess.run(['clang', '-std=gnu11', '-O1', '-g', '-Wall', '-Wextra', '-Werror',
                         '-fsanitize=address,undefined', str(path), '-o', str(exe)], check=True)

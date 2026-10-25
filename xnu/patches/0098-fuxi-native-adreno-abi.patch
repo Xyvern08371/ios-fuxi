@@ -16,7 +16,7 @@
  osfmk/vm/vm_fourk_pager.c	 standard
 --- a/bsd/dev/gpu.c
 +++ b/bsd/dev/gpu.c
-@@ -22,10 +22,15 @@
+@@ -22,10 +22,16 @@
  #ifndef G_PTR
  #define G_PTR(pa) ((uintptr_t)(pa))
  #endif
@@ -30,10 +30,11 @@
 +#include "gpu-clock.h"
 +/* XNU sets this once before cold start. Loader probes retain zero. */
 +static unsigned g_gpu_selected;
++static uint64_t g_gpu_ddr_requested;
  /* ---- Fuxi-verified physical bases (research/device/probe-09/live.dtb) ---- */
  #define GPU_GCC_BASE      0x00100000ULL   /* gcc kalama-v2 @100000 (clock-controller) */
  #define GPU_GCC_GPU_PAGE  (GPU_GCC_BASE + 0x71000) /* gcc-kalama: gpu branch page */
-@@ -117,7 +122,7 @@
+@@ -117,7 +123,7 @@
   #ifdef FUXI_GPU_XNU
   uint32_t f, v = probe_safe_rd32(base + off, &f);
  #else
@@ -42,7 +43,7 @@
  #endif
   __asm__ volatile("dmb oshld" ::: "memory");
   return v;
-@@ -128,7 +133,7 @@
+@@ -128,7 +134,7 @@
   #ifdef FUXI_GPU_XNU
   (void)probe_safe_wr32(base + off, v);
  #else
@@ -51,7 +52,7 @@
  #endif
   __asm__ volatile("dsb osh" ::: "memory");
  }
-@@ -214,13 +219,13 @@
+@@ -214,13 +220,13 @@
   #ifdef FUXI_GPU_XNU
   fg_store64(at, val);
  #else
@@ -67,7 +68,7 @@
   for (unsigned i = 0; i < bytes / 8; i++) p[i] = 0;
   __asm__ volatile("dsb sy" ::: "memory");
  }
-@@ -306,13 +311,13 @@
+@@ -306,13 +312,13 @@
  {
   for (unsigned off = 0; off < size; off += 4096) {
    unsigned v = va + off;
@@ -84,7 +85,7 @@
    unsigned c = (v >> 12) & 511;
    if (l3[c]) return 0;
    l3[c] = (pa + off) | 3 | (3u << 8) | (1u << 10) | attr;
-@@ -525,6 +530,38 @@
+@@ -525,6 +531,38 @@
   }
   *vote = (uint32_t)cdb16(p+pi*2)<<16 | si<<8 | pi;
   return 1;
@@ -119,11 +120,11 @@
 +   }
 +  }
 + }
-+ return g_gpu_bw_packet(bcm, address[3], bw);
++ return g_gpu_bw_packet(bcm, address[3], g_gpu_ddr_row2(g_gpu_selected, g_gpu_ddr_requested), bw);
  }
  /* e[40..59]: five command/ACK records {sent, response, returned, error}.
   * Poll shared queue indices as well as interrupt status; reject malformed or
-@@ -591,8 +628,6 @@
+@@ -591,8 +629,6 @@
   for (unsigned i = 0; i < 59; i++) ((volatile uint32_t *)perf)[i] = 0;
   for (unsigned i = 0; i < 160; i++) ((volatile uint32_t *)bw)[i] = 0;
   /* Ascending Linux frequency indices, including OFF at index 0. kHz. */
@@ -132,7 +133,7 @@
   static const uint32_t cfreq[3] = {0,200000,500000};
   static const unsigned clevel[3] = {0,0x40,0x80};
   static const char gfx[8] = "gfx.lvl", mx[8] = "mx.lvl", cx[8] = "cx.lvl", gmxc[8] = "gmxc.lvl";
-@@ -600,8 +635,8 @@
+@@ -600,8 +636,8 @@
   const char *secondary = g_aux(gmxc, &unused) ? gmxc : mx;
   perf[1] = 10; perf[2] = 3;
   for (unsigned i = 0; i < 10; i++) {
@@ -143,7 +144,7 @@
   }
   for (unsigned i = 0; i < 3; i++) {
    if (!g_arc_vote(cx, mx, clevel[i], &perf[51+i*2])) { e[3] = 0x908; return 0; }
-@@ -615,6 +650,8 @@
+@@ -615,6 +651,8 @@
    if (!bw[24+i]) { e[3] = 0x908; return 0; }
   }
   if (!bw[6]) { e[3] = 0x908; return 0; }
@@ -152,7 +153,7 @@
   if (gm_rd(0x5000) != 1 || g_rd(GPU_RSCC_BASE, 0x101*4) || (gm_rd(0x5180)&1)) { e[3] = 0x909; return 0; }
   g_hfi_init(); g_rpmh_init();
   gm_wr(0x9304, 0xffffffff); gm_wr(0x9306, 0xffffffff);
-@@ -648,7 +685,7 @@
+@@ -648,7 +686,7 @@
  {
   uint32_t *e = gpu_extra[0];
   if (g_rd(GPU_SMMU_BASE, g_cb(g_bank) + 0x58) & 0xc00001feu) { e[60] = 0xa04; return; }
@@ -161,7 +162,7 @@
   int err = g_hfi_send(30, vote, 4, 4);
   if (err) { e[60] = err; return; }
   gm_wr(0x5191, 1u<<31); gm_wr(0x5194, 1u<<30);
-@@ -672,10 +709,16 @@
+@@ -672,10 +710,16 @@
  #define G3_RING_PA  (G_MEM + 0x1320000)
  #define G3_PTR_PA   (G_MEM + 0x1328000)
  #define G3_FENCE_PA (G_MEM + 0x1329000)
@@ -181,7 +182,7 @@
  #define G3_MAGIC    0xa740f00du
  #define G3_GUARD    0x5ac3e17bu
  #define G3_FSR_MASK 0xc00001feu /* SMMUv2 defined faults; keep reserved bit10 in report */
-@@ -848,7 +891,7 @@
+@@ -848,7 +892,7 @@
  #ifdef FUXI_GPU_XNU
   /* Uncached scratch, serialized once at the doorbell. Avoid an MMIO
    * recovery call and three barriers for every command dword. */
@@ -190,7 +191,7 @@
  #else
   g_wr(G3_RING_PA, G_RING_INDEX(g3_wptr++) * 4, word);
  #endif
-@@ -1527,8 +1570,8 @@
+@@ -1527,8 +1571,8 @@
     * Baseline is probe.c's volatile byte memcpy, MMU/caches off. */
    d[3] = 7; start = g4_counter();
    for (unsigned y = 0; y < height; y++)
@@ -275,7 +276,7 @@
   if (!va || (pa & (wide ? 7 : 3))) return fg_access_failed = 1;
   unsigned bad = fuxi_gpu_access(va, v, wr, wide);
   if (bad) {
-@@ -135,17 +157,107 @@
+@@ -135,17 +157,109 @@
  }
  static const uint8_t *fg_firmware(unsigned which, unsigned *size)
  {
@@ -359,8 +360,10 @@
 +static void fg_clock_log(void)
 +{
 + unsigned index = g_gpu_selected ? g_gpu_selected : 1, bw = g_gpu_bw_index(g_gpu_selected);
-+ printf("FUXI GPU CLOCK: level=%u gpu_index=%u requested_khz=%u gx_arc=%#x bw_index=%u ddr_kBps=%u hfi_ack=1\n",
-+     g_gpu_selected,index,g_gpu_freq[index],gpu_extra[0][100+index],bw,g_gpu_ddr[bw]);
++ printf("FUXI GPU CLOCK: level=%u gpu_index=%u requested_khz=%u gx_arc=%#x bw_index=%u ddr_kBps=%u ddr_requested=%llu ddr_clamped=%u hfi_ack=1\n",
++     g_gpu_selected,index,g_gpu_freq[index],gpu_extra[0][100+index],bw,
++     bw == 2 ? g_gpu_ddr_row2(g_gpu_selected,g_gpu_ddr_requested) : g_gpu_ddr[bw],
++     g_gpu_ddr_requested,g_gpu_ddr_clamp(g_gpu_selected,g_gpu_ddr_requested));
 + printf("FUXI GPU CLOCK: GMU table_khz=0/200000/500000 cx_arc=%#x/%#x/%#x (no host GMU perf-index vote)\n",
 +     gpu_extra[0][110],gpu_extra[0][111],gpu_extra[0][112]);
 + static const uint32_t offsets[] = {CC_PLL0+PLL_MODE,CC_PLL0+PLL_L_VAL,CC_PLL0+0x14,
@@ -387,7 +390,7 @@
  /* Retain BOTH physical attempts, independently of the shared logical-call
   * report slot. Static storage only; no allocation or firmware in diagnostics. */
  static volatile struct {
-@@ -200,10 +312,14 @@
+@@ -200,10 +314,14 @@
  static ppnum_t fg_ppns[FG_SOURCE_BYTES/PAGE_SIZE+1];
  static volatile uint64_t *fg_l2(void)
  {
@@ -404,7 +407,7 @@
  static unsigned fg_started, fg_limit, fg_force, fg_seq;
  int fuxi_gpu_ready(void) { return __atomic_load_n(&fg_state, __ATOMIC_ACQUIRE) == 1; }
  static uint64_t fg_deadline, fg_submit_time;
-@@ -211,6 +327,7 @@
+@@ -211,6 +329,7 @@
  static int fg_expired(void) { return rsr("cntpct_el0") >= fg_deadline; }
  static void fg_fail(const char *reason, unsigned code)
  {
@@ -412,7 +415,7 @@
   __atomic_store_n(&fg_state, 2, __ATOMIC_RELEASE);
   printf("FUXI GPU: disabled permanently: %s (%#x), CPU present\n", reason, code);
  }
-@@ -237,7 +354,11 @@
+@@ -237,7 +356,11 @@
     if (fg_access(GPU_REG_BASE + 0x3c45*4, &v, 1, 0)) good = 0;
    }
   }
@@ -425,7 +428,7 @@
   delay(100);
   for (unsigned i = 0; i < 2; i++) {
    v = 2u << 16; (void)fg_access(GPU_SMMU_BASE + SMMU_S2CR(g3_slot[i]), &v, 1, 0);
-@@ -265,6 +386,7 @@
+@@ -265,6 +388,7 @@
   * new generation. No PFN scan or TLB invalidation on a cache hit. */
  int fuxi_gpu_unmap(unsigned slot, struct fg_times *t)
  {
@@ -433,7 +436,7 @@
   if (slot >= FG_CACHE_SLOTS || fg_busy) return 0;
   uint64_t start = mach_absolute_time();
   volatile uint64_t *l2 = fg_l2();
-@@ -285,10 +407,11 @@
+@@ -285,10 +409,11 @@
  int fuxi_gpu_map(unsigned slot, uint64_t generation, uintptr_t source,
      uint64_t length, struct fg_times *t)
  {
@@ -446,7 +449,7 @@
   volatile uint64_t *l2 = fg_l2();
   unsigned first = ((FG_SOURCE_VA >> 21) & 511) + slot*FG_SOURCE_L3;
   unsigned pages = (length+(source&4095)+4095)/4096;
-@@ -341,12 +464,15 @@
+@@ -341,12 +466,15 @@
   t->misses++;
   return 1;
  }
@@ -463,7 +466,7 @@
   if (SecureDTLookupEntry(NULL, "/chosen", &chosen) != kSuccess ||
       SecureDTGetProperty(chosen, "fuxi-gpu-memory", &prop, &bytes) != kSuccess ||
       bytes != 16 || ((uint64_t *)prop)[0] != FG_SCRATCH || ((uint64_t *)prop)[1] != FG_SCRATCH_SIZE) {
-@@ -359,7 +485,7 @@
+@@ -359,7 +487,7 @@
   }
   kern_return_t kr = fg_map_windows();
   if (kr != KERN_SUCCESS) { fg_fail("uncached mapping failed", kr); goto out; }
@@ -472,7 +475,7 @@
   if (h->magic != FG_MAGIC || h->version != 1 || h->bytes != sizeof(*h) || h->reserved ||
       h->base != FG_SCRATCH || h->size != FG_SCRATCH_SIZE) {
    fg_fail("missing/invalid cold firmware handoff", 3); goto out;
-@@ -367,7 +493,7 @@
+@@ -367,7 +495,7 @@
   for (unsigned i = 0; i < 3; i++) {
    unsigned n = h->fw_size[i];
    if (!n || n > FG_FW_SLOT || (n & 3) ||
@@ -481,7 +484,7 @@
     fg_fail("firmware size/checksum", i); goto out;
    }
   }
-@@ -385,6 +511,7 @@
+@@ -385,6 +513,7 @@
       "fence=%#x TRUST=%#x zap=%#x pixels=%#x\n", fg_limit == 13 ? 13 : 16,
       g_bank, g3_bank, g3_asid, g3_read(G3_FENCE_PA), g3_gr(0xf400),
       gpu_extra[13][2], gpu_extra[11][2]);
@@ -489,7 +492,7 @@
   if (fg_limit < 17 || fg_force == 1) { fg_fail("diagnostic stop after self-test", fg_limit); goto out; }
   if (g3_read(0xae05014) != G4_FB_PA || g3_read(0xae05024) != 4320 ||
       g3_read(0xae05000) != (2400u<<16 | 1080u) || g3_read(0xae05030) != 0x237ff ||
-@@ -392,8 +519,14 @@
+@@ -392,8 +521,14 @@
       !fg_source_tables()) { fg_fail("scanout geometry/mapping", 4); goto out; }
   uint32_t tlb[128] = {0};
   if (g4_tlb(tlb) || fg_access_failed) { fg_fail("initial TLB sync", 5); goto out; }
@@ -505,7 +508,7 @@
   out: return;
  }
  void fuxi_gpu_start(uint64_t fb, unsigned width, unsigned height, unsigned pitch)
-@@ -402,6 +535,19 @@
+@@ -402,6 +537,22 @@
   (void)PE_parse_boot_argn("fuxigpu", &enable, sizeof(enable));
   if (enable != 1 || fg_started) return;
   fg_started = 1; fg_limit = 17;
@@ -514,6 +517,9 @@
 + g_gpu_selected = g_gpu_select(requested_level);
 + if (requested_level > G_GPU_LEVEL_MAX)
 +  printf("FUXI GPU CLOCK: rejected fuxigpulevel=%llu (allowed 0..%u); legacy level=0\n", requested_level, G_GPU_LEVEL_MAX);
++ (void)PE_parse_boot_argn("fuxigpuddr", &g_gpu_ddr_requested, sizeof(g_gpu_ddr_requested));
++ if (g_gpu_ddr_requested > G_GPU_DDR_MAX)
++  printf("FUXI GPU CLOCK: rejected fuxigpuddr=%llu (allowed 0..%u); level bandwidth default\n", g_gpu_ddr_requested, G_GPU_DDR_MAX);
 + (void)PE_parse_boot_argn("fuxigpuclock", &fg_clock_measure, sizeof(fg_clock_measure));
 + fg_clock_measure = fg_clock_measure == 1;
 + (void)PE_parse_boot_argn("fuxigpuabi", &fg_abi_enabled, sizeof(fg_abi_enabled));
@@ -525,7 +531,7 @@
   (void)PE_parse_boot_argn("fuxigpu_stage", &fg_limit, sizeof(fg_limit));
   (void)PE_parse_boot_argn("fuxigpu_fail", &fg_force, sizeof(fg_force));
   if ((fg_limit != 13 && fg_limit != 16 && fg_limit != 17) ||
-@@ -455,12 +601,20 @@
+@@ -455,12 +606,20 @@
   * A completed fence wins over a late timer/deadline. */
  int fuxi_gpu_poll(struct fg_times *t)
  {
@@ -547,7 +553,7 @@
    return 1;
   }
   if (!err && !fg_expired()) return 0;
-@@ -468,6 +622,7 @@
+@@ -468,6 +627,7 @@
   /* Only fault containment has bounded register polling; no scheduler wait. */
   int drained = fg_isolate();
   fg_busy = 0;
@@ -555,7 +561,7 @@
   t->wait += mach_absolute_time()-fg_submit_time;
   return drained ? -1 : -2;
  }
-@@ -475,7 +630,9 @@
+@@ -475,7 +635,9 @@
      unsigned pitch, unsigned sx, unsigned sy, unsigned dx, unsigned dy,
      unsigned width, unsigned height, struct fg_times *t)
  {
@@ -566,7 +572,7 @@
   if (!width || !height || width > 1080 || height > 2400 || dx > 1080-width || dy > 2400-height ||
       (source & 3) || (pitch & 3) || pitch > 131008 || ((uint64_t)sx+width)*4 > pitch ||
       length+(source&4095) > FG_SOURCE_BYTES ||
-@@ -485,7 +642,13 @@
+@@ -485,7 +647,13 @@
   t->clean += mach_absolute_time()-start;
   start = mach_absolute_time();
   int err = 0;
@@ -581,7 +587,7 @@
   unsigned stride = 2;
   while ((pitch*stride) & 63) stride *= 2;
   /* XML has 15-bit dimensions; coordinates here are <2416 and strided pitch
-@@ -505,11 +668,19 @@
+@@ -505,11 +673,19 @@
   t->submit += mach_absolute_time()-start;
   if (err || fg_access_failed) {
    fg_fail("present submit", err);
@@ -647,7 +653,7 @@
      uint64_t length, struct fg_times *t);
 --- a/bsd/dev/gpu-clock.h
 +++ b/bsd/dev/gpu-clock.h
-@@ -0,0 +1,63 @@
+@@ -0,0 +1,85 @@
 +/* SPDX-License-Identifier: BSD-2-Clause-Patent
 + * Ported from UniXNU kits/AdrenoFirmware/AdrenoHfiVotes.c
 + * (BSD-2-Clause-Patent). See LICENSE.AdrenoFirmware.
@@ -657,13 +663,16 @@
 + */
 +#ifndef FUXI_GPU_CLOCK_H
 +#define FUXI_GPU_CLOCK_H
-+#define G_GPU_LEVEL_MAX 6u /* 550 MHz; common to both Fuxi DT power bins */
++#define G_GPU_LEVEL_MAX 8u /* 680 MHz; 719 MHz is SKU-specific */
++#define G_GPU_DDR_MAX 8u /* DT index 9 reaches ACV performance mode */
 +static const uint32_t g_gpu_freq[10] = {0,220000,295000,348000,401000,475000,550000,615000,680000,719000};
 +static const unsigned g_gpu_level[10] = {0,0x34,0x38,0x3c,0x40,0x50,0x80,0x90,0xc0,0xe0};
-+/* DT bus-table-ddr (kB/s), bus-freq 1 at 220 and 3 at 295..550 MHz.
-+ * Bounded profile never reaches the ACV performance-mode threshold.
-+ * 0 preserves legacy GPU index1 / DDR off; 1 repairs only its DDR vote. */
++/* Legacy HFI rows, distinct from DT bus-table-ddr indices. */
 +static const uint32_t g_gpu_ddr[3] = {0,2136718,6074218};
++/* Fuxi DT facts, shared by both bins through 680 MHz. Exclude DDR index 9
++ * (16500000 kB/s): ACV stays valid-only, below performance-mode threshold. */
++static const uint32_t g_gpu_ddr_dt[9] = {0,2136718,3000000,6074218,6671875,8171875,10687500,12449218,14398437};
++static const unsigned g_gpu_bus_max[9] = {0,3,3,3,4,5,7,7,9};
 +static unsigned g_gpu_select(uint64_t requested)
 +{
 + return requested <= G_GPU_LEVEL_MAX ? requested : 0;
@@ -672,11 +681,26 @@
 +{
 + return selected ? (selected == 1 ? 1 : 2) : 0;
 +}
++/* Zero means no effective override, including for legacy/220 MHz policy.
++ * Keep wide invalid inputs from wrapping into an accepted DT index. */
++static unsigned g_gpu_ddr_clamp(unsigned selected, uint64_t requested)
++{
++ if (selected < 2 || selected > G_GPU_LEVEL_MAX || requested > G_GPU_DDR_MAX) return 0;
++ return requested > g_gpu_bus_max[selected] ? g_gpu_bus_max[selected] : requested;
++}
++static uint32_t g_gpu_ddr_row2(unsigned selected, uint64_t requested)
++{
++ unsigned index = g_gpu_ddr_clamp(selected, requested);
++ /* Preserve every old row for levels 0..6. Newly selectable 615/680 MHz
++  * need their DT bus-freq 6/7 floors, rather than the old DT index 3. */
++ if (!index) index = selected == 7 ? 6 : selected == 8 ? 7 : 3;
++ return g_gpu_ddr_dt[index];
++}
 +struct g_bcm { uint32_t address, unit; unsigned width, vcd; };
 +/* Caller supplies exactly SH0, MC0, ACV, in that order, plus actual CN0.
 + * Do all validation before touching output. ACV is fixed valid-only here;
 + * proportional SH0/MC0 bus widths on SM8550 are 16/4 bytes. */
-+static int g_gpu_bw_packet(const struct g_bcm b[3], uint32_t cn0, uint32_t out[160])
++static int g_gpu_bw_packet(const struct g_bcm b[3], uint32_t cn0, uint32_t row2_kbps, uint32_t out[160])
 +{
 + if (!cn0 || (cn0 & 3) || ((cn0>>16)&7) != 5) return 0;
 + for (unsigned j = 0; j < 3; j++) {
@@ -696,11 +720,15 @@
 +  if (commit) out[5] |= 1u<<j;
 +  for (unsigned i = 0; i < 3; i++) {
 +   uint32_t data = commit ? 0x40000000 : 0;
-+   if (g_gpu_ddr[i]) {
++   uint32_t kbps = i == 2 ? row2_kbps : g_gpu_ddr[i];
++   if (kbps) {
 +    data |= 0x20000000;
 +    if (j < 2) {
-+     uint64_t peak = (uint64_t)g_gpu_ddr[i]*b[j].width/(j ? 4 : 16);
++     uint64_t peak = (uint64_t)kbps*b[j].width/(j ? 4 : 16);
 +     peak = peak*1000/b[j].unit;
++     /* With matching aux widths 16/4, the largest allowed DDR rate fits
++      * when unit >= 878811 (integer floor). Smaller boot DB units saturate:
++      * cap each field without spilling into valid/commit bits. */
 +     uint32_t vote = peak > 0x3fff ? 0x3fff : peak ? (uint32_t)peak : 1;
 +     data |= vote<<14 | vote;
 +    }

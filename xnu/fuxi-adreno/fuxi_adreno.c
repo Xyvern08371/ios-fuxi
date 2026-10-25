@@ -233,8 +233,10 @@ static void fg_clock_sample(void)
 static void fg_clock_log(void)
 {
  unsigned index = g_gpu_selected ? g_gpu_selected : 1, bw = g_gpu_bw_index(g_gpu_selected);
- printf("FUXI GPU CLOCK: level=%u gpu_index=%u requested_khz=%u gx_arc=%#x bw_index=%u ddr_kBps=%u hfi_ack=1\n",
-     g_gpu_selected,index,g_gpu_freq[index],gpu_extra[0][100+index],bw,g_gpu_ddr[bw]);
+ printf("FUXI GPU CLOCK: level=%u gpu_index=%u requested_khz=%u gx_arc=%#x bw_index=%u ddr_kBps=%u ddr_requested=%llu ddr_clamped=%u hfi_ack=1\n",
+     g_gpu_selected,index,g_gpu_freq[index],gpu_extra[0][100+index],bw,
+     bw == 2 ? g_gpu_ddr_row2(g_gpu_selected,g_gpu_ddr_requested) : g_gpu_ddr[bw],
+     g_gpu_ddr_requested,g_gpu_ddr_clamp(g_gpu_selected,g_gpu_ddr_requested));
  printf("FUXI GPU CLOCK: GMU table_khz=0/200000/500000 cx_arc=%#x/%#x/%#x (no host GMU perf-index vote)\n",
      gpu_extra[0][110],gpu_extra[0][111],gpu_extra[0][112]);
  static const uint32_t offsets[] = {CC_PLL0+PLL_MODE,CC_PLL0+PLL_L_VAL,CC_PLL0+0x14,
@@ -540,6 +542,9 @@ void fuxi_gpu_start(uint64_t fb, unsigned width, unsigned height, unsigned pitch
  g_gpu_selected = g_gpu_select(requested_level);
  if (requested_level > G_GPU_LEVEL_MAX)
   printf("FUXI GPU CLOCK: rejected fuxigpulevel=%llu (allowed 0..%u); legacy level=0\n", requested_level, G_GPU_LEVEL_MAX);
+ (void)PE_parse_boot_argn("fuxigpuddr", &g_gpu_ddr_requested, sizeof(g_gpu_ddr_requested));
+ if (g_gpu_ddr_requested > G_GPU_DDR_MAX)
+  printf("FUXI GPU CLOCK: rejected fuxigpuddr=%llu (allowed 0..%u); level bandwidth default\n", g_gpu_ddr_requested, G_GPU_DDR_MAX);
  (void)PE_parse_boot_argn("fuxigpuclock", &fg_clock_measure, sizeof(fg_clock_measure));
  fg_clock_measure = fg_clock_measure == 1;
  (void)PE_parse_boot_argn("fuxigpuabi", &fg_abi_enabled, sizeof(fg_abi_enabled));
