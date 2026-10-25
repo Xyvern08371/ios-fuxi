@@ -1061,3 +1061,16 @@ changes were used. Compare identical warm interactions with overlap and submit
 reuse individually, then together, preserving all other boot settings. Inspect
 depth/latency and failures with trace on, then repeat with trace off; a two-deep
 queue can improve throughput while increasing input-to-display latency.
+
+## GMEM trial (`fuxigpugmem=1`)
+
+OBSERVED (scripted gestures, `fuxigpuoverlap=1 fuxigpusubmit=1`): two frames
+stay in flight, and blur frames take 17/28/32 ms end to end (median/p90/max of
+~300-frame windows; gpu_exec ~10 ms median). CoreAnimation presents at ~26-30 Hz,
+which is about every other 60 Hz vsync. GUESS: per-frame latency, not
+throughput, keeps CA at half rate, and Turnip's sysmem rendering makes the
+bandwidth-heavy blur passes slow.
+
+`fuxigpugmem=1` sets the default `TU_DEBUG=nocb` (tiled GMEM rendering) instead of
+`sysmem,nocb`. An explicit TU_DEBUG environment value still wins. UniXNU saw
+GMEM hangs on A740, so this is a diagnostic opt-in only.
