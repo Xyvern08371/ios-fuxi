@@ -81,7 +81,7 @@ public:
   if(!b || usage!=1 || !limits.linearRows(width,height,pixel,row,offset,b->length))throw std::runtime_error("linear texture descriptor/extent/stride");
   return allocateTexture(format,usage,width,height);
  }
- Sampler *allocateSampler(bool,bool,uint32_t=0,float=0,float=0,const uint32_t * =nullptr,uint32_t=0) {return new Sampler{};}
+ Sampler *allocateSampler(bool,bool,uint32_t=0,float=0,float=0,const uint32_t * =nullptr,uint32_t=0,uint32_t=1) {return new Sampler{};}
  void destroy(Sampler *s) {delete s;}
  Texture *allocateTexture(uint32_t format=80,uint32_t usage=5,uint32_t width=256,uint32_t height=256,uint32_t levels=1,uint32_t type=2) {
   if(!modelTextures)throw std::runtime_error("M4 CPU model has no rendering");

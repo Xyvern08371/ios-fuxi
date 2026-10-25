@@ -62,7 +62,8 @@ int main() {@autoreleasepool {
   [function release];[library release];
  }
  MTLSamplerDescriptor *sd=[MTLSamplerDescriptor new];id<MTLSamplerState>sampler=[device newSamplerStateWithDescriptor:sd];
- assert(sampler && sampler.device==device);checkLabel((id)sampler);[sampler release];sd.maxAnisotropy=2;
+ assert(sampler && sampler.device==device);checkLabel((id)sampler);[sampler release];sd.maxAnisotropy=8;
+ sampler=[device newSamplerStateWithDescriptor:sd];assert(sampler);[sampler release];sd.maxAnisotropy=17;
  assert(![device newSamplerStateWithDescriptor:sd]);[sd release];
  FuxiTexture *t=[FuxiTexture new];t->_device=[device retain];t->_texture=new fuxi::Texture{};t->_texture->allocated=262144;t->_usage=MTLTextureUsageRenderTarget;
  FuxiPipeline *p=[FuxiPipeline new];p->_device=[device retain];p->_pipeline=new fuxi::Pipeline{};

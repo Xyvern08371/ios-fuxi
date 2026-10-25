@@ -115,7 +115,7 @@ class Backend {
  }
  void *library{};
  VkInstance instance{}; VkPhysicalDevice physical{}; VkDevice device{}; VkQueue queue{};
- bool independentBlend=false;uint32_t maxColorAttachments=1;
+ bool independentBlend=false;uint32_t maxColorAttachments=1;float maxAnisotropy=1;
  PipelineCache pipelineCache;
  ArtifactCache artifactCache;CacheMode cacheMode=systemCacheMode();
  Translator::CacheScope artifactCallbacks{};Translator::CacheScopeVerified artifactCallbacksVerified{};
@@ -277,7 +277,9 @@ public:
     if(orderedColorAccess){enabledExtensions.push_back(VK_EXT_RASTERIZATION_ORDER_ATTACHMENT_ACCESS_EXTENSION_NAME);di.pNext=&order;}
    }
    VkPhysicalDeviceFeatures2 core{};core.sType=VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;GetPhysicalDeviceFeatures2(physical,&core);
-   VkPhysicalDeviceFeatures enables{};enables.independentBlend=core.features.independentBlend;di.pEnabledFeatures=&enables;
+   VkPhysicalDeviceFeatures enables{};enables.independentBlend=core.features.independentBlend;enables.samplerAnisotropy=core.features.samplerAnisotropy;di.pEnabledFeatures=&enables;
+   // Without the feature an anisotropic Metal sampler degrades to plain filtering.
+   maxAnisotropy=enables.samplerAnisotropy?std::max(1.f,props.limits.maxSamplerAnisotropy):1;
    independentBlend=enables.independentBlend;maxColorAttachments=std::min(8u,props.limits.maxColorAttachments);
    fprintf(stderr,"FUXI MTL: ordered framebuffer fetch %s (input attachments)\n",orderedColorAccess?"enabled":"unavailable");
    if(hostImport) {
@@ -456,7 +458,7 @@ public:
  void destroy(Sampler *s) {std::lock_guard<std::mutex> guard(mutex);destroySamplerUnlocked(s);}
  // address: Metal MTLSamplerAddressMode per axis (0 clamp-to-edge, 2 repeat, 3 mirror repeat, 4 clamp-to-zero,
  // 5 clamp-to-border with border 0/1/2 = transparent black/opaque black/opaque white). Mirror clamp-to-edge (1) is refused.
- Sampler *allocateSampler(bool minLinear,bool magLinear,uint32_t mip=0,float minLod=0,float maxLod=FLT_MAX,const uint32_t *address=nullptr,uint32_t border=0) {
+ Sampler *allocateSampler(bool minLinear,bool magLinear,uint32_t mip=0,float minLod=0,float maxLod=FLT_MAX,const uint32_t *address=nullptr,uint32_t border=0,uint32_t anisotropy=1) {
   std::lock_guard<std::mutex> guard(mutex);requireLive();auto *s=new Sampler{};s->lodMin=minLod;s->lodMax=maxLod;s->filters=1|(minLinear?2:0)|(magLinear?4:0)|(mip<<3);
   if(mip>2 || !std::isfinite(minLod) || !std::isfinite(maxLod) || minLod<0 || maxLod<minLod){delete s;throw std::runtime_error("sampler mip/LOD");}
   VkSamplerCreateInfo ci{};ci.sType=VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;ci.minFilter=minLinear?VK_FILTER_LINEAR:VK_FILTER_NEAREST;
@@ -471,6 +473,8 @@ public:
    if(clampBorder && border>2){delete s;throw std::runtime_error("sampler border color");}
    // Clamp-to-zero reads transparent black; Metal's border colors map to the float borders.
    ci.borderColor=!clampBorder||border==0?VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK:border==1?VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK:VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE;}
+  if(!anisotropy || anisotropy>16){delete s;throw std::runtime_error("sampler anisotropy");}
+  if(anisotropy>1 && maxAnisotropy>1){ci.anisotropyEnable=VK_TRUE;ci.maxAnisotropy=std::min(float(anisotropy),maxAnisotropy);}
   ci.minLod=mip?std::min(minLod,VK_LOD_CLAMP_NONE):0;ci.maxLod=mip?std::min(maxLod,VK_LOD_CLAMP_NONE):0;
   try {check(CreateSampler(device,&ci,nullptr,&s->sampler));return s;}catch(...) {delete s;throw;}
  }

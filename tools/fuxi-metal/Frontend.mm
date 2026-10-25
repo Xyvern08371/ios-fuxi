@@ -1831,11 +1831,11 @@ static bool fuxiAddressMode(MTLSamplerAddressMode m) {return m==MTLSamplerAddres
  if(!d || d.minFilter>MTLSamplerMinMagFilterLinear || d.magFilter>MTLSamplerMinMagFilterLinear ||
     d.mipFilter>MTLSamplerMipFilterLinear || !fuxiAddressMode(d.sAddressMode) ||
     !fuxiAddressMode(d.tAddressMode) || !fuxiAddressMode(d.rAddressMode) || d.borderColor>MTLSamplerBorderColorOpaqueWhite ||
-    !d.normalizedCoordinates || d.maxAnisotropy!=1 || d.compareFunction!=MTLCompareFunctionNever ||
+    !d.normalizedCoordinates || d.maxAnisotropy<1 || d.maxAnisotropy>16 || d.compareFunction!=MTLCompareFunctionNever ||
     !std::isfinite(d.lodMinClamp) || !std::isfinite(d.lodMaxClamp) || d.lodMinClamp<0 || d.lodMaxClamp<d.lodMinClamp || d.lodAverage || d.supportArgumentBuffers) {failureLog("FUXI MTL: sampler reject descriptor min=%lu mag=%lu mip=%lu lod=%.9g..%.9g address=%lu,%lu,%lu normalized=%u anisotropy=%lu compare=%lu average=%u arguments=%u\n",(unsigned long)d.minFilter,(unsigned long)d.magFilter,(unsigned long)d.mipFilter,d.lodMinClamp,d.lodMaxClamp,(unsigned long)d.sAddressMode,(unsigned long)d.tAddressMode,(unsigned long)d.rAddressMode,d.normalizedCoordinates,(unsigned long)d.maxAnisotropy,(unsigned long)d.compareFunction,d.lodAverage,d.supportArgumentBuffers);return nil;}
  FuxiSampler *state=[FuxiSampler new];state->_device=[self retain];state->_label=[d.label copy];
  try {const uint32_t address[3]={(uint32_t)d.sAddressMode,(uint32_t)d.tAddressMode,(uint32_t)d.rAddressMode};
-  state->_sampler=owner(self)->backend->allocateSampler(d.minFilter==MTLSamplerMinMagFilterLinear,d.magFilter==MTLSamplerMinMagFilterLinear,(uint32_t)d.mipFilter,d.lodMinClamp,d.lodMaxClamp,address,(uint32_t)d.borderColor);}
+  state->_sampler=owner(self)->backend->allocateSampler(d.minFilter==MTLSamplerMinMagFilterLinear,d.magFilter==MTLSamplerMinMagFilterLinear,(uint32_t)d.mipFilter,d.lodMinClamp,d.lodMaxClamp,address,(uint32_t)d.borderColor,(uint32_t)d.maxAnisotropy);}
  catch(const std::exception &e) {failureLog("FUXI MTL: sampler FAIL %s\n",e.what());[state release];return nil;}return state;
 }
 - (id)newRenderPipelineStateWithDescriptor:(MTLRenderPipelineDescriptor *)d error:(NSError **)error {CENSUS();

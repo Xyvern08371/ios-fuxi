@@ -45,7 +45,7 @@ int main(int argc,char **argv){
  // Invalid counts/levels/LOD fail before submission, without allocating or poisoning.
  auto charge=b.resourceBytes();reject([&]{b.allocateTexture(80,5,8,4,5);});reject([&]{b.allocateTexture(80,5,8,4,0);});assert(b.resourceBytes()==charge);
  auto bad=gen;bad.mipBase=4;bad.mipCount=2;reject([&]{b.submit({bad});});bad={};bad.texture=mips;bad.srcLevel=5;bad.dst=read;reject([&]{b.submit({bad});});
- reject([&]{b.allocateSampler(false,false,3);});reject([&]{b.allocateSampler(false,false,1,2,1);});
+ reject([&]{b.allocateSampler(false,false,3);});reject([&]{b.allocateSampler(false,false,1,2,1);});reject([&]{b.allocateSampler(false,false,1,0,1,nullptr,0,0);});reject([&]{b.allocateSampler(false,false,1,0,1,nullptr,0,17);});
  // Descriptor classes, including packed BGR10A2 and all existing small channels.
  for(uint32_t format:{80u,70u,115u,10u,30u,1u,94u}){auto *t=b.allocateTexture(format,format==1?1:21,8,4,4);for(unsigned l=0;l<4;++l){std::vector<uint8_t> bytes(t->levelWidth(l)*t->levelHeight(l)*b.texelBytes(format));for(size_t i=0;i<bytes.size();++i)bytes[i]=(uint8_t)(17*i+19*l);put(t,l,bytes);assert(get(t,l)==bytes);}b.destroy(t);}
  reject([&]{b.allocateTexture(81,1,8,4,4);});reject([&]{b.allocateTexture(1,4,8,4,4);});reject([&]{b.allocateTexture(80,2,8,4,4);});
