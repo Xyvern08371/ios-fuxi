@@ -295,3 +295,34 @@ The START bit and write-line checks still gate every copy. Every 600 starts,
 `FUXI SCANOUT: waits per 600 starts ring=… floor=… transfer=…` reports the
 polls each gate held. A large `transfer` count at a low floor means the panel
 transfer itself is still running; tearing would show there first.
+
+## Tear-check registers, TE rate and opt-in TE gate (`fuxiscante=1`)
+
+OBSERVED (code + logs): the `rd=` value in earlier `owned` lines came from
+INTF+0x2a8. The SM8550 SDE driver (`sde_hw_intf.c`) names that register
+`INTF_TEAR_WR_PTR_IRQ`, a static setting that `sde_encoder_phys_cmd.c` programs
+to 1. Both M114 and P117 logged `rd=0x1`, which matches. The read pointer is
+`INTF_TEAR_INT_COUNT_VAL` at +0x298: the high 16 bits count TE frames and the
+low 16 bits are the line, which reloads to `VSYNC_INIT_VAL` (+0x294) at each TE.
+
+New log lines:
+- At ownership: `FUXI SCANOUT: tear sel= en= vsync= height= init= thresh=
+  start_pos= wr_irq=`. These are the raw ABL tear-check settings.
+  `vsync & 0x7ffff` is `vsync_count`, from which the configured rate is
+  `19.2 MHz / (vtotal * vsync_count)`, with vtotal 2684 for this panel's DTB
+  timing. A value near 119 means 60 Hz; near 59 means 120 Hz.
+- Every 600 STARTs: `te=` (TE-gate polls), `te_hz=` (TE frames per second
+  measured over the window) and `gaps=a/b/c/d`. The gaps are START-to-START
+  intervals of at most 1, 2 or 3 sixty-Hz periods, or longer (idle).
+
+With `fuxiscante=1`, acquire skips the fixed floor. After each START it waits
+until the TE frame count changes and the line is at least 64 past the reload
+value. Then the usual START-bit and write-line checks run. The count is read
+after the START write, so a TE that races the START only adds a wait. If no
+usable TE arrives within 40 ms of a START, the gate logs `te counter stalled`
+and uses the default 20 ms floor for the rest of the boot. An explicit
+`fuxiscandrain` still applies on top of the TE gate.
+
+GUESS: TE counting and reload behaviour follow the SDE driver's use of these
+registers. This has not been checked on the device. Boot with the default
+first, and only enable the gate after `te_hz` reads 60 or 120.
