@@ -27,9 +27,8 @@ int main(){
  assert(counter("render_merge_viewport_sets")-beforeViewports==expected && counter("render_merge_scissor_sets")-beforeScissors==expected);
  assert(counter("render_merge_set_binds")-beforeSets==(merge && systemTranslationPolicy().submitFast?1u:120u));
  pixels("repeated-plan-and-state");
- // A changed draw input invalidates the cache; returning to the old input is
- // another miss in the deliberately single-entry cache.
- repeated[60].first=1;repeated[60].vertices=3;beforePlans=plans();run(repeated,1,119);assert(plans()-beforePlans==3);
+ // Only the new shape misses; the previous shape survives across submissions.
+ repeated[60].first=1;repeated[60].vertices=3;beforePlans=plans();run(repeated,1,119);assert(plans()-beforePlans==1);
  pixels("changed-plan-input");dlclose(bridge);
  if(b.supportsOrderedColorAccess()){
   auto *fetch=b.compilePipeline(nullptr,"control",nullptr,"fetch");assert(fetch->fetchMask==1);

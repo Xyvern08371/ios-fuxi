@@ -30,6 +30,7 @@
 #include <vector>
 #include <unordered_map>
 #include "Translator.hpp"
+#include "DrawPlanCache.hpp"
 #include "CompileBoost.hpp"
 #include "PipelineCache.hpp"
 #include "ArtifactCache.hpp"
@@ -142,7 +143,7 @@ class Backend {
    (unsigned long long)objectHits,(unsigned long long)objectMisses);
   driverHits=driverMisses=driverUnknown=objectHits=objectMisses=0;return checkpoint;
  }
- ObjectCache<Pipeline> objects;ResourceLimits limits;
+ ObjectCache<Pipeline> objects;ResourceLimits limits;DrawPlanCache<Pipeline> drawPlans;
  // Two independently resettable lanes. A busy lane belongs to its retirement.
  struct HostUse {VkDeviceMemory memory;const void *address;size_t bytes;};
  struct SubmitSlot {
@@ -202,14 +203,15 @@ public:
  struct ReuseCounts {uint64_t commandPools{},commandBuffers{},fences{},queries{},descriptors{},frames{},views{};} reuseCounts;
 #ifdef FUXI_MTL_HOST_TEST
  // Test-only reference mode and deterministic recording failure; no production environment switches.
- bool reuseSubmitObjects=true,failBeforeQueue=false,failQueueAttempt=false;
+ bool reuseSubmitObjects=true,reuseDrawPlans=true,captureDrawPlans=false,failBeforeQueue=false,failQueueAttempt=false;
+ std::vector<std::pair<Pipeline *,DrawOutput>> drawPlansForTest;
  void loseWhileInFlightForTest(){std::lock_guard<std::mutex> lock(mutex);check(VK_ERROR_DEVICE_LOST);}
  struct ImageTransition {Texture *texture;uint32_t level;VkImageLayout before,after;};
  struct SampleViewUse {Texture *texture;uint32_t base,count;VkImageLayout layout;};
  std::vector<ImageTransition> imageTransitions;std::vector<SampleViewUse> sampleViewUses;
  size_t cachedFrames() const{return frameCache.size();}
  size_t cachedViews() const{return viewCache.size();}
- void dropPipelineCacheForTest(){std::lock_guard<std::mutex> guard(mutex);requireLive();objects.clear([&](Pipeline *p){destroyPipelineUnlocked(p);});}
+ void dropPipelineCacheForTest(){std::lock_guard<std::mutex> guard(mutex);requireLive();objects.clear([&](Pipeline *p){drawPlans.invalidate(p);destroyPipelineUnlocked(p);});}
  void discardReuseForTest(){std::lock_guard<std::mutex> guard(mutex);requireLive();for(auto &slot:slots)clearSubmitObjects(slot);clearFrames();clearViews();}
 #endif
  uint32_t maxTextureDimension() const{return limits.dimension;}
@@ -332,7 +334,7 @@ public:
   if(!backboardGate.blocked())artifactCache.checkpoint();
   artifactCache.close();
   for(auto &slot:slots)clearSubmitObjects(slot);clearFrames();clearViews();for(auto &slot:slots){destroyUnlocked(slot.aliasScratch);slot.aliasScratch=nullptr;}
-  objects.clear([&](Pipeline *p){destroyPipelineUnlocked(p);});
+  objects.clear([&](Pipeline *p){drawPlans.invalidate(p);destroyPipelineUnlocked(p);});
   pipelineCache.close();
   if(device && DestroyDevice) DestroyDevice(device,nullptr);
   if(instance && DestroyInstance) DestroyInstance(instance,nullptr);
@@ -575,7 +577,7 @@ public:
   check(CreateImageView(device,&vi,nullptr,&view));return view;
  }
  void destroyPipelineUnlocked(Pipeline *p) {
-  if(!p || --p->references)return;for(auto &v:p->variants)destroyPipelineUnlocked(v.second);
+  if(!p || --p->references)return;drawPlans.invalidate(p);for(auto &v:p->variants)destroyPipelineUnlocked(v.second);
   if(!poisoned) {
    if(p->pipeline)DestroyPipeline(device,p->pipeline,nullptr);
    if(p->stripPipeline)DestroyPipeline(device,p->stripPipeline,nullptr);
@@ -652,7 +654,7 @@ public:
   ++pipelineMisses;++objectMisses;
   auto *p=createPipeline(translated,enabledOptions);timing.create=timing.lap();timing.result="miss";
   compileBoost.finish();
-  try {objects.insert(inputKey,productKey,p,p->retainedBytes,[&](Pipeline *old){destroyPipelineUnlocked(old);});}
+  try {objects.insert(inputKey,productKey,p,p->retainedBytes,[&](Pipeline *old){drawPlans.invalidate(old);destroyPipelineUnlocked(old);});}
   catch(...){destroyPipelineUnlocked(p);throw;}
   fprintf(stderr,"FUXI MTL: pipeline cache MISS %.3f ms\n",std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-start).count());
   return p;
@@ -888,11 +890,9 @@ public:
   };
   try {
    std::vector<DrawOutput> draws(ops.size());
-   // One entry per submission: no allocation or resource ownership. Cache the
-   // translator's value output before access analysis can rewrite/skip draws.
-   // Diagnostic mode deliberately continues calling the external planner.
-   Pipeline *plannedOriginal=nullptr,*plannedPipeline=nullptr;
-   DrawInput plannedInput{};DrawOutput plannedOutput{};
+#ifdef FUXI_MTL_HOST_TEST
+   if(captureDrawPlans)drawPlansForTest.clear();
+#endif
    std::vector<std::array<MipRange,resourceSlots>> accessed(ops.size());
    std::vector<std::array<bool,resourceSlots>> generalSamples(ops.size());
    std::vector<Buffer *> buffers;
@@ -960,10 +960,11 @@ public:
      if(sam){input.filters[i]=sam->filters;input.lodMin[i]=sam->lodMin;input.lodMax[i]=sam->lodMax;}
     }
     FrameStageTimer pipelineTimer(timing,&FrameSample::pipe);
-    auto *requestedPipeline=op.pipeline;
-    if(!systemTranslationPolicy().trace && plannedOriginal==requestedPipeline && sameDrawInput(plannedInput,input)){
-     op.pipeline=plannedPipeline;draws[n]=plannedOutput;
-    }else {
+    auto *requestedPipeline=op.pipeline;bool cacheDrawPlan=!systemTranslationPolicy().trace;
+#ifdef FUXI_MTL_HOST_TEST
+    cacheDrawPlan=cacheDrawPlan && reuseDrawPlans;
+#endif
+    if(!(cacheDrawPlan && drawPlans.find(requestedPipeline,input,op.pipeline,draws[n]))){
      char why[512]{};auto &translator=Translator::get();
      Translator::OptionsScope translationScope(translator);
      auto *original=op.pipeline;std::optional<VariantKey> key;
@@ -983,13 +984,16 @@ public:
       else {if(original->variants.size()>=8)throw std::runtime_error("runtime variant bound");Translation variant{};
        CompileBoostScope compileBoost("variant");
        if(!translator.variant(original->translation,&input,&variant,why,sizeof(why)))throw std::runtime_error(why);
-       auto *pipeline=createPipeline(variant,original->options);try{original->variants.push_back({*key,pipeline});}catch(...){destroyPipelineUnlocked(pipeline);throw;}original->retainedBytes+=pipeline->retainedBytes;objects.reweigh(original,original->retainedBytes,[&](Pipeline *old){destroyPipelineUnlocked(old);});op.pipeline=pipeline;
+       auto *pipeline=createPipeline(variant,original->options);try{original->variants.push_back({*key,pipeline});}catch(...){destroyPipelineUnlocked(pipeline);throw;}original->retainedBytes+=pipeline->retainedBytes;drawPlans.invalidate(original);objects.reweigh(original,original->retainedBytes,[&](Pipeline *old){drawPlans.invalidate(old);destroyPipelineUnlocked(old);});op.pipeline=pipeline;
       }
       if(!translator.draw(op.pipeline->translation,&input,&draws[n],why,sizeof(why)))throw std::runtime_error(why);
      }
-     plannedOriginal=requestedPipeline;plannedPipeline=op.pipeline;plannedInput=input;plannedOutput=draws[n];
+     if(cacheDrawPlan)drawPlans.insert(requestedPipeline,input,op.pipeline,draws[n]);
     }
     pipelineTimer.stop();
+#ifdef FUXI_MTL_HOST_TEST
+    if(captureDrawPlans){drawPlansForTest.emplace_back(op.pipeline,DrawOutput{});memcpy(&drawPlansForTest.back().second,&draws[n],sizeof(DrawOutput));}
+#endif
     // Analyze the final runtime variant and this draw's descriptors, not the
     // baseline shader or the order in which Metal bindings were set.
     auto &plan=draws[n];bool skipDraw=false;

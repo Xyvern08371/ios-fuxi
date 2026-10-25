@@ -8,7 +8,7 @@
 int main(int argc,char **argv){
  assert(argc==1 || argc==2);
  using namespace fuxi;
- Backend b;auto baseline=liveMemoryObjects.load();auto *src=b.allocateTexture(80,5,16,16),*other=b.allocateTexture(80,5,16,16),*dst=b.allocateTexture(80,5,16,16);auto *data=b.allocate(1024),*read=b.allocate(1024);
+ Backend b;b.reuseDrawPlans=!getenv("PIPE_BENCH_UNCACHED");auto baseline=liveMemoryObjects.load();auto *src=b.allocateTexture(80,5,16,16),*other=b.allocateTexture(80,5,16,16),*dst=b.allocateTexture(80,5,16,16);auto *data=b.allocate(1024),*read=b.allocate(1024);
  Operation upload{};upload.texture=src;upload.src=data;upload.upload=true;memset(data->contents,91,1024);b.submit({upload});upload.texture=other;memset(data->contents,37,1024);b.submit({upload});
  void *library=nullptr;Buffer *vertices=nullptr,*ones=nullptr;CompileOptions options{};
  if(argc==2){
@@ -23,7 +23,8 @@ int main(int argc,char **argv){
  Operation draw{};draw.encoderID=1;draw.texture=dst;draw.pipeline=p;draw.samples[0]=src;draw.samplers[0]=sam;draw.vertices=6;draw.viewport={0,16,16,-16,0,1};draw.scissor={{0,0},{16,16}};draw.sampleCount[0]=1;
  if(library){draw.vertices=4;draw.topology=Topology::TriangleStrip;draw.buffers[0][0]={vertices,0,false};draw.buffers[0][2]={ones,0,true};draw.buffers[1][1]={ones,0,true};}
  bool encoderBoundaries=getenv("MERGE_BENCH_ENCODERS")!=nullptr;
- std::vector<Operation> draws(120,draw);for(unsigned i=0;i<120;++i){draws[i].samples[0]=(i%2)?other:src;draws[i].load=i?1:2;if(encoderBoundaries)draws[i].encoderID=i+1;}
+ bool interleaved=getenv("PIPE_BENCH_SHAPES")!=nullptr;
+ std::vector<Operation> draws(120,draw);for(unsigned i=0;i<120;++i){draws[i].samples[0]=(i%2)?other:src;draws[i].load=i?1:2;if(encoderBoundaries)draws[i].encoderID=i+1;if(interleaved && !(i%2))draws[i].vertices=3;}
  for(unsigned i=0;i<3;++i)b.submit(draws);
  FrameTraceWindow window;uint64_t ns=0,descriptor=0,record=0,objects=0,sets=0,passes=0,merged=0,gpu=0;
  auto db=b.submitDescriptorsNanos.load(),rb=b.submitRecordNanos.load(),ob=b.submitObjectsNanos.load(),sb=frameCounts.descriptors;
@@ -33,7 +34,7 @@ int main(int argc,char **argv){
  printf("BENCH fast=%u frames=40 draws=4800 submit_us/draw=%.3f descriptors_us/draw=%.3f objects_us/draw=%.3f record_us/draw=%.3f sets/frame=%.2f\n",unsigned(systemTranslationPolicy().submitFast),ns/4800e3,descriptor/4800e3,objects/4800e3,record/4800e3,sets/40.0);
  printf("MERGE_BENCH enabled=%u fast=%u passes/frame=%.2f merged/frame=%.2f cpu_ms/frame=%.3f gpu_ms/frame=%.3f\n",unsigned(systemTranslationPolicy().merge),unsigned(systemTranslationPolicy().submitFast),passes/40.0,merged/40.0,ns/40e6,gpu/40e6);
  if(systemTranslationPolicy().merge)printf("BOUNDARY_BENCH encoders/frame=%u cpu_us/draw=%.3f gpu_us/draw=%.3f\n",encoderBoundaries?120u:1u,ns/4800e3,gpu/4800e3);
- printf("CPUOPT_BENCH draws/frame=120 median_submit_ms=%.3f median_pipe_ms=%.3f planner=%s\n",window.percentile(&FrameSample::backendSubmit,50)/1e6,window.percentile(&FrameSample::pipe,50)/1e6,library?"external":"fixture");
+ printf("CPUOPT_BENCH draws/frame=120 median_submit_ms=%.3f median_pipe_ms=%.3f planner=%s interleaved=%u cached=%u\n",window.percentile(&FrameSample::backendSubmit,50)/1e6,window.percentile(&FrameSample::pipe,50)/1e6,library?"external":"fixture",unsigned(interleaved),unsigned(b.reuseDrawPlans));
  // Both flights keep pipelines, samplers, views, attachments and samples alive
  // after all caller references and the object cache have been dropped.
  std::function<void()> first,second;b.submit(draws,{},&first);b.submit(draws,{},&second);

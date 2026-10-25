@@ -91,7 +91,11 @@ void main() {color=textureLod(image,vec2(0.5),constants.lod);}
         definitions[-1] = '-DFUXI_MTL_TRANSLATOR="'+str(d/'bench-bridge.so')+'"'
         subprocess.run(common+sanitized+definitions+[str(ROOT/'tools/fuxi-metal/VariantPlanTests.cpp'), '-ldl', '-pthread', '-o', str(d/'variants')], check=True)
         print(invoke(d/'variants', 'fuxigpumerge=1 fuxigpusubmit=1', CONTROL_REQUIRE_VARIANT='1'), end='')
+        print(invoke(d/'variants', 'fuxigpumerge=1 fuxigpusubmit=1 fuxigputrace=1', CONTROL_REQUIRE_VARIANT='1'), end='')
         subprocess.run(common+['-O2']+definitions+[str(ROOT/'tools/fuxi-metal/SubmitBench.cpp'), '-ldl', '-pthread', '-o', str(d/'bench')], check=True)
+        for uncached in (True, False, False, True):
+            overrides = {'PIPE_BENCH_UNCACHED': '1'} if uncached else {}
+            print(invoke(d/'bench', 'fuxigpumerge=1 fuxigpusubmit=1', PIPE_BENCH_SHAPES='1', CONTROL_REQUIRE_VARIANT='1', **overrides), end='')
         for fast in ('', 'fuxigpusubmit=1'):
             for args in ('', 'fuxigpumerge=1', 'fuxigpumerge=1', ''):
                 print(invoke(d/'bench', fast+' '+args), end='')
