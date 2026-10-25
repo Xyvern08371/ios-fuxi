@@ -1074,3 +1074,162 @@ bandwidth-heavy blur passes slow.
 `fuxigpugmem=1` sets the default `TU_DEBUG=nocb` (tiled GMEM rendering) instead of
 `sysmem,nocb`. An explicit TU_DEBUG environment value still wins. UniXNU saw
 GMEM hangs on A740, so this is a diagnostic opt-in only.
+
+## Render pass merging
+
+**OBSERVED (supplied device measurements):** CoreAnimation blur frames have
+about 115 draws, with `render_passes/frame == draws/frame`. Median `gpu_exec`
+is about 9.6 ms, or 83 microseconds per draw. The GMEM trial did not change
+that result. These are supplied measurements; no device was accessed here.
+The old backend records a separate `vkCmdBeginRenderPass`/`vkCmdEndRenderPass`
+and attachment/sample transitions plus a memory barrier for every draw.
+
+**GUESS:** repeated sysmem render-pass boundaries trigger Turnip CCU
+flush/invalidate/wait work and now dominate the GPU interval, contributing to
+CA's roughly 30 Hz presentation. Equal pass/draw counts and the unchanged GMEM
+result motivate this experiment; they do not measure CCU costs or establish
+that merging will reach 60 Hz.
+
+Enable **`fuxigpumerge=1`**, independently of feedback, overlap, descriptor reuse
+and GMEM. Only one exact `=1` boot token enables it; absent, zero, malformed and
+duplicate tokens disable it. There is no environment fallback. Rebuild
+FuxiMetal; no translator or upstream driver changes are required. Default
+recording and the default frame-trace format retain their previous behavior.
+
+The frontend assigns a command-local identity when it creates each Metal
+render command encoder. Its existing first-load/later-load and final-store
+records remain authoritative; `endEncoding` still sets every final attachment's
+store action. Consecutive encoders always have different identities, including
+when they reuse identical attachments and start with Load. Identity zero means
+unknown and cannot merge. Command submissions and event segments are also
+boundaries; runs never cross them.
+
+The opt-in planner runs after runtime variants, descriptor plans, sampling
+access proofs and skipped draws have been resolved. A run requires identical
+nonzero encoder identity, attachment mask/count, texture objects and mip
+levels, render-area fields, and compatible color formats. The admitted model
+already has one slice/depth plane and sample count one; nonzero slices and
+multisampling remain refused by the frontend. Every removed boundary must have
+Store on its left and Load on its right, for every present attachment.
+The Vulkan pass uses the first draw's loads/clear colors and the final draw's
+stores. Intermediate logical attachment definition checks and final
+`setDefined` updates retain their original semantics, including store DontCare.
+Viewport, scissor, pipeline, descriptors, push constants, vertex/index bindings
+and the draw command are still recorded individually.
+
+All sampled-image and attachment transitions for a merged run move before its
+begin. Repeated image/mip transitions in that hoist are emitted once. This is
+safe because admitted runs only sample read-only, nonattachment images and
+write their unchanged attachments. The per-operation memory barrier remains
+at the end of the run. Singleton operations retain all their old transitions
+and barriers. Texture layout/definition snapshots still roll back together on
+a pre-submit failure; deferred retirement keeps the existing lane ownership.
+
+Splits are deliberately conservative:
+
+- `encoder`: different or unknown encoder identity.
+- `attachments`, `area`: changed attachments, levels, formats or render area.
+- `actions`: an internal clear, DontCare load or discard store.
+- `attachment_sample`: any sampled attachment image or memory/host-range alias,
+  even proven-disjoint mips and GENERAL views. This isolates both producer and
+  consumer, including `fuxigpufeedback=1` draws, preserving inter-draw barriers.
+- `storage`: writable or unproven storage descriptors. Storage buffers can merge
+  only when the final SPIR-V explicitly decorates that variable NonWritable in
+  every referencing stage (including the translator's vertex-read buffers).
+  Member-only/unknown contracts stay isolated. An earlier shader's buffer write
+  cannot lose its barrier.
+- `buffer_alias`: an index buffer sharing attachment memory or host ranges.
+- `shadow`: sampled linear-shadow refreshes, which record transfers.
+- `fetch`: framebuffer fetch or input attachments.
+- `non_draw`: uploads, image/buffer copies, mip blits, fills and empty passes,
+  including render-area-limited `clearOnly` passes and skipped shader draws.
+
+Existing refusals, such as GPU copy destinations used as draw buffers in the
+same submission, remain refusals. This feature does not broaden resource or
+feedback admission. In particular, the feedback opt-in still cannot define
+same-draw same-texel feedback results; splitting only preserves ordering
+between draws.
+
+With `fuxigpuframetrace=1`, existing `draws/frame` and `render_passes/frame`
+count actual recorded draws and Vulkan begins. Merge mode appends
+`merged_draws/frame` (continuations, equivalently saved pass begins) and
+`merged_splits=encoder:N,attachments:N,...`. Split counts are window totals for
+adjacent operation boundaries involving a draw, classified by the first
+blocking reason; a hazard can count on both sides. They are neither counts of
+failed draws nor per-frame averages. The default trace has no appended fields.
+
+The new `test-fuxi-metal-merge.py --glslang "$GLSLANG"` runs production Backend
+A/B pixel controls on local lavapipe with authored GLSL, ASan/UBSan and a Vulkan
+recording proxy. It compares every defined output byte with merging off/on
+for blending, first Clear/Load, discard followed by clear, partial render areas,
+encoder/action boundaries, uploads/copies/mip blits, empty partial passes,
+mip producer/consumer and GENERAL-view hazards. A storage-buffer read/write
+control requires two ordered single-fragment increments. Feedback and
+submit/overlap combinations run in fresh processes; true feedback compares
+only an untouched mip. Discard checks verify Vulkan storeOp and undefined
+bookkeeping, not unspecified discarded pixels. The proxy checks real
+pass/draw counts, actual load/store operations and the absence of barriers
+inside a pass. Recording rollback and two outstanding retirement tickets are
+also exercised. M9l adds byte-identical mixed-format 2/4/8 MRT runs, sparse
+slots, and ordered framebuffer-fetch splits. Native MRT frontend assertions
+check encoder identities across `endEncoding`; these require a Mac.
+
+**OBSERVED (host benchmark):** optimized C++, local lavapipe, 140 sampled draws
+in one encoder identity, two alternating bindings, three warm-up frames and 40
+measured frames per fresh process. Each setting runs A/B/B/A; times are means
+per frame within each run, in milliseconds. Submit CPU excludes fence waiting;
+GPU timestamps cover the software Vulkan execution interval. Descriptor reuse
+is held constant within each comparison. Pixel and pass-count assertions run
+in every benchmark; timings have no pass/fail threshold.
+
+| Descriptor reuse | Merge | Passes/frame | Submit CPU ms/frame, runs 1 / 2 | GPU timestamp ms/frame, runs 1 / 2 |
+| --- | --- | ---: | ---: | ---: |
+| Off | Off | 140 | 2.387 / 3.024 | 5.561 / 6.290 |
+| Off | On | 1 | 2.310 / 1.507 | 4.889 / 4.359 |
+| On | Off | 140 | 1.340 / 1.061 | 8.920 / 5.645 |
+| On | On | 1 | 0.354 / 0.347 | 3.190 / 3.293 |
+
+Each merged frame reports 139 merged continuations and still executes all 140
+draws. Sets/frame remain 140 with descriptor reuse off and two with it on.
+Scheduling variance is substantial, especially in the reference GPU interval;
+these results establish host pass reduction and correctness, not a stable
+speedup percentage or an Adreno latency prediction.
+
+Linux verification passed: the new merge suite; frontend portable controls
+(including exact-token policy, storage declaration proofs and trace/reset
+fields); backend fill/copy plus timeout/loss/corruption controls; frame trace;
+M6 with authored GLSL; mipfeedback; overlap; cache, cache-hits and translation;
+M9a through M9b (offline Rust bridge tests and production cache controls);
+M9g/H/I/K/L/M/N/O; staging's policy/storage controls; and the metal build
+dry-run. M9g/H/I/K/L/O also run with merge, overlap and descriptor reuse enabled.
+M9l compares byte-identical MRT output across pipeline changes and checks mixed
+final attachment discard actions as well as sparse attachments and fetch splits.
+All external inputs were already cached; no downloads or upstream source edits
+were used. Reproduction of the new controls and MRT comparison:
+
+```sh
+python3 tools/test-fuxi-metal-merge.py --glslang "$GLSLANG"
+FUXI_MTL_TEST_BOOTARGS='fuxigpumerge=1 fuxigpuoverlap=1 fuxigpusubmit=1' \
+  python3 tools/test-fuxi-metal-m9l.py --translator "$HOST_TRANSLATOR"
+python3 tools/test-fuxi-metal-frontend.py
+bash tools/ci/build.sh metal --dry-run
+```
+
+**Unverified / risks:** native Objective-C encoder identity tests, GCD/IOSurface
+integration and the full Mac/iOS build require a Mac. Defaults/pipeline/M6b/M7
+wrappers require native SDK-built fixture inputs; artifact qualification and
+CA offline replay require external build or proprietary inputs and were not
+run here. The authored AIR paths were covered by the listed Linux suites.
+No firmware or Apple binaries were used. The recording proxy is not full
+Vulkan validation-layer qualification.
+
+Actual CA encoder grouping, merge rate, Turnip CCU behavior under
+`TU_DEBUG=sysmem,nocb`, pixels, memory pressure, latency and presentation Hz
+remain unverified. Conservative attachment-sampling, storage and shadow splits
+can leave many passes intact, especially in mip chains. Hoisting adds
+submission-owned planning/transition state; it does not add Vulkan in-flight
+lanes or extend work across encoder/submission boundaries. Feedback's existing
+same-draw undefined texels remain undefined. Compare identical warm device
+interactions with only merge toggled, inspect pass/draw counts and split
+reasons with trace on, then repeat with trace off. A host pass reduction does
+not establish the guessed device bottleneck or a 60 Hz result.

@@ -23,9 +23,12 @@ inline unsigned frameCPU() {
 struct FrameCounts {uint64_t pipelines=0,descriptors=0,allocations=0;};
 // Count successful Vulkan pipeline/set/memory creations on the calling thread.
 inline thread_local FrameCounts frameCounts;
+enum class MergeSplit : size_t {none,encoder,attachments,area,actions,attachmentSample,storage,shadow,fetch,nonDraw,bufferAlias,count};
+inline constexpr const char *mergeSplitNames[]={"none","encoder","attachments","area","actions","attachment_sample","storage","shadow","fetch","non_draw","buffer_alias"};
 struct FrameSample {
  uint64_t wall=0,cpuBeforeCommit=0,shadowCopy=0,leaseLock=0,backendSubmit=0,gpuWait=0,gpuExec=0;
  uint64_t inflight=0,completionLatency=0;
+ uint64_t mergedDraws=0;std::array<uint64_t,size_t(MergeSplit::count)> mergeSplits{};
  uint64_t draws=0,passes=0,gpuSamples=0;FrameCounts counts{};unsigned cpu=4096;bool encodeCountsUnknown=false;
 };
 inline thread_local FrameSample *currentFrame=nullptr;
@@ -40,11 +43,13 @@ class FrameTraceWindow {
  std::array<FrameSample,capacity> samples{};
  std::array<uint64_t,capacity> scratch{};
  uint64_t count=0,wallMax=0,draws=0,passes=0,encodeUnknown=0,gpuUnavailable=0;
+ uint64_t mergedDraws=0;std::array<uint64_t,size_t(MergeSplit::count)> mergeSplits{};
  FrameCounts counts{};std::array<uint64_t,9> cpus{};
 public:
  void add(const FrameSample &s) {
   samples[count%capacity]=s;++count;wallMax=std::max(wallMax,s.wall);
   draws+=s.draws;passes+=s.passes;counts.pipelines+=s.counts.pipelines;counts.descriptors+=s.counts.descriptors;counts.allocations+=s.counts.allocations;
+  mergedDraws+=s.mergedDraws;for(size_t i=1;i<mergeSplits.size();++i)mergeSplits[i]+=s.mergeSplits[i];
   gpuUnavailable+=!s.gpuSamples;++cpus[s.cpu<8?s.cpu:8];encodeUnknown+=s.encodeCountsUnknown;
  }
  uint64_t size() const{return count;}
@@ -69,9 +74,11 @@ public:
   for(unsigned i=0;i<8;++i)fprintf(out,"%s%u:%llu",i?",":"",i,(unsigned long long)cpus[i]);
   fprintf(out,",unknown:%llu encode_counts_unknown=%llu gpu_exec_unavailable=%llu",(unsigned long long)cpus[8],(unsigned long long)encodeUnknown,(unsigned long long)gpuUnavailable);
   if(systemTranslationPolicy().overlap)fprintf(out," overlap_depth=%.0f/%.0f completion_ms=%.3f/%.3f",double(percentile(&FrameSample::inflight,50)),double(percentile(&FrameSample::inflight,90)),p(&FrameSample::completionLatency,50),p(&FrameSample::completionLatency,90));
+  if(systemTranslationPolicy().merge){fprintf(out," merged_draws/frame=%.2f merged_splits=",mergedDraws/n);
+   for(size_t i=1;i<mergeSplits.size();++i)fprintf(out,"%s%s:%llu",i==1?"":",",mergeSplitNames[i],(unsigned long long)mergeSplits[i]);}
   fputc('\n',out);
   funlockfile(out);
-  count=wallMax=draws=passes=encodeUnknown=gpuUnavailable=0;counts={};cpus.fill(0);
+  count=wallMax=draws=passes=encodeUnknown=gpuUnavailable=mergedDraws=0;mergeSplits.fill(0);counts={};cpus.fill(0);
  }
 };
 }

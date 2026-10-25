@@ -26,6 +26,9 @@ int main(){@autoreleasepool {
  [encoder setRenderPipelineState:(id)pipeline];[encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];[encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];[encoder endEncoding];
  assert(!cb->_rejected && cb->_ops.size()==2);
  for(unsigned i=0;i<4;++i){auto first=cb->_ops[0].color(i),last=cb->_ops[1].color(i);assert(first.texture==textures[i]->_texture && first.level==(i==1?0u:1u) && first.load==i%3 && first.store==1);assert(last.load==1 && last.store==unsigned(i%2==0));assert(strstr(cb->_ops[0].diagnostic.c_str(),"colors=["));}
+ assert(cb->_ops[0].encoderID && cb->_ops[0].encoderID==cb->_ops[1].encoderID);
+ encoder=(FuxiRender *)[cb renderCommandEncoderWithDescriptor:pass];[encoder setRenderPipelineState:(id)pipeline];[encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];[encoder endEncoding];
+ assert(cb->_ops.size()==3 && cb->_ops[2].encoderID!=cb->_ops[1].encoderID);
  for(unsigned i=0;i<4;++i)assert([cb->_resources containsObject:textures[i]]);
  // Pipeline state at slot 3 affects identity; absent slots' defaults are inert.
  auto misses=fuxi::Backend::pipelineMisses.load();pd.colorAttachments[3].writeMask=MTLColorWriteMaskAll;id changed=[device newRenderPipelineStateWithDescriptor:pd error:&error];assert(changed && fuxi::Backend::pipelineMisses==misses+1);[changed release];

@@ -25,6 +25,8 @@ def main():
             if not a.compile_only:subprocess.run([str(d/name)],check=True,timeout=15)
             if not a.compile_only and name == 'FrameTraceTests':
                 subprocess.run([str(d/name)],env=dict(os.environ,FUXI_MTL_TEST_BOOTARGS='fuxigpuoverlap=1'),check=True,timeout=15)
+            if not a.compile_only and name == 'FrameTraceTests':
+                subprocess.run([str(d/name)],env=dict(os.environ,FUXI_MTL_TEST_BOOTARGS='fuxigpumerge=1 fuxigpuoverlap=1'),check=True,timeout=15)
             if not a.compile_only and name == 'TranslationPolicyTests':
                 keys = ('fuxigpustages', 'fuxigputrace', 'fuxigpuasync')
                 enabled = dict(os.environ, FUXI_MTL_STAGE_CACHE='1', FUXI_MTL_TRANSLATION_TRACE='1', FUXI_MTL_ASYNC_PIPELINES='1', FUXI_MTL_COMPILE_BOOST='1')

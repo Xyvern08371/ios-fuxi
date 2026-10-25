@@ -28,6 +28,7 @@
 #include <optional>
 #include <stdexcept>
 #include <vector>
+#include <unordered_map>
 #include "Translator.hpp"
 #include "CompileBoost.hpp"
 #include "PipelineCache.hpp"
@@ -82,7 +83,7 @@ struct VariantKey {
  std::string legacy;std::array<uint32_t,resourceSlots*8> words{};
  bool operator==(const VariantKey &other) const {return !legacy.empty() || !other.legacy.empty()?legacy==other.legacy:words==other.words;}
 };
-struct Pipeline {std::array<uint32_t,resourceSlots> textureTypes{};size_t references=1,retainedBytes=0;void *translation{};CompileOptions options{};uint32_t fetchMask{};bool orderedColorAccess=false;std::vector<std::pair<uint32_t,VkRenderPass>> renders;VkPipeline pipeline{},stripPipeline{};std::array<VkPipeline,2> linePipelines{};Translation recipe{};VkPipelineLayout layout{};VkRenderPass render{};uint32_t pushOffset{},pushSize{},pushStages{};uint8_t pushBytes[128]{};VkDescriptorSetLayout setLayout{};VkSampler bakedSamplers[16]{};BakedSampler bakedSamplerInfo[16]{};MipAccess mipAccess[2];std::vector<Descriptor> descriptors;std::vector<Buffer *> constantBlobs;std::vector<std::array<uint8_t,32>> blobHashes;std::vector<std::pair<VariantKey,Pipeline *>> variants;};
+struct Pipeline {std::array<uint32_t,resourceSlots> textureTypes{};size_t references=1,retainedBytes=0;void *translation{};CompileOptions options{};uint32_t fetchMask{};bool orderedColorAccess=false;std::vector<std::pair<uint32_t,VkRenderPass>> renders;VkPipeline pipeline{},stripPipeline{};std::array<VkPipeline,2> linePipelines{};Translation recipe{};VkPipelineLayout layout{};VkRenderPass render{};uint32_t pushOffset{},pushSize{},pushStages{};uint8_t pushBytes[128]{};VkDescriptorSetLayout setLayout{};VkSampler bakedSamplers[16]{};BakedSampler bakedSamplerInfo[16]{};MipAccess mipAccess[2];uint32_t readOnlyStorage[2]{};std::vector<Descriptor> descriptors;std::vector<Buffer *> constantBlobs;std::vector<std::array<uint8_t,32>> blobHashes;std::vector<std::pair<VariantKey,Pipeline *>> variants;};
 struct BufferBind {Buffer *buffer{};uint64_t offset{};bool bytes=false;};
 struct ColorTarget {Texture *texture{};uint32_t level{},load=2,store=1;float clear[4]{};};
 struct Operation {
@@ -97,6 +98,9 @@ struct Operation {
  uint32_t srcLevel{},dstLevel{},sampleBase[resourceSlots]{},sampleCount[resourceSlots]{};bool generateMips=false;uint32_t mipBase{},mipCount{};
  std::string diagnostic{};// texture/dstLevel also name the first present target when slot 0 is absent.
  uint32_t colorCount=1,colorMask=1;ColorTarget colors[7]{};
+ // Command-local Metal encoder identity. Zero is unknown and never merges.
+ // The frontend rejects nonzero slices/depth planes and multisampling.
+ uint64_t encoderID{};
  ColorTarget color(unsigned i) const {if(!(colorMask&(1u<<i)))return {};if(i)return colors[i-1];ColorTarget c{texture,dstLevel,load,store,{}};memcpy(c.clear,clear,sizeof(clear));return c;}
  void setColor(unsigned i,const ColorTarget &c){if(i){colors[i-1]=c;return;}texture=c.texture;dstLevel=c.level;load=c.load;store=c.store;memcpy(clear,c.clear,sizeof(clear));}
 
@@ -729,6 +733,8 @@ public:
    VkPipelineLayoutCreateInfo li{};li.setLayoutCount=p->setLayout?1:0;li.pSetLayouts=&p->setLayout;li.sType=VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;li.pushConstantRangeCount=translated.rangeCount;li.pPushConstantRanges=ranges;check(CreatePipelineLayout(device,&li,nullptr,&p->layout));
    p->recipe=translated;
    p->mipAccess[0]=MipAccess(translated.vertex,translated.vertexCount);p->mipAccess[1]=MipAccess(translated.fragment,translated.fragmentCount);
+   if(systemTranslationPolicy().merge)for(auto &d:p->descriptors)if(d.type==VK_DESCRIPTOR_TYPE_STORAGE_BUFFER)for(unsigned stage=0;stage<2;++stage)
+    if((d.stages&(stage?16u:1u)) && p->mipAccess[stage].readOnlyStorage(d.binding))p->readOnlyStorage[stage]|=1u<<d.binding;
    p->retainedBytes+=p->mipAccess[0].retainedBytes()+p->mipAccess[1].retainedBytes();
    auto began=std::chrono::steady_clock::now();
    try {
@@ -1028,6 +1034,51 @@ public:
      for(auto &stage:op.buffers)for(auto &bound:stage)if(bound.buffer==ops[previous].dst)throw std::runtime_error("GPU-written draw buffer requires separate submission");
     }
    }
+   // Plan only after runtime variants, access proofs and skipped draws are final.
+   // Every admitted shader writes attachments only. Storage buffers require
+   // a NonWritable contract in every referencing stage; unknown writers split.
+   std::vector<size_t> mergeEnds;
+   if(systemTranslationPolicy().merge){
+    mergeEnds.resize(ops.size());
+    auto isolated=[&](size_t n)->MergeSplit {
+     auto &op=ops[n];if(!op.texture || !op.pipeline || op.clearOnly || op.upload || op.generateMips || op.src || op.dst)return MergeSplit::nonDraw;
+     if(op.pipeline->fetchMask)return MergeSplit::fetch;
+     if(op.indices)for(unsigned i=0;i<op.colorCount;++i){auto *t=op.color(i).texture;auto *b=op.indices;
+      if(t && (b->memory==t->memory || hostRangesOverlap(b->contents,b->length,t->mapped,t->allocated)))return MergeSplit::bufferAlias;
+     }
+     for(unsigned j=0;j<draws[n].descriptorCount;++j){auto &d=draws[n].descriptors[j];auto type=d.type;
+      if(type==VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT)return MergeSplit::fetch;
+      if(type==VK_DESCRIPTOR_TYPE_STORAGE_IMAGE || type==VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER)return MergeSplit::storage;
+      if(type==VK_DESCRIPTOR_TYPE_STORAGE_BUFFER)for(unsigned stage=0;stage<2;++stage)
+       if((d.stages&(stage?16u:1u)) && (d.binding>=16 || !(op.pipeline->readOnlyStorage[stage]&(1u<<d.binding))))return MergeSplit::storage;
+     }
+     for(unsigned slot=0;slot<resourceSlots;++slot){auto *sample=op.samples[slot];if(!slot && !sample)sample=op.sourceTexture;if(!sample)continue;
+      if(sample->shadow)return MergeSplit::shadow;
+      for(unsigned i=0;i<op.colorCount;++i){auto *t=op.color(i).texture;if(t && (sample==t || sample->image==t->image || sample->memory==t->memory || hostRangesOverlap(sample->mapped,sample->allocated,t->mapped,t->allocated)))return MergeSplit::attachmentSample;}
+     }
+     return MergeSplit::none;
+    };
+    auto boundary=[&](size_t a,size_t b)->MergeSplit {
+     auto &x=ops[a];auto &y=ops[b];auto reason=isolated(a);if(reason!=MergeSplit::none)return reason;
+     reason=isolated(b);if(reason!=MergeSplit::none)return reason;
+     if(!x.encoderID || x.encoderID!=y.encoderID)return MergeSplit::encoder;
+     if(x.colorCount!=y.colorCount || x.colorMask!=y.colorMask)return MergeSplit::attachments;
+     if(x.areaWidth!=y.areaWidth || x.areaHeight!=y.areaHeight)return MergeSplit::area;
+     for(unsigned i=0;i<x.colorCount;++i){auto c=x.color(i),d=y.color(i);
+      if(c.texture!=d.texture || c.level!=d.level || x.pipeline->options.color(i).format!=y.pipeline->options.color(i).format)return MergeSplit::attachments;
+      // Only encoder-internal load/store boundaries may disappear.
+      if(c.texture && (c.store!=1 || d.load!=1))return MergeSplit::actions;
+     }
+     return MergeSplit::none;
+    };
+    size_t first=0;
+    for(size_t n=1;n<=ops.size();++n){auto reason=n==ops.size()?MergeSplit::none:boundary(n-1,n);
+     if(n<ops.size() && reason==MergeSplit::none)continue;
+     for(size_t i=first;i<n;++i)mergeEnds[i]=n-1;
+     if(currentFrame && n<ops.size() && (ops[n-1].pipeline || ops[n].pipeline))++currentFrame->mergeSplits[size_t(reason)];
+     first=n;
+    }
+   }
    size_t neutralSize=0;for(const auto &draw:draws)for(unsigned i=0;i<draw.descriptorCount;++i){const auto &d=draw.descriptors[i];if(d.source==2){
     if((d.type!=VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER && d.type!=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER) || d.offset || !d.range || d.range>maxBufferLength)throw std::runtime_error("planned neutral buffer bounds/type");
     neutralSize=std::max(neutralSize,size_t(d.range));}}
@@ -1063,9 +1114,15 @@ public:
    if(timestamps){CmdResetQueryPool(cmd,timestamps,0,2);CmdWriteTimestamp(cmd,VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,timestamps,0);}
    VkMemoryBarrier barrier{};barrier.sType=VK_STRUCTURE_TYPE_MEMORY_BARRIER;barrier.srcAccessMask=VK_ACCESS_HOST_WRITE_BIT;barrier.dstAccessMask=VK_ACCESS_MEMORY_READ_BIT|VK_ACCESS_MEMORY_WRITE_BIT;
    CmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_HOST_BIT,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,0,1,&barrier,0,nullptr,0,nullptr);
+   // Merged runs contain only read-only nonattachment samples, so a mip can
+   // request only SHADER_READ_ONLY here, or GENERAL for a shared attachment.
+   // Deduplicate these pre-pass barriers; singleton hazards keep every barrier.
+   bool hoisting=false;std::unordered_map<VkImage,uint32_t> hoisted;
    auto transition=[&](Texture *t,VkImageLayout next,uint32_t base=0,uint32_t count=0) {
     if(!count)count=t->levels-base;
-    for(uint32_t l=base;l<base+count;++l){auto &layout=l?t->levelLayouts[l]:t->layout;
+    for(uint32_t l=base;l<base+count;++l){
+     if(hoisting){auto &mips=hoisted[t->image];uint32_t bit=1u<<l;if(mips&bit)continue;mips|=bit;}
+     auto &layout=l?t->levelLayouts[l]:t->layout;
      VkImageMemoryBarrier ib{};ib.sType=VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;ib.oldLayout=layout;ib.newLayout=next;
      ib.srcAccessMask=layout==VK_IMAGE_LAYOUT_UNDEFINED?0:VK_ACCESS_MEMORY_READ_BIT|VK_ACCESS_MEMORY_WRITE_BIT|VK_ACCESS_HOST_WRITE_BIT;
      ib.dstAccessMask=VK_ACCESS_MEMORY_READ_BIT|VK_ACCESS_MEMORY_WRITE_BIT;ib.srcQueueFamilyIndex=ib.dstQueueFamilyIndex=VK_QUEUE_FAMILY_IGNORED;
@@ -1107,7 +1164,7 @@ public:
     region.imageSubresource={VK_IMAGE_ASPECT_COLOR_BIT,0,0,1};region.imageExtent={t->width,t->height,1};
     CmdCopyBufferToImage(cmd,t->backingBuffer->buffer,t->image,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,1,&region);t->setDefined(0);
    };
-   for(size_t opIndex=0;opIndex<ops.size();++opIndex) {diagnosticOp=opIndex;const auto &op=ops[opIndex];const auto &draw=draws[opIndex];
+   auto prepareImages=[&](size_t opIndex){diagnosticOp=opIndex;const auto &op=ops[opIndex];
     // Refresh outside the render pass, after any preceding buffer writes.
     std::vector<Texture *> refreshed;
     auto readShadow=[&](Texture *t){if(t && t->shadow && std::find(refreshed.begin(),refreshed.end(),t)==refreshed.end()){refresh(t);refreshed.push_back(t);}};
@@ -1129,6 +1186,11 @@ public:
     }
     if(op.texture && !op.pipeline && !op.clearOnly)transition(op.texture,VK_IMAGE_LAYOUT_GENERAL,op.generateMips?op.mipBase:(!op.upload && !op.sourceTexture?op.srcLevel:op.dstLevel),op.generateMips?op.mipCount:1);
     if(op.pipeline || op.clearOnly)for(unsigned i=0;i<op.colorCount;++i){auto c=op.color(i);if(c.texture)transition(c.texture,VK_IMAGE_LAYOUT_GENERAL,c.level,1);}
+   };
+   for(size_t opIndex=0;opIndex<ops.size();++opIndex) {diagnosticOp=opIndex;const auto &op=ops[opIndex];const auto &draw=draws[opIndex];
+    size_t passEnd=mergeEnds.empty()?opIndex:mergeEnds[opIndex];
+    bool continuation=opIndex && !mergeEnds.empty() && mergeEnds[opIndex-1]>=opIndex;
+    if(!continuation){hoisting=passEnd>opIndex;hoisted.clear();for(size_t i=opIndex;i<=passEnd;++i)prepareImages(i);hoisting=false;diagnosticOp=opIndex;}
     if(op.generateMips){auto *t=op.texture;
      if(!t->isDefined(op.mipBase))throw std::runtime_error("undefined mip generation source");
      for(uint32_t l=op.mipBase+1;l<op.mipBase+op.mipCount;++l){
@@ -1143,7 +1205,10 @@ public:
      std::array<Texture *,8> targets{};std::array<uint32_t,8> levels{};VkImageView targetViews[8]{},compactViews[8]{};VkClearValue clears[8]{};unsigned used=0;
      for(unsigned i=0;i<op.colorCount;++i){auto c=op.color(i);if(!c.texture)continue;if(c.load==1 && !c.texture->isDefined(c.level))throw std::runtime_error("load undefined attachment["+std::to_string(i)+"]");
       c.texture->setDefined(c.level,c.store!=0);targets[i]=c.texture;levels[i]=c.level;targetViews[i]=attachmentView(c.texture,c.level);compactViews[used]=targetViews[i];memcpy(clears[used++].color.float32,c.clear,sizeof(c.clear));}
-     auto render=renderPass(op.pipeline,&op);
+     if(!continuation){
+     std::optional<Operation> passOp;
+     if(passEnd>opIndex){passOp=op;for(unsigned i=0;i<op.colorCount;++i){auto c=passOp->color(i);if(!c.texture)continue;c.store=ops[passEnd].color(i).store;passOp->setColor(i,c);}}
+     auto render=renderPass(op.pipeline,passOp?&*passOp:&op);
      VkFramebufferCreateInfo fi{};fi.sType=VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;fi.renderPass=render;
      fi.attachmentCount=used;fi.pAttachments=compactViews;fi.width=op.texture->levelWidth(op.dstLevel);fi.height=op.texture->levelHeight(op.dstLevel);fi.layers=1;VkFramebuffer frame{};
      {Measure measure{objectNanos};auto found=std::find_if(frameCache.begin(),frameCache.end(),[&](auto c){return c.textures==targets && c.render==render && c.levels==levels;});
@@ -1153,7 +1218,9 @@ public:
      }
      VkRenderPassBeginInfo ri{};ri.sType=VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;ri.renderPass=render;ri.framebuffer=frame;
      ri.renderArea={{0,0},{op.areaWidth?op.areaWidth:op.texture->levelWidth(op.dstLevel),op.areaHeight?op.areaHeight:op.texture->levelHeight(op.dstLevel)}};ri.clearValueCount=used;ri.pClearValues=clears;
-     if(currentFrame)++currentFrame->passes;CmdBeginRenderPass(cmd,&ri,VK_SUBPASS_CONTENTS_INLINE);CmdBindPipeline(cmd,VK_PIPELINE_BIND_POINT_GRAPHICS,topologyPipeline(op.pipeline,op.topology));
+     if(currentFrame)++currentFrame->passes;CmdBeginRenderPass(cmd,&ri,VK_SUBPASS_CONTENTS_INLINE);
+     }else if(currentFrame)++currentFrame->mergedDraws;
+     CmdBindPipeline(cmd,VK_PIPELINE_BIND_POINT_GRAPHICS,topologyPipeline(op.pipeline,op.topology));
      if(currentFrame)++currentFrame->draws;CmdSetViewport(cmd,0,1,&op.viewport);CmdSetScissor(cmd,0,1,&op.scissor);
      if(draw.descriptorCount) {
       VkDescriptorSetAllocateInfo sai{};sai.sType=VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;sai.descriptorPool=submitPool;sai.descriptorSetCount=1;sai.pSetLayouts=&op.pipeline->setLayout;
@@ -1208,7 +1275,7 @@ public:
      for(unsigned i=0;i<draw.pushCount;++i){auto &w=draw.pushes[i];CmdPushConstants(cmd,op.pipeline->layout,w.stages,w.offset,w.size,w.bytes);}
      for(unsigned i=0;i<draw.vertexCount;++i){auto b=op.buffers[0][draw.vertexSlots[i]].buffer;VkDeviceSize offset=draw.vertexOffsets[i];CmdBindVertexBuffers(cmd,draw.vertexBindings[i],1,&b->buffer,&offset);}
      if(draw.indexed){CmdBindIndexBuffer(cmd,op.indices->buffer,draw.indexOffset,VK_INDEX_TYPE_UINT16);CmdDrawIndexed(cmd,draw.count,1,draw.first,0,0);}else CmdDraw(cmd,draw.count,1,draw.first,0);
-     CmdEndRenderPass(cmd);
+     if(opIndex==passEnd)CmdEndRenderPass(cmd);
     } else if(op.texture && op.clearOnly && ((op.areaWidth && op.areaWidth!=op.texture->levelWidth(op.dstLevel)) || (op.areaHeight && op.areaHeight!=op.texture->levelHeight(op.dstLevel)))) {
      // Empty partial passes still execute Metal load/store over the chosen area.
      // A render pass CLEAR obeys renderArea; vkCmdClearColorImage cannot do so.
@@ -1262,8 +1329,8 @@ public:
      CmdCopyImageToBuffer(cmd,op.texture->image,VK_IMAGE_LAYOUT_GENERAL,op.dst->buffer,1,&region);
     } else if(op.src) {VkBufferCopy region{op.from,op.to,op.size};CmdCopyBuffer(cmd,op.src->buffer,op.dst->buffer,1,&region);}
     else CmdFillBuffer(cmd,op.dst->buffer,op.to,op.size,uint32_t(op.value)*0x01010101u);
-    barrier.srcAccessMask=VK_ACCESS_MEMORY_WRITE_BIT;barrier.dstAccessMask=VK_ACCESS_MEMORY_READ_BIT|VK_ACCESS_MEMORY_WRITE_BIT;
-    CmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,0,1,&barrier,0,nullptr,0,nullptr);
+    if(opIndex==passEnd){barrier.srcAccessMask=VK_ACCESS_MEMORY_WRITE_BIT;barrier.dstAccessMask=VK_ACCESS_MEMORY_READ_BIT|VK_ACCESS_MEMORY_WRITE_BIT;
+    CmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,0,1,&barrier,0,nullptr,0,nullptr);}
    }
    barrier.srcAccessMask=VK_ACCESS_MEMORY_WRITE_BIT;barrier.dstAccessMask=VK_ACCESS_HOST_READ_BIT;
    CmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,VK_PIPELINE_STAGE_HOST_BIT,0,1,&barrier,0,nullptr,0,nullptr);

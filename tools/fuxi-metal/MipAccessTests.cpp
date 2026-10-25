@@ -46,5 +46,14 @@ int main(){
  r=vector.range(1,0,1000,[](uint32_t b,uint64_t off,uint32_t &bits,bool push){assert(b==8 && off==20 && !push);bits=0x40000000;return true;});assert(r.first==2 && r.last==2);
  // Nonzero texture view bases are added by the caller exactly once.
  r=implicit.range(0,0,0);MipRange absolute;absolute.add(3+r.first,3+r.last);assert(absolute.contains(3) && !absolute.contains(2));
+ // Read-only storage declarations are stage/binding exact and fail closed.
+ Module storage;storage.add(30,{70,2});storage.add(32,{71,12,70});storage.add(59,{71,72,12});storage.add(71,{72,34,0});storage.add(71,{72,33,9});
+ auto readonly=[&]{return MipAccess(storage.words.data(),storage.words.size()).readOnlyStorage(9);};assert(!readonly());
+ storage.add(72,{70,0,24});assert(!readonly()); // member-only is conservatively unknown
+ storage.add(71,{72,24});assert(readonly());assert(!MipAccess(storage.words.data(),storage.words.size()).readOnlyStorage(10));
+ auto wrongSet=storage;
+ wrongSet.add(71,{72,34,1});assert(!MipAccess(wrongSet.words.data(),wrongSet.words.size()).readOnlyStorage(9));
+ storage.add(59,{71,73,12});storage.add(71,{73,34,0});storage.add(71,{73,33,9});assert(!readonly()); // another writable variable at the same binding
+ storage.words.push_back(0);assert(!readonly());assert(!MipAccess().readOnlyStorage(9));
  puts("PASS: mip access constants/uniforms/push/clamps, unions, rebased views, unknown/fetch/malformed refusal");
 }

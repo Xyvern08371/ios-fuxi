@@ -108,6 +108,20 @@ public:
   for(size_t id=0;id<bindings.size();++id)if(sets[id]!=0)bindings[id]=UINT32_MAX;
   valid=true;
  }
+ // A storage descriptor is read-only only with an explicit NonWritable
+ // variable contract in this final module. Missing bindings, malformed modules,
+ // decoration groups/member-only contracts and unfamiliar forms stay unknown.
+ // This is a declaration proof, not a guess based on observed OpLoad uses.
+ bool readOnlyStorage(uint32_t descriptorBinding) const {
+  if(!valid)return false;bool found=false;
+  for(uint32_t id=0;id<bindings.size();++id)if(bindings[id]==descriptorBinding){
+   auto *v=def(id);if(!v || v->op!=59 || v->w.size()<4 || (v->w[3]!=12 && v->w[3]!=2))return false;
+   auto *type=def(v->w[1]);if(!type || type->op!=32 || type->w.size()!=4 || type->w[2]!=v->w[3])return false;
+   bool nonWritable=false;for(auto &i:code)if(i.op==71 && i.w.size()==3 && i.w[1]==id && i.w[2]==24)nonWritable=true;
+   if(!nonWritable)return false;found=true;
+  }
+  return found;
+ }
  // Resolve sampler metadata by SPIR-V binding. Read callback addresses descriptor
  // bytes, or push bytes when its last argument is true, from this exact draw.
  MipRange range(uint32_t imageBinding,uint32_t count,const std::function<MipSampler(uint32_t)> &sampler,const Read &read) const {

@@ -908,7 +908,7 @@ static thread_local FuxiCommandBuffer *completionCommand;
  std::function<void()> _retirement;std::shared_ptr<fuxi::SurfaceLease> _lease;
  struct ShadowCopy {FuxiBuffer *buffer;std::vector<uint8_t> bytes;};std::vector<ShadowCopy> _shadows;
  BOOL _frameTrace;fuxi::FrameClock::time_point _traceCreated;fuxi::FrameCounts _traceCounts;std::thread::id _traceThread;
- std::vector<FuxiEventPoint> _events;std::vector<fuxi::Operation> _ops; MTLCommandBufferStatus _status; BOOL _encoding,_rejected,_enqueued,_scheduled;
+ uint64_t _renderEncoderID;std::vector<FuxiEventPoint> _events;std::vector<fuxi::Operation> _ops; MTLCommandBufferStatus _status; BOOL _encoding,_rejected,_enqueued,_scheduled;
 }
 @end
 @interface FuxiBlit : FuxiLabeledObject { @public FuxiCommandBuffer *_command; BOOL _ended; }
@@ -1187,7 +1187,7 @@ static NSString *renderPassText(MTLRenderPassDescriptor *d){
  MTLSamplePosition ignoredPosition{};CHECK("samplePositions.count",[d getSamplePositions:&ignoredPosition count:0],!actual);
 
 #undef CHECK
- FuxiRender *e=[FuxiRender new];e->_state={};e->_state.colorCount=colorCount;e->_state.colorMask=colorMask;e->_passText=[passText copy];e->_command=[self retain];e->_target=[t retain];e->_clear=a.clearColor;e->_load=(uint32_t)a.loadAction;e->_store=(uint32_t)a.storeAction;
+ FuxiRender *e=[FuxiRender new];e->_state={};e->_state.encoderID=++_renderEncoderID;e->_state.colorCount=colorCount;e->_state.colorMask=colorMask;e->_passText=[passText copy];e->_command=[self retain];e->_target=[t retain];e->_clear=a.clearColor;e->_load=(uint32_t)a.loadAction;e->_store=(uint32_t)a.storeAction;
  e->_state.viewport={0,(float)areaH,(float)areaW,-(float)areaH,0,1};e->_state.scissor={{0,0},{areaW,areaH}};e->_state.dstLevel=((FuxiTexture *)t)->_baseLevel+(uint32_t)a.level;e->_state.areaWidth=areaW;e->_state.areaHeight=areaH;
  for(unsigned i=1;i<colorCount;++i){auto c=d.colorAttachments[i];auto texture=(FuxiTexture *)c.texture;if(!texture)continue;e->_targets[i-1]=[texture retain];auto clear=c.clearColor;
   e->_state.colors[i-1]={texture->_texture,texture->_baseLevel+(uint32_t)c.level,(uint32_t)c.loadAction,(uint32_t)c.storeAction,{(float)clear.red,(float)clear.green,(float)clear.blue,(float)clear.alpha}};}

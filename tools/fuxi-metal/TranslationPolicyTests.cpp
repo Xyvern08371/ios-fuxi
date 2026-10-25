@@ -10,6 +10,7 @@ int main(int argc,char **argv){
  assert(!translationPolicy(nullptr).overlap && !translationPolicy(nullptr).submitFast);
  assert(translationPolicy("fuxigpuoverlap=1 fuxigpusubmit=1").overlap && translationPolicy("fuxigpuoverlap=1 fuxigpusubmit=1").submitFast);
  assert(!translationPolicy(nullptr).skipSampling && translationPolicy("fuxigpuskip=1").skipSampling);
+ assert(!translationPolicy(nullptr).merge && translationPolicy("fuxigpumerge=1").merge);
  assert(!translationPolicy(nullptr).gmem && translationPolicy("fuxigpugmem=1").gmem && !translationPolicy("fuxigpugmem=1").allowFeedback);
  assert(!translationPolicy(nullptr).allowFeedback && translationPolicy("fuxigpufeedback=1").allowFeedback && !translationPolicy("fuxigpufeedback=1").skipSampling);
  assert(!translationPolicy(nullptr).frameTrace && !translationPolicy(nullptr).pipelined);
@@ -17,7 +18,7 @@ int main(int argc,char **argv){
  assert(translationPolicy("fuxigpupipelined=1").pipelined && !translationPolicy("fuxigpupipelined=1").frameTrace);
  assert(!translationPolicy(nullptr).stages && !translationPolicy("").trace && !translationPolicy(nullptr).compileBoost);
  auto p=translationPolicy("fuxigpustages=1 fuxigputrace=1 fuxigpuasync=1 fuxicompileboost=1");assert(p.stages && p.trace && p.async && p.compileBoost);
- for(auto key:{"fuxigpustages","fuxigputrace","fuxigpuasync","fuxicompileboost","fuxigpuframetrace","fuxigpupipelined","fuxigpuskip","fuxigpufeedback","fuxigpugmem","fuxigpuoverlap","fuxigpusubmit"}){
+ for(auto key:{"fuxigpustages","fuxigputrace","fuxigpuasync","fuxicompileboost","fuxigpuframetrace","fuxigpupipelined","fuxigpuskip","fuxigpufeedback","fuxigpugmem","fuxigpuoverlap","fuxigpusubmit","fuxigpumerge"}){
   auto check=[&](const std::string &s){return translationOption(s.c_str(),(std::string(key)+"=").c_str());};
   assert(check(std::string("other=1\t")+key+"=1\r\n"));
   for(auto suffix:{"0","2","","11","yes"})assert(!check(std::string(key)+"="+suffix));
