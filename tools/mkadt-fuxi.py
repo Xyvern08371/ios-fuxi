@@ -156,6 +156,17 @@ def add_product_children(root, haptics=False, camera=False, d22ap=mkadt.D22AP_AD
     return root
 
 
+def ensure_mac_addresses(root):
+    """Add mkadt's synthetic /chosen Wi-Fi and Bluetooth MACs if missing, so
+    older --template ADTs get them too (MobileGestalt UniqueDeviceID inputs)."""
+    chosen = next(n for n in root.children if n.name == 'chosen')
+    for name, value in (('mac-address-wifi0', mkadt.SWEET_WIFI_MAC),
+                        ('mac-address-bluetooth0', mkadt.SWEET_BT_MAC)):
+        if chosen.prop(name) is None:
+            chosen.props.append((name, 0, value))
+    return root
+
+
 def reserve_gpu(root, mem_size=MEM_SIZE):
     """Preserve an integration ADT's identity/root extents while excluding scratch."""
     chosen = next(n for n in root.children if n.name == 'chosen')
@@ -194,6 +205,7 @@ def main():
                 raise ValueError('--template requires --gpu-reserve and preserves existing root extents')
             root, _ = adt.parse(args.template.read_bytes())
             root = reserve_gpu(root, mem_size)
+            root = ensure_mac_addresses(root)
         else:
             root = build(args.ufs_readonly, root_props, args.smp, args.gpu_reserve, mem_size)
         root = add_product_children(root, args.product_haptics, args.product_camera, args.d22ap_adt)
