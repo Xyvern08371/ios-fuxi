@@ -22,10 +22,10 @@ int main(){
  alignas(Pipeline) unsigned char storage[sizeof(Pipeline)];auto *p=new(storage) Pipeline{4};
  draw(p,inputs[0],resolved,out);assert(calls==4);cache.invalidate(p);p->~Pipeline();p=new(storage) Pipeline{9};
  assert(!cache.find(p,inputs[0],resolved,out));draw(p,inputs[0],resolved,out);assert(calls==5 && resolved==p);DrawOutput reference{};Pipeline *expected=nullptr;uncached(p,inputs[0],expected,reference);assert(!memcmp(&out,&reference,sizeof(out)));cache.invalidate(p);p->~Pipeline();
- DrawPlanCache<Pipeline> bounded;DrawInput input{};DrawOutput value{};
- for(unsigned i=0;i<33;++i){input.count=i;value.count=i;bounded.insert(&a,input,&variant,value);}
+ static DrawPlanCache<Pipeline> bounded;DrawInput input{};DrawOutput value{};
+ for(unsigned i=0;i<=DrawPlanCache<Pipeline>::capacity;++i){input.count=i;value.count=i;bounded.insert(&a,input,&variant,value);}
  input.count=0;assert(!bounded.find(&a,input,resolved,out));
- for(unsigned i=1;i<33;++i){input.count=i;assert(bounded.find(&a,input,resolved,out) && resolved==&variant && out.count==i);}
+ for(unsigned i=1;i<=DrawPlanCache<Pipeline>::capacity;++i){input.count=i;assert(bounded.find(&a,input,resolved,out) && resolved==&variant && out.count==i);}
  DrawRebase rules{};rules.enabled=1;rules.buffers[0]={1,1,3,0,0,16,256,65536};rules.buffers[1]={1,0,1,1,0,0,16,5000};
  rules.pushCount=3;rules.pushes[0]={0,0,1,0};rules.pushes[1]={0,8,2,19};rules.pushes[2]={1,0,3,0};
  DrawInput seed{};seed.count=3;seed.buffers[1][3]={4096,260,0};seed.buffers[0][1]={4096,16,0};seed.buffers[0][0]={4096,0,0};

@@ -45,9 +45,13 @@ inline bool rebaseDrawPlan(const DrawInput &old,const DrawInput &i,const DrawOut
  }
  return true;
 }
+// CA streams more than 32 shapes per frame; 32 entries missed ~30 draws/frame on device.
 template<class Pipeline> class DrawPlanCache {
+public:
+ static constexpr size_t capacity=128;
+private:
  struct Entry {Pipeline *requested{},*resolved{};DrawInput input{};DrawOutput output{};DrawRebase rules{};DrawPlanShape shape{DrawInput{}};};
- std::array<Entry,32> entries{};size_t next=0;
+ std::array<Entry,capacity> entries{};size_t next=0;
 public:
  bool find(Pipeline *requested,const DrawInput &input,Pipeline *&resolved,DrawOutput &output) const {
   DrawPlanShape shape(input);
