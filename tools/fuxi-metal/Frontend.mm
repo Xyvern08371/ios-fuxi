@@ -1222,10 +1222,10 @@ static NSString *renderPassText(MTLRenderPassDescriptor *d){
  if(!handlers.count)return;dispatch_group_enter(_completionGroup);
  auto queued=_frameTrace?fuxi::FrameClock::now():fuxi::FrameClock::time_point{};
  void (^run)(void)=^{auto start=_frameTrace?fuxi::FrameClock::now():fuxi::FrameClock::time_point{};
-  if(_frameTrace)_queue->_traceDelivery=fuxi::frameNanos(queued);
+  if(_frameTrace)_queue->_traceDelivery=std::max<uint64_t>(1,fuxi::frameNanos(queued));
   FuxiCommandBuffer *before=completionCommand;completionCommand=self;
   for(MTLCommandBufferHandler handler in handlers)handler((id)self);
-  completionCommand=before;if(_frameTrace)_queue->_traceHandlers=fuxi::frameNanos(start);dispatch_group_leave(_completionGroup);};
+  completionCommand=before;if(_frameTrace)_queue->_traceHandlers=std::max<uint64_t>(1,fuxi::frameNanos(start));dispatch_group_leave(_completionGroup);};
  if(_overlap)dispatch_async(_queue->_deliveryQueue,run);
  else if(_queue->_completionQueue)dispatch_async(_queue->_completionQueue,run);else run();
 }
@@ -1428,7 +1428,7 @@ static NSString *renderPassText(MTLRenderPassDescriptor *d){
  @synchronized(self){[_scheduledHandlers removeAllObjects];}[_resources removeAllObjects];_resourceSet.clear();_ops.clear();_events.clear();_shadows.clear();
  if(_overlap)dispatch_group_leave(_completionGroup);
 }
-- (void)waitUntilCompleted {CENSUS();if(completionCommand!=self){auto start=_frameTrace?fuxi::FrameClock::now():fuxi::FrameClock::time_point{};dispatch_group_wait(_completionGroup,DISPATCH_TIME_FOREVER);if(_frameTrace)_queue->_traceWaitCompleted=fuxi::frameNanos(start);}}
+- (void)waitUntilCompleted {CENSUS();if(completionCommand!=self){auto start=_frameTrace?fuxi::FrameClock::now():fuxi::FrameClock::time_point{};dispatch_group_wait(_completionGroup,DISPATCH_TIME_FOREVER);if(_frameTrace)_queue->_traceWaitCompleted=std::max<uint64_t>(1,fuxi::frameNanos(start));}}
 - (void)waitUntilScheduled {CENSUS();if(!_overlap)return;@synchronized(self){if(_scheduled || _finished || _status==MTLCommandBufferStatusError)return;}dispatch_group_wait(_scheduledGroup,DISPATCH_TIME_FOREVER);}
 - (BOOL)commitAndWaitUntilSubmitted {CENSUS();[self commit];[self waitUntilScheduled];return _scheduled && self.status!=MTLCommandBufferStatusError;}
 - (CFTimeInterval)kernelStartTime {FRONTEND_TIME(self);CENSUS();return 0;}
