@@ -10,11 +10,12 @@ int main(){
  assert(frameCPUFromRegister(0xabc000ULL|0xfff)==4095);
  assert(frameCPU()==4096); // host has no Darwin register convention
  FrameTraceWindow window;assert(window.percentile(&FrameSample::wall,50)==0);
- for(unsigned i=1;i<=100;++i){FrameSample s;s.wall=i*1000000ULL;s.cpu=i%7;s.draws=2;s.passes=1;s.counts={1,2,3};window.add(s);}
+ for(unsigned i=1;i<=100;++i){FrameSample s;s.wall=i*1000000ULL;s.completionLatency=s.wall;s.inflight=i%2+1;s.cpu=i%7;s.draws=2;s.passes=1;s.counts={1,2,3};window.add(s);}
  assert(window.size()==100 && window.percentile(&FrameSample::wall,50)==50000000 && window.percentile(&FrameSample::wall,90)==90000000);
  FILE *out=tmpfile();assert(out);window.report(out);rewind(out);char line[2048];assert(fgets(line,sizeof(line),out));
  assert(strstr(line,"frame trace n=100 samples=100 wall=50.000/90.000/100.000 ms"));
  assert(strstr(line,"draws/frame=2.00 render_passes/frame=1.00 pipelines/frame=1.00 descriptors/frame=2.00 allocations/frame=3.00"));
+ if(systemTranslationPolicy().overlap)assert(strstr(line,"overlap_depth=1/2 completion_ms=50.000/90.000"));else assert(!strstr(line,"overlap_depth="));
  assert(!window.size());fclose(out);
  // Overflow retains the newest 1024 samples; window max includes evicted data.
  FrameSample s;s.wall=9999999999;window.add(s);

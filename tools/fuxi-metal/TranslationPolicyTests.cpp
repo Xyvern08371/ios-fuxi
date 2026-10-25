@@ -6,6 +6,9 @@
 int main(int argc,char **argv){
  if(argc==2){auto p=fuxi::systemTranslationPolicy();assert(p.stages==(argv[1][0]=='1') && p.trace==(argv[1][1]=='1') && p.async==(argv[1][2]=='1') && p.compileBoost==(argv[1][3]=='1'));if(strlen(argv[1])==6)assert(p.frameTrace==(argv[1][4]=='1') && p.pipelined==(argv[1][5]=='1'));return 0;}
  using namespace fuxi;
+ static_assert(sizeof("fuxigpuoverlap")-1<=16 && sizeof("fuxigpusubmit")-1<=16);
+ assert(!translationPolicy(nullptr).overlap && !translationPolicy(nullptr).submitFast);
+ assert(translationPolicy("fuxigpuoverlap=1 fuxigpusubmit=1").overlap && translationPolicy("fuxigpuoverlap=1 fuxigpusubmit=1").submitFast);
  assert(!translationPolicy(nullptr).skipSampling && translationPolicy("fuxigpuskip=1").skipSampling);
  assert(!translationPolicy(nullptr).allowFeedback && translationPolicy("fuxigpufeedback=1").allowFeedback && !translationPolicy("fuxigpufeedback=1").skipSampling);
  assert(!translationPolicy(nullptr).frameTrace && !translationPolicy(nullptr).pipelined);
@@ -13,7 +16,7 @@ int main(int argc,char **argv){
  assert(translationPolicy("fuxigpupipelined=1").pipelined && !translationPolicy("fuxigpupipelined=1").frameTrace);
  assert(!translationPolicy(nullptr).stages && !translationPolicy("").trace && !translationPolicy(nullptr).compileBoost);
  auto p=translationPolicy("fuxigpustages=1 fuxigputrace=1 fuxigpuasync=1 fuxicompileboost=1");assert(p.stages && p.trace && p.async && p.compileBoost);
- for(auto key:{"fuxigpustages","fuxigputrace","fuxigpuasync","fuxicompileboost","fuxigpuframetrace","fuxigpupipelined","fuxigpuskip","fuxigpufeedback"}){
+ for(auto key:{"fuxigpustages","fuxigputrace","fuxigpuasync","fuxicompileboost","fuxigpuframetrace","fuxigpupipelined","fuxigpuskip","fuxigpufeedback","fuxigpuoverlap","fuxigpusubmit"}){
   auto check=[&](const std::string &s){return translationOption(s.c_str(),(std::string(key)+"=").c_str());};
   assert(check(std::string("other=1\t")+key+"=1\r\n"));
   for(auto suffix:{"0","2","","11","yes"})assert(!check(std::string(key)+"="+suffix));

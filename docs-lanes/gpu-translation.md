@@ -436,8 +436,9 @@ then publishes Completed and delivers handlers. `Backend::submit` holds its
 mutex through preparation, queue submission, fence completion and invalidation.
 A pipeline compilation or cache checkpoint can contend for that same mutex.
 
-The blocking/cost audit below refers to the implementation in this change;
-all paths are conditional unless described as every nonempty submit. Vulkan
+The blocking/cost audit below describes the synchronous/default path at its
+original audit snapshot; the later frame-overlap section covers the opt-in
+worker path. All paths are conditional unless described as every nonempty submit. Vulkan
 object creation and cache maintenance are synchronous CPU calls, not additional
 explicit GPU completion waits.
 
@@ -863,3 +864,200 @@ Turnip (`TU_DEBUG=sysmem,nocb`), actual Spotlight/Control Center/notification
 pixels, performance, compiler floating-point behavior and continued GPU rendering
 after blur remain unverified. Software Vulkan success is not an on-device result;
 Vulkan validation-layer coverage was unavailable in this host environment.
+
+## Frame overlap and submit cost
+
+### OBSERVED: supplied trace and code
+
+The supplied interaction excerpt after `e7d9133` has one trace row with
+`wall=19.055/27.153/32.887`, `cpu_before_commit=8.757/15.676`,
+`backend_submit=7.099/9.152`, `gpu_wait=11.335/17.216`,
+`gpu_exec=10.255/16.092`, and 140.57 draws/descriptor sets per surface command.
+Slash triples are p50/p90/max; pairs are p50/p90. Encode time is **outside**
+`wall`, and GPU timestamps overlap the fence wait. Percentiles of separate
+phases cannot be added to derive a total percentile. The reported session stays
+on the GPU and displays about 24–26 Hz; this is supplied device evidence, not a
+new device experiment.
+
+Previously `Frontend.mm` called `Backend::submit` on the committing thread.
+That method held the device mutex across `vkWaitForFences` (two-second timeout),
+invalidation and cleanup. Its single command pool, descriptor pool, fence and
+query pool could only be reset after that fence. The stack IOSurface lease,
+resource release and completion handlers also depended on synchronous return.
+Scheduled handlers were delivered after the wait. This explains the synchronous
+`gpu_wait`; `fuxigpupipelined` only reused alias-copy scratch.
+
+Per draw, submit validates bindings/bounds, calls the translator's draw planner,
+looks up or creates a runtime variant when requested, checks sampled access and
+attachment aliases, resolves render-pass/framebuffer/view caches, and records
+barriers, a render pass, pipeline/bindings and the draw. The old descriptor path
+allocated one set per draw and called `vkUpdateDescriptorSets` once **per
+binding**. Runtime variant lookup formatted every slot into an allocating
+`std::string`, then searched at most eight variants. The expensive mip
+interpreter **already skipped non-aliasing samples**; their whole-view definition
+checks remain. Image barriers and the per-operation memory barriers remain.
+
+### Opt-in settings and completion behavior
+
+| Boot argument | Behavior |
+| --- | --- |
+| `fuxigpuoverlap=1` | Serial submission worker, separate serial fence-retirement worker, two admitted commands per Metal queue and at most two Vulkan submissions per backend. |
+| `fuxigpusubmit=1` | Exact descriptor-set reuse within each submission, batched descriptor updates on misses, and fixed typed runtime-variant keys. |
+| `fuxigpuframetrace=1` | Existing trace; with overlap also reports `overlap_depth` and `completion_ms` p50/p90. |
+
+All are sampled once, absent/off by default, with no new environment fallback.
+Only one exact `=1` enables; zero, malformed values and duplicates disable.
+New names are 14 and 13 characters respectively. Existing admission, backend,
+feedback, cache and scratch policies remain independent. Rebuild FuxiMetal;
+this change requires no bridge, Mesa, metal2vulkan or NativeMetal modification.
+
+With overlap, commit snapshots no-copy shadow bytes and queues the command,
+then returns without waiting for its GPU fence. Explicit `enqueue` reserves
+queue order even when commits arrive in reverse order. Admission backpressure
+can block a third enqueue/commit until an earlier command retires. There is no
+unbounded internal work queue. An explicitly enqueued command must eventually
+be committed; reserving both slots without committing either prevents progress.
+Each backend lane owns its resettable pools, fence, timestamps and scratch.
+Queue submission/recording uses the device mutex; deferred fence waiting does
+not. A ticket pins buffers, textures, pipelines, samplers and transient Vulkan
+objects until retirement, independent of caller/cache references.
+
+`waitUntilScheduled` waits for successful submission or its error outcome.
+Scheduled handlers run before completed handlers. Per-queue retirement and
+handler delivery are serial, including when a caller sets a completion queue.
+`waitUntilCompleted` includes completion-handler delivery; calling it on the
+same command from its completed handler remains nonblocking. Handlers added
+while a fence is pending join its completion; late completed handlers run once
+on the delivery queue. Resources remain retained through GPU retirement.
+Presentation is delivered only after successful completion. IOSurface leases
+are released after the fence and invalidation; reuse of the same surface waits
+for its prior lease. Surface IDs are acquired in sorted order to avoid cycles.
+The original synchronous commit body remains the default path, with inline
+default handlers.
+
+Process-local event boundaries still use synchronous segments **on the
+submission worker** so signals follow preceding GPU writes. The final segment
+can retire asynchronously. Shared shadow refreshes and CPU index inspection
+drain previous flights. Noncoherent host allocations shared with an earlier
+flight drain before whole-allocation flush/invalidation can race that flight.
+Shadow refresh and recording are serialized together by the backend mutex;
+client bytes are snapshotted before commit returns. Mip proofs refuse to infer
+uniform LODs from host bytes while an earlier submission could have written them.
+These conservative cases can limit overlap.
+
+Fence timeout/device loss or an in-flight poison fails completion, releases
+admission slots, and quarantines GPU objects and producer leases. Device loss
+from another backend API also poisons pending submissions before cleanup.
+No uncertain DMA allocation is reset or destroyed, and failed overlap commands
+do not present. Quarantine intentionally persists until process/kernel teardown.
+
+Descriptor reuse is bounded to 256 exact entries per submission. Keys include
+set-layout identity, binding/type, buffer handle/offset/range and image
+view/sampler/layout; comparisons do not hash padding or omit dynamic ranges.
+Sets are immutable after creation and belong to their lane's pool until its
+fence. Push constants remain separate commands. Pools still size for the
+conservative per-draw maximum and reset only after retirement. The typed variant
+key preserves the old specialization facts, including exact float bits, without
+formatting strings. Extension discovery already uses
+`vkEnumerateDeviceExtensionProperties`; this implementation uses portable
+Vulkan descriptor sets and does not enable `VK_KHR_push_descriptor`. Actual
+Turnip extension availability was not queried on a device.
+
+With trace enabled, `overlap_depth` is admitted depth (including the command)
+at reservation; `completion_ms` is commit entry through fence retirement,
+invalidation, lease release and scheduled-handler delivery, before completed
+handlers. `wall` ends at fence retirement and lease release, so a slow scheduled
+handler can make completion latency larger than wall. Depth is not GPU utilization. `gpu_wait` now
+belongs to the retirement worker and overlaps CPU encoding/recording; it must
+not be added to CPU work to estimate throughput. Counts combine the creating
+thread's encode interval when known with the submission worker's own counters;
+GPU time comes from the command's own ticket, avoiding overlapping process-total
+attribution. Shadow snapshot allocation/copy is included in wall; `shadow_copy`
+measures the worker's refresh. Trace-off measurements are still needed.
+
+### OBSERVED: Linux verification and host measurements
+
+`test-fuxi-metal-overlap.py --glslang "$GLSLANG"` uses only local Vulkan headers,
+lavapipe, authored GLSL and the existing test adapter. It records 140 sampled
+draws per frame, alternates two texture bindings, warms three frames, then
+measures 40 frames (5,600 draws) in fresh-process A/B/B/A order. It checks final
+pixels; timing excludes fence waiting/JIT and is not a pass/fail threshold.
+Descriptor, object and recording subphases are measured by the existing backend
+counters. The fixture does not exercise runtime variant creation.
+
+Optimized C++ host run, timings in microseconds per draw (two runs per path):
+
+| Path | Submit CPU | Descriptor API/cache phase | Object API/cache phase | Remaining recording | Sets/frame |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Default | 14.154 / 17.795 | 5.292 / 6.555 | 5.142 / 6.301 | 2.976 / 3.819 | 140 / 140 |
+| `fuxigpusubmit=1` | 7.283 / 8.596 | 0.303 / 0.415 | 1.695 / 2.045 | 4.305 / 4.915 | 2 / 2 |
+
+Submit CPU for 140 draws was 1.982 / 2.491 ms versus 1.020 / 1.203 ms.
+There is substantial host scheduling variance; earlier runs also favored reuse,
+but these numbers establish neither a phone speedup nor a stable percentage.
+The descriptor phase includes the exact-cache search; binding normalization is
+in remaining recording. Validation, draw planning, barriers and driver submission
+remain costs. Different per-draw bindings may have much less reuse; the bounded
+linear search can itself become a cost.
+
+ASan/UBSan controls submit two real Vulkan commands before either ticket is
+retired, block a third submission until a lane retires, check GPU copy ordering
+and pixels, and verify no buffer destruction while pinned. Sampled controls
+drop caller texture/sampler/pipeline references and the object cache with both
+flights outstanding; all GPU allocations survive until the last retirement.
+Injected fence timeout, device loss and a device loss from another API fail both
+pending tickets without destroying their DMA objects. An ICD wrapper hides
+HOST_COHERENT to verify shared-range draining and flush/invalidate sequencing;
+this is a deterministic host control, not Turnip cache qualification. Portable
+surface tests block same-surface reuse and wake poisoned waiters without handoff.
+Trace tests cover overlap depth/latency fields and preserve default log fields.
+
+The existing frontend portable controls, software-Vulkan backend, frame-reuse,
+cache, translation, M6 sampled and M9g/M9h/M9i/M9k/M9l/M9m/M9n/M9o suites passed.
+M9g/H/I/K/L/O were also run with `fuxigpusubmit=1`; mip-feedback pixels/refusals
+passed with submit reuse and its feedback/skip combinations. The old M6 GLSL
+adapter needed its current identity/product-hash exports and MRT color-zero mask
+initialized; only that authored test adapter changed. The metal CI dry-run and
+Python syntax checks passed. Reproduction uses cached external inputs only:
+
+```sh
+python3 tools/test-fuxi-metal-overlap.py --glslang "$GLSLANG"
+python3 tools/test-fuxi-metal-mipfeedback.py --glslang "$GLSLANG"
+python3 tools/test-fuxi-metal-frontend.py
+python3 tools/test-fuxi-metal-backend.py --headers "$VULKAN_HEADERS"
+python3 tools/test-fuxi-metal-frametrace.py
+python3 tools/test-fuxi-metal-m6.py --headers "$VULKAN_HEADERS" --glslang "$GLSLANG"
+FUXI_MTL_TEST_BOOTARGS=fuxigpusubmit=1 \
+  python3 tools/test-fuxi-metal-m9k.py --translator "$HOST_TRANSLATOR"
+bash tools/ci/build.sh metal --dry-run
+```
+
+`OverlapFrontendTests.mm` is wired into the existing frontend runner and thus
+the metal build. It pauses retirement, checks commit return, explicit enqueue
+order under reversed commits, two-command backpressure, scheduled/completed
+handlers, pending/late handlers, self-wait, completion-queue routing, presentation,
+resource lifetime, no-copy snapshots and in-flight poison. **Native Objective-C
+execution, Foundation/Metal/IOSurface integration and the full Mac/iOS build
+require a Mac and were not run on Linux.** Defaults/SDK fixture suites likewise
+remain Mac-only. Host C++ tests do not establish native GCD/Objective-C behavior.
+
+### GUESS and risks requiring device acceptance
+
+Overlapping CA encoding/recording with GPU work should remove the old serial
+sum from steady-state throughput. It does not reduce the GPU's own roughly
+10 ms workload or guarantee 60 Hz. Same-surface reuse, shared shadows,
+noncoherent aliases, indexed CPU validation, event waits, translation and
+backend contention can still serialize work. Two lanes increase retained pools,
+scratch and in-flight resources; shadow snapshots also add host memory/copy
+cost. Scheduled handlers run on the submission worker and must return for that
+queue to progress. Completion handlers must not synchronously wait for later
+handlers on the same serial delivery queue.
+
+Actual Turnip behavior with `TU_DEBUG=sysmem,nocb`, driver CPU cost, private CA
+resource reuse, IOSurface/scanout timing, pixels under Spotlight/Control Center,
+thermal behavior, memory pressure, interaction Hz and the 60 Hz target are
+**unverified**. No device access, hosted runs, downloads or upstream source
+changes were used. Compare identical warm interactions with overlap and submit
+reuse individually, then together, preserving all other boot settings. Inspect
+depth/latency and failures with trace on, then repeat with trace off; a two-deep
+queue can improve throughput while increasing input-to-display latency.

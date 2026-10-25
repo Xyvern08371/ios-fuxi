@@ -25,6 +25,7 @@ struct FrameCounts {uint64_t pipelines=0,descriptors=0,allocations=0;};
 inline thread_local FrameCounts frameCounts;
 struct FrameSample {
  uint64_t wall=0,cpuBeforeCommit=0,shadowCopy=0,leaseLock=0,backendSubmit=0,gpuWait=0,gpuExec=0;
+ uint64_t inflight=0,completionLatency=0;
  uint64_t draws=0,passes=0,gpuSamples=0;FrameCounts counts{};unsigned cpu=4096;bool encodeCountsUnknown=false;
 };
 inline thread_local FrameSample *currentFrame=nullptr;
@@ -66,7 +67,9 @@ public:
    p(&FrameSample::gpuWait,50),p(&FrameSample::gpuWait,90),
    p(&FrameSample::gpuExec,50),p(&FrameSample::gpuExec,90),draws/n,passes/n,counts.pipelines/n,counts.descriptors/n,counts.allocations/n);
   for(unsigned i=0;i<8;++i)fprintf(out,"%s%u:%llu",i?",":"",i,(unsigned long long)cpus[i]);
-  fprintf(out,",unknown:%llu encode_counts_unknown=%llu gpu_exec_unavailable=%llu\n",(unsigned long long)cpus[8],(unsigned long long)encodeUnknown,(unsigned long long)gpuUnavailable);
+  fprintf(out,",unknown:%llu encode_counts_unknown=%llu gpu_exec_unavailable=%llu",(unsigned long long)cpus[8],(unsigned long long)encodeUnknown,(unsigned long long)gpuUnavailable);
+  if(systemTranslationPolicy().overlap)fprintf(out," overlap_depth=%.0f/%.0f completion_ms=%.3f/%.3f",double(percentile(&FrameSample::inflight,50)),double(percentile(&FrameSample::inflight,90)),p(&FrameSample::completionLatency,50),p(&FrameSample::completionLatency,90));
+  fputc('\n',out);
   funlockfile(out);
   count=wallMax=draws=passes=encodeUnknown=gpuUnavailable=0;counts={};cpus.fill(0);
  }

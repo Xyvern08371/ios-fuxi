@@ -2,6 +2,9 @@
 #include <cassert>
 #include <cstdio>
 #include <map>
+#include <future>
+#include <atomic>
+#include <memory>
 static std::map<uintptr_t,unsigned> held;
 static unsigned locks,unlocks;
 static uintptr_t fail;
@@ -27,5 +30,15 @@ int main() {
  try {fuxi::SurfaceLease lease(true,lock,unlock,&poisoned);for(uintptr_t i=1;i<=257;i++)lease.add(i);assert(false);}
  catch(const std::runtime_error &){}
  for(auto pair:held)assert(!pair.second);
+ std::atomic<bool> poison{false};
+ auto first=std::make_unique<fuxi::SurfaceLease>(true,lock,unlock,&poison,true);first->add(1000);
+ std::promise<void> started;auto second=std::async(std::launch::async,[&]{started.set_value();fuxi::SurfaceLease next(true,lock,unlock,&poison,true);next.add(1000);});
+ started.get_future().wait();assert(second.wait_for(std::chrono::milliseconds(30))==std::future_status::timeout);
+ first.reset();second.get();assert(!held[1000]);
+ first=std::make_unique<fuxi::SurfaceLease>(true,lock,unlock,&poison,true);first->add(1001);
+ std::promise<void> waiting;auto refused=std::async(std::launch::async,[&]{waiting.set_value();bool failed=false;try{fuxi::SurfaceLease next(true,lock,unlock,&poison,true);next.add(1001);}catch(const std::runtime_error&){failed=true;}assert(failed);});
+ waiting.get_future().wait();assert(refused.wait_for(std::chrono::milliseconds(30))==std::future_status::timeout);
+ poison=true;first.reset();refused.get();assert(held[1001]);
+ puts("PASS: exclusive surface reuse waits for completion; poisoned waiter wakes without scanout handoff");
  puts("PASS: scanout opt-in parsing, per-submit deduplication, completion/rollback release, unknown-DMA retention, bounded leases");
 }

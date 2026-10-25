@@ -58,7 +58,7 @@ public:
  size_t resourceBytes() const{return limits.used;}
  ~Backend(){objects.clear([&](Pipeline *p){destroy(p);});}
  static inline bool modelTextures=false;
- static inline int live=0,submissions=0,constructed=0;bool poisoned=false;
+ static inline int live=0,submissions=0,constructed=0;std::atomic<bool> poisoned{false};
  explicit Backend(const char * ="unknown") {++constructed;}
  Buffer *allocate(size_t n) {
   if(!n || n>maxBufferLength)throw std::runtime_error("length");
@@ -100,7 +100,9 @@ public:
  bool destroy(Texture *t) {if(t){limits.release(t->charged);delete t;}return !poisoned;}
  void destroy(Pipeline *p) {if(p && !--p->references)delete p;}
  bool requiresSampling(const Pipeline *p) const {return p->sampled;}
- void submit(const std::vector<Operation>& ops,const std::function<void()> &scheduled={}) {
+ void submit(const std::vector<Operation>& ops,const std::function<void()> &scheduled={},std::function<void()> *retirement=nullptr,const std::function<void()> &prepare={}) {
+  if(prepare)prepare();
+  if(retirement){auto copy=ops;submit(copy,scheduled);*retirement=[this]{requireLive();};return;}
   if(getenv("FUXI_TEST_LOST")) {poisoned=true;throw std::runtime_error("modeled device loss");}
   if(getenv("FUXI_TEST_HANG"))for(;;)pause();
   if(ops.empty()){++emptySubmits;if(scheduled)scheduled();return;}
