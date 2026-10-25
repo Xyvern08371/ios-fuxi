@@ -943,12 +943,14 @@ public:
        if(!relative.empty())range.add(base+relative.first,base+relative.last);
       }
      }
+     bool sameImage=false,alias=false;
      for(unsigned k=0;k<op.colorCount;++k){auto c=op.color(k);auto *target=c.texture;if(!target)continue;
-      if(sample==target || sample->image==target->image){if(range.contains(c.level))unsafe=true;}
-      else if(sample->memory==target->memory || hostRangesOverlap(sample->mapped,sample->allocated,target->mapped,target->allocated))unsafe=true;
+      if(sample==target || sample->image==target->image){if(range.contains(c.level)){unsafe=true;sameImage=true;}}
+      else if(sample->memory==target->memory || hostRangesOverlap(sample->mapped,sample->allocated,target->mapped,target->allocated)){unsafe=true;alias=true;}
      }
      if(unsafe){
       auto reason="attachmentFeedback slot="+std::to_string(slot)+" view="+std::to_string(base)+"+"+std::to_string(count)+" possibleRead="+(range.empty()?std::string("none"):std::to_string(range.first)+".."+std::to_string(range.last));
+      if(sameImage && !alias && allowFeedbackDraw(reason.c_str())){generalSamples[n][slot]=true;continue;}
       if(skipSamplingDraw(reason.c_str())){skipDraw=true;break;}throw std::runtime_error("sampling reject "+reason);
      }
      // Keep the original Metal view and relative LOD/query semantics. GENERAL
@@ -1068,14 +1070,14 @@ public:
      uint32_t base=op.sampleBase[slot],count=op.sampleCount[slot]?op.sampleCount[slot]:t->levels-base;
      if(base>=t->levels || !count || count>t->levels-base)throw std::runtime_error("sample mip range");
      auto range=accessed[opIndex][slot];
-     for(uint32_t l=range.first;!range.empty() && l<=range.last;++l)if(!t->isDefined(l))throw std::runtime_error("undefined sampled mip");
+     for(uint32_t l=range.first;!range.empty() && l<=range.last;++l)if(!t->isDefined(l)){if(allowUndefinedRead())break;throw std::runtime_error("undefined sampled mip");}
      transition(t,generalSamples[opIndex][slot]?VK_IMAGE_LAYOUT_GENERAL:VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,base,count);
     }
     if(op.sourceTexture && !op.pipeline && !op.sourceTexture->isDefined(op.srcLevel))throw std::runtime_error("undefined source texture mip");
     if(op.sourceTexture && !op.pipeline)transition(op.sourceTexture,VK_IMAGE_LAYOUT_GENERAL,op.srcLevel,1);
     if(op.pipeline && op.sourceTexture && !op.samples[0]){
      auto *t=op.sourceTexture;auto range=accessed[opIndex][0];
-     for(uint32_t l=range.first;!range.empty() && l<=range.last;++l)if(!t->isDefined(l))throw std::runtime_error("undefined sampled mip");
+     for(uint32_t l=range.first;!range.empty() && l<=range.last;++l)if(!t->isDefined(l)){if(allowUndefinedRead())break;throw std::runtime_error("undefined sampled mip");}
      transition(t,generalSamples[opIndex][0]?VK_IMAGE_LAYOUT_GENERAL:VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,op.sampleBase[0],op.sampleCount[0]);
     }
     if(op.texture && !op.pipeline && !op.clearOnly)transition(op.texture,VK_IMAGE_LAYOUT_GENERAL,op.generateMips?op.mipBase:(!op.upload && !op.sourceTexture?op.srcLevel:op.dstLevel),op.generateMips?op.mipCount:1);

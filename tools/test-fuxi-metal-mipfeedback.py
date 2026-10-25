@@ -47,7 +47,7 @@ void main() {color=textureLod(image,vec2(0.5),constants.lod);}
         subprocess.run(flags+['-DFUXI_MTL_HOST_TEST', '-DFUXI_MTL_ICD="'+str(a.icd.resolve())+'"',
             '-DFUXI_MTL_TRANSLATOR="'+str(d/'bridge.so')+'"', '-I'+str(a.headers),
             str(ROOT/'tools/fuxi-metal/MipFeedbackTests.cpp'), '-ldl', '-pthread', '-o', str(test)], check=True)
-        for index, args in enumerate(('', 'fuxigpuskip=1', 'fuxigpuskip=1 fuxigpuskip=1', 'fuxigpuskip=bad')):
+        for index, args in enumerate(('', 'fuxigpuskip=1', 'fuxigpuskip=1 fuxigpuskip=1', 'fuxigpuskip=bad', 'fuxigpufeedback=1')):
             gate = d/('gate'+str(index))
             gate.mkdir(mode=0o700)
             p = subprocess.run([str(test)], env=dict(env, FUXI_MTL_TEST_BOOTARGS=args, CONTROL_GATE=str(gate)), capture_output=True, text=True, timeout=60)
@@ -57,7 +57,8 @@ void main() {color=textureLod(image,vec2(0.5),constants.lod);}
             assert ('sampling skip draw' in p.stderr) == (args == 'fuxigpuskip=1'), p.stderr
             if args == 'fuxigpuskip=1':
                 assert p.stderr.count('sampling skip draw') == 9 and 'count=16' in p.stderr and 'count=9' not in p.stderr, p.stderr
+            assert ('sampling allow feedback' in p.stderr) == (args == 'fuxigpufeedback=1'), p.stderr
             print(p.stdout, end='')
-        print('PASS: default unchanged; skip opt-in exact-token/duplicate/malformed policy, successful subsequent GPU draws')
+        print('PASS: default unchanged; feedback opt-in runs same-image draws; skip opt-in exact-token/duplicate/malformed policy, successful subsequent GPU draws')
 if __name__ == '__main__':
     main()

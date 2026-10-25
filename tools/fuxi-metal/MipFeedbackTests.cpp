@@ -21,10 +21,13 @@ int main(){
  // rejects before recording/submission; opt-in drops only this operation.
  setenv("CONTROL_LOD","1",1);auto before=b.submits.load();auto skipped=fuxi::skippedSamplingDraws.load();bool rejected=false;
  try{b.submit({op});}catch(const std::runtime_error &e){rejected=true;assert(std::string(e.what()).find("sampling reject attachmentFeedback")!=std::string::npos);}
- bool skip=fuxi::systemTranslationPolicy().skipSampling;assert(rejected==!skip && !b.poisoned && !fuxi::backboardGate.blocked());
- assert(fuxi::skippedSamplingDraws==skipped+(skip?1:0));if(!skip)assert(b.submits==before);
+ bool allow=fuxi::systemTranslationPolicy().allowFeedback,skip=!allow && fuxi::systemTranslationPolicy().skipSampling;
+ assert(rejected==!(skip||allow) && !b.poisoned && !fuxi::backboardGate.blocked());
+ assert(fuxi::skippedSamplingDraws==skipped+(skip?1:0));if(!skip && !allow)assert(b.submits==before);
+ // Feedback opt-in: the draw runs (the written texel's read is undefined) and the device stays live.
+ if(allow)assert(fuxi::allowedFeedbackDraws>=1 && b.submits==before+1);
  if(skip){std::vector<fuxi::Operation> refused(20,op);b.submit(refused);assert(fuxi::skippedSamplingDraws==skipped+21 && !fuxi::backboardGate.blocked());}
- pixels(1,skip?0:91);
+ if(!allow)pixels(1,skip?0:91);
  setenv("CONTROL_LOD","0",1);b.submit({op});setenv("CONTROL_LOD","1",1);
  // Upsample: original view still starts at zero. LOD 1 reads the preceding
  // downsample result while writing zero; no rebasing of explicit LOD is needed.
