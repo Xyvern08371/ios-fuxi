@@ -200,5 +200,18 @@ with tempfile.TemporaryDirectory() as root:
     except SystemExit:
         pass
 
+with tempfile.TemporaryDirectory() as root:
+    owner = (os.getuid(), os.getgid())
+    ax = os.path.join(root, 'private/var/mobile/Library/Preferences/com.apple.Accessibility.plist')
+    m.reduce_transparency(root, False, owner)                     # absent: no file created
+    assert not os.path.exists(ax)
+    m.reduce_transparency(root, True, owner)
+    assert plistlib.load(open(ax, 'rb')) == {'EnhancedBackgroundContrastEnabled': True}
+    assert os.stat(ax).st_mode & 0o777 == 0o600
+    d = plistlib.load(open(ax, 'rb')); d['Other'] = 1
+    plistlib.dump(d, open(ax, 'wb'), fmt=plistlib.FMT_BINARY)
+    m.reduce_transparency(root, False, owner)
+    assert plistlib.load(open(ax, 'rb')) == {'Other': 1}             # other keys kept
+
 print('PASS: cpbitmap trailer/length/pixels, legibility style, PNG decode, wallpaper files, colour wallpaper prefs, '
-      'staged apps install/undo, LaunchServices reset, oslog jobs')
+      'staged apps install/undo, LaunchServices reset, oslog jobs, reduce transparency')
