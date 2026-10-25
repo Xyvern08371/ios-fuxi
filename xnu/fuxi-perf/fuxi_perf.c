@@ -67,6 +67,10 @@ static int fp_rate_temp, fp_rate_valid, fp_rate;
 static unsigned fp_pressure_enabled;
 static int fp_pressure = -1; /* No fabricated nominal before the first sample. */
 static uint64_t fp_pressure_since, fp_pressure_dwell; /* fall hold, 10 s */
+/* Actual (LMh-limited) EPSS domain state +0x20, L x 19.2 MHz, sampled per
+ * worker tick. [0] while boosted, [1] otherwise; gold and prime only. */
+static uint64_t fp_cur_sum[2][2], fp_cur_n[2];
+static unsigned fp_cur_max[2][2];
 static unsigned fp_enabled, fp_started, fp_ready;
 static thread_call_data_t fp_call;
 /* Refusals are EBUSY, never EAGAIN: userland_sysctl() retries a handler's
@@ -607,12 +611,24 @@ static void fp_worker_locked(thread_call_param_t arg, thread_call_param_t result
   fp_duty_end[fp_duty_count++] = now;
  }
  fp_boosted = boost;
+ for (unsigned d = 1; d < 3; d++) {
+  uint32_t cur;
+  if (!fp_epss[d] || fp_domain_failed[d] || !fp_read(fp_epss[d],0x20,&cur)) continue;
+  unsigned mhz = (cur & 0xff)*192/10, b = boost ? 0 : 1;
+  fp_cur_sum[b][d-1] += mhz;
+  if (d == 1) fp_cur_n[b]++;
+  if (mhz > fp_cur_max[b][d-1]) fp_cur_max[b][d-1] = mhz;
+ }
  fp_last = now;
  if (!fp_window_start) fp_window_start = now;
  if (now-fp_window_start >= fp_window) {
   uint64_t ns, above_ns;
   absolutetime_to_nanoseconds(fp_boost_time,&ns);
   absolutetime_to_nanoseconds(fp_above_time,&above_ns);
+  for (unsigned b = 0; b < 2; b++) if (fp_cur_n[b])
+   printf("FUXI PERF: freq %s gold %llu/%u prime %llu/%u MHz avg/max samples %llu\n",
+       b ? "unboosted" : "boosted",fp_cur_sum[b][0]/fp_cur_n[b],fp_cur_max[b][0],
+       fp_cur_sum[b][1]/fp_cur_n[b],fp_cur_max[b][1],fp_cur_n[b]);
   if (!fp_idle_after) printf("FUXI PERF: stats boosts %llu boosted %llu ms max temp %d dC above %u dC %llu ms cuts %llu valid %d state %s\n",
       fp_boosts,ns/1000000,fp_max_temp,fp_hot,above_ns/1000000,fp_cuts,
       valid,fp_boosted ? "high" : "cool");
@@ -622,6 +638,11 @@ static void fp_worker_locked(thread_call_param_t arg, thread_call_param_t result
    printf("FUXI PERF: stats boosts %llu boosted %llu ms max temp %d dC above %u dC %llu ms cuts %llu valid %d state %s idle %llu ms entries %llu\n",
        fp_boosts,ns/1000000,fp_max_temp,fp_hot,above_ns/1000000,fp_cuts,
        valid,idle ? "idle" : fp_boosted ? "high" : "cool",idle_ns/1000000,fp_idle_entries);
+  }
+  for (unsigned b = 0; b < 2; b++) {
+   fp_cur_n[b] = 0;
+   fp_cur_sum[b][0] = fp_cur_sum[b][1] = 0;
+   fp_cur_max[b][0] = fp_cur_max[b][1] = 0;
   }
   fp_idle_time = fp_idle_entries = 0;
   fp_boosts = fp_boost_time = fp_above_time = fp_cuts = 0;
