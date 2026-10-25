@@ -780,3 +780,86 @@ then off for latency. Include `relock_ms`, remaining Vulkan waits, integrity
 rejections, size traces and peak RSS. New translations still lower shaders and
 create Vulkan pipelines synchronously; this change does not make those stalls
 disappear.
+
+## Mip feedback passes (Spotlight blur)
+
+**OBSERVED (supplied device evidence):** two boots with the same scripted
+Spotlight gesture reached a BGRA8Unorm, 2D, 704×96 texture with ten mip levels,
+usage `0x5`. Color attachment zero wrote level 1 over 352×48, load 2/store 1;
+the fragment binding was the same texture with view base 0/count 10. The
+bind-time `sampling reject attachmentFeedback` immediately preceded the
+persisted backboardd runtime-failure/CPU-respawn gate. The supplied session
+measurements then showed roughly 20 fps and all five fast cores around 50%
+user time. This establishes the rejection and fallback sequence; the descriptor
+log alone does **not** establish the shader's LOD or sampler clamps.
+
+**Implemented:** feedback validation runs against the final translated runtime
+variant and draw bindings, after samplers and constants are available. The
+original host-owned `MipAccess.hpp` examines both stages' SPIR-V image accesses,
+matches descriptor set/binding to Metal texture/sampler slots, and conservatively
+unions possible mip levels. Nonmip samplers read view-relative level zero;
+mipmapped samplers bound implicit or unknown LODs with their min/max clamps.
+Plain explicit LODs can be narrowed from scalar constants, immutable uniform
+buffer/push bytes, constant-index access chains, scalar copies and simple vector
+component extraction. Linear/nearest filtering conservatively includes both
+neighboring integer levels. The original Metal view base is added exactly once.
+Reads of GPU-written uniform bytes are not inferred from stale host data.
+
+Unknown provenance, unsupported image operations (including fetches that bypass
+sampler clamps), arithmetic, dynamic indexing and unrecognized LOD expressions
+widen the range; they never infer `L-1` from the destination level or a blur
+function name. Any resulting range containing an attached mip is refused.
+Different images sharing memory/host ranges and equal IOSurface identities
+remain refused. The supported texture model has one slice; array/slice support
+is not added by this change. Multiple color attachments are checked individually.
+
+**Views and layouts:** retain the original Metal view's Vulkan base/count. For a
+view overlapping an attachment but with proven disjoint **accesses**, bind that
+view in `GENERAL`, and use `GENERAL` for the attachment inside the subpass too.
+This deliberately keeps the full view instead of rebasing an upsample view:
+explicit LODs, implicit derivatives, dimensions and level queries retain their
+existing meaning, including nonzero-base Metal views. There is no sampler bias
+or SPIR-V rewrite. Other views of that image are promoted to `GENERAL` when
+needed so their descriptor layouts agree. An already disjoint Metal view uses
+`SHADER_READ_ONLY_OPTIMAL` on its sampled levels and `GENERAL` on the attached
+level. Layout state and barriers are tracked separately for each mip, including
+source/destination transfers, mip generation and pre-submit rollback. Level-zero
+`layout` remains available to existing import/completion code. `GENERAL` is not
+permission for same-level feedback; the access proof is still required.
+
+**Opt-in gate policy:** `fuxigpuskip=1` omits an unsupported attachment-feedback
+shader draw, preserving its pass load/store actions and subsequent command work.
+It covers same-IOSurface refusals in the frontend and unproven/overlapping mip
+ranges or image aliases in the backend. It does not suppress resource, shader,
+Vulkan, device-loss or fence failures. Default behavior still fails through the
+existing gate. Duplicate, malformed and zero-valued keys disable skipping.
+Skips increment `skippedSamplingDraws` (also exported as
+`fuxi_metal_sampling_skipped_draws`); logs show the first eight and then powers of
+two. The periodic backboardd report includes `sampling_skipped`.
+
+**OBSERVED (host verification):** `test-fuxi-metal-mipfeedback.py` exercises the
+production backend with authored GLSL on software Vulkan under ASan/UBSan. The
+exact reported texture/pass shape reads level zero while writing level one;
+pixels, full-view upsampling, rebased views, same-level refusal, active gate
+survival with skipping, exact-token policy, mixed per-mip layouts/barrier order
+and recording-failure rollback are checked. `MipAccessTests.cpp` covers constant,
+uniform and push LODs, unknown/fetch refusal and range unions. The M9k suite also
+exercises the exact pass shape through the separately built AIR translator with
+this tree's authored AIR, including same-level refusal and rebased upsampling.
+The backend fill/copy and injected fence/device-loss/corruption controls, plus
+M9o authored line/shadow/trace regression controls, also passed. The skip test
+checks cumulative counts and the first-eight/powers-of-two log limit.
+Linux runs the frontend suite's portable policy/state controls; the native
+`MipFrontendTests.mm` additions (encoding the reported descriptor and same-
+IOSurface default/skip behavior) require Mac Foundation/Metal/IOSurface. The
+native frontend, defaults and Metal-SDK fixture suites require a Mac and their
+existing build outputs.
+
+**GUESS / unverified:** the private CA downsample reads `L-1`, and its upsample
+reads `L+1`. The shader/sampler data needed to prove those specific accesses was
+not supplied. These host controls establish supported access patterns, not that
+every private blur shader is recognized by the conservative interpreter. Device
+Turnip (`TU_DEBUG=sysmem,nocb`), actual Spotlight/Control Center/notification
+pixels, performance, compiler floating-point behavior and continued GPU rendering
+after blur remain unverified. Software Vulkan success is not an on-device result;
+Vulkan validation-layer coverage was unavailable in this host environment.

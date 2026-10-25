@@ -19,6 +19,8 @@
 #include "ClientSetup.hpp"
 #include "DrawSafety.hpp"
 #include "TextureLevels.hpp"
+#include "MipAccess.hpp"
+#include "SamplingPolicy.hpp"
 #include "PixelFormats.hpp"
 #include "ObjectCache.hpp"
 #include <functional>
@@ -69,11 +71,12 @@ inline void importCheck(VkResult r,int line=__builtin_LINE()) {
 struct Buffer { VkBuffer buffer{}; VkDeviceMemory memory{}; void *contents{}; size_t length{}, allocated{},charged{},memoryBytes{},references=1;uint32_t memoryType{};bool imported=false; };
 struct Texture : TextureLevels {VkImage image{};VkDeviceMemory memory{};VkImageView view{};size_t allocated{},charged{},memoryBytes{};
  uint32_t memoryType{};VkImageUsageFlags usage{};uint32_t format=80;VkFormat vkFormat=VK_FORMAT_B8G8R8A8_UNORM;
- VkImageTiling tiling=VK_IMAGE_TILING_OPTIMAL;VkImageLayout layout=VK_IMAGE_LAYOUT_UNDEFINED;void *mapped{};bool imported=false,borrowedMemory=false;
+ // layout is level zero; levelLayouts[1..levels) track the remaining mips.
+ VkImageTiling tiling=VK_IMAGE_TILING_OPTIMAL;VkImageLayout layout=VK_IMAGE_LAYOUT_UNDEFINED;std::array<VkImageLayout,32> levelLayouts{};void *mapped{};bool imported=false,borrowedMemory=false;
  Buffer *backingBuffer{};size_t backingOffset{},backingRow{};bool shadow=false;
  std::vector<VkImageView> attachmentViews;bool canGenerate=false,filterable=true;};
 struct Sampler {VkSampler sampler{};uint32_t filters=1;float lodMin=0,lodMax=0;};
-struct Pipeline {std::array<uint32_t,resourceSlots> textureTypes{};size_t references=1,retainedBytes=0;void *translation{};CompileOptions options{};uint32_t fetchMask{};bool orderedColorAccess=false;std::vector<std::pair<uint32_t,VkRenderPass>> renders;VkPipeline pipeline{},stripPipeline{};std::array<VkPipeline,2> linePipelines{};Translation recipe{};VkPipelineLayout layout{};VkRenderPass render{};uint32_t pushOffset{},pushSize{},pushStages{};uint8_t pushBytes[128]{};VkDescriptorSetLayout setLayout{};VkSampler bakedSamplers[16]{};std::vector<Descriptor> descriptors;std::vector<Buffer *> constantBlobs;std::vector<std::array<uint8_t,32>> blobHashes;std::vector<std::pair<std::string,Pipeline *>> variants;};
+struct Pipeline {std::array<uint32_t,resourceSlots> textureTypes{};size_t references=1,retainedBytes=0;void *translation{};CompileOptions options{};uint32_t fetchMask{};bool orderedColorAccess=false;std::vector<std::pair<uint32_t,VkRenderPass>> renders;VkPipeline pipeline{},stripPipeline{};std::array<VkPipeline,2> linePipelines{};Translation recipe{};VkPipelineLayout layout{};VkRenderPass render{};uint32_t pushOffset{},pushSize{},pushStages{};uint8_t pushBytes[128]{};VkDescriptorSetLayout setLayout{};VkSampler bakedSamplers[16]{};BakedSampler bakedSamplerInfo[16]{};MipAccess mipAccess[2];std::vector<Descriptor> descriptors;std::vector<Buffer *> constantBlobs;std::vector<std::array<uint8_t,32>> blobHashes;std::vector<std::pair<std::string,Pipeline *>> variants;};
 struct BufferBind {Buffer *buffer{};uint64_t offset{};bool bytes=false;};
 struct ColorTarget {Texture *texture{};uint32_t level{},load=2,store=1;float clear[4]{};};
 struct Operation {
@@ -178,6 +181,9 @@ public:
 #ifdef FUXI_MTL_HOST_TEST
  // Test-only reference mode and deterministic recording failure; no production environment switches.
  bool reuseSubmitObjects=true,failBeforeQueue=false,failQueueAttempt=false;
+ struct ImageTransition {Texture *texture;uint32_t level;VkImageLayout before,after;};
+ struct SampleViewUse {Texture *texture;uint32_t base,count;VkImageLayout layout;};
+ std::vector<ImageTransition> imageTransitions;std::vector<SampleViewUse> sampleViewUses;
  size_t cachedFrames() const{return frameCache.size();}
  size_t cachedViews() const{return viewCache.size();}
  void dropPipelineCacheForTest(){std::lock_guard<std::mutex> guard(mutex);requireLive();objects.clear([&](Pipeline *p){destroyPipelineUnlocked(p);});}
@@ -622,7 +628,7 @@ public:
    a.storeOp=c.store?VK_ATTACHMENT_STORE_OP_STORE:VK_ATTACHMENT_STORE_OP_DONT_CARE;
    a.stencilLoadOp=VK_ATTACHMENT_LOAD_OP_DONT_CARE;a.stencilStoreOp=VK_ATTACHMENT_STORE_OP_DONT_CARE;
    a.initialLayout=a.finalLayout=VK_IMAGE_LAYOUT_GENERAL;
-   refs[i]={used++,orderedColorAccess?VK_IMAGE_LAYOUT_GENERAL:VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+   refs[i]={used++,VK_IMAGE_LAYOUT_GENERAL};
   }
   VkSubpassDescription sub{};sub.pipelineBindPoint=VK_PIPELINE_BIND_POINT_GRAPHICS;sub.colorAttachmentCount=count;sub.pColorAttachments=refs;
   if(orderedColorAccess){sub.flags=VK_SUBPASS_DESCRIPTION_RASTERIZATION_ORDER_ATTACHMENT_COLOR_ACCESS_BIT_EXT;sub.inputAttachmentCount=count;sub.pInputAttachments=refs;}
@@ -676,6 +682,7 @@ public:
     if(d.binding>=16)throw std::runtime_error("descriptor binding limit");
     BakedSampler baked{};char why[256]{};
     if(!tr.sampler(translated.handle,d.binding,&baked,why,sizeof(why)))throw std::runtime_error(why);
+    p->bakedSamplerInfo[d.binding]=baked;
     if(baked.enabled){VkSamplerCreateInfo si{};si.sType=VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
      si.magFilter=(VkFilter)baked.mag;si.minFilter=(VkFilter)baked.min;si.mipmapMode=(VkSamplerMipmapMode)baked.mip;
      si.addressModeU=(VkSamplerAddressMode)baked.address[0];si.addressModeV=(VkSamplerAddressMode)baked.address[1];si.addressModeW=(VkSamplerAddressMode)baked.address[2];
@@ -690,6 +697,8 @@ public:
    }
    VkPipelineLayoutCreateInfo li{};li.setLayoutCount=p->setLayout?1:0;li.pSetLayouts=&p->setLayout;li.sType=VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;li.pushConstantRangeCount=translated.rangeCount;li.pPushConstantRanges=ranges;check(CreatePipelineLayout(device,&li,nullptr,&p->layout));
    p->recipe=translated;
+   p->mipAccess[0]=MipAccess(translated.vertex,translated.vertexCount);p->mipAccess[1]=MipAccess(translated.fragment,translated.fragmentCount);
+   p->retainedBytes+=p->mipAccess[0].retainedBytes()+p->mipAccess[1].retainedBytes();
    auto began=std::chrono::steady_clock::now();
    try {
     p->pipeline=buildTopologyPipeline(p,Topology::Triangle);
@@ -774,6 +783,9 @@ public:
   auto submitStart=std::chrono::steady_clock::now();auto submitQueued=submitStart,submitDone=submitStart;
   auto since=[](std::chrono::steady_clock::time_point t){return (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-t).count();};
   std::lock_guard<std::mutex> guard(mutex);requireLive();
+#ifdef FUXI_MTL_HOST_TEST
+  imageTransitions.clear();sampleViewUses.clear();
+#endif
   auto locked=currentFrame?FrameClock::now():FrameClock::time_point{};if(currentFrame)currentFrame->leaseLock+=uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(locked-submitStart).count());
   CacheActivity activity{cacheMode==CacheMode::persistent?&cacheActivity:nullptr};
   ArtifactCache::Access artifactAccess(artifactCache);
@@ -789,7 +801,7 @@ public:
   // Empty completion participates in the same lock/order, but creates no BO or GPU fence.
   if(ops.empty()){if(currentFrame)currentFrame->backendSubmit+=frameNanos(locked);++emptySubmits;if(scheduled)scheduled();return;}
   bool submitted=false,completed=false;std::vector<VkImageView> sampleViews;std::vector<VkFramebuffer> frames;std::vector<VkRenderPass> emptyRenders;std::vector<Texture *> textures;
-  struct TextureState {Texture *texture;VkImageLayout layout;bool defined;uint32_t definedLevels;};std::vector<TextureState> oldTextures;
+  struct TextureState {Texture *texture;VkImageLayout layout;std::array<VkImageLayout,32> levelLayouts;bool defined;uint32_t definedLevels;};std::vector<TextureState> oldTextures;
   size_t diagnosticOp=0;Buffer *neutralBuffer=nullptr,*aliasBuffer=nullptr;size_t aliasBytes=0;
   std::vector<bool> aliasCopies(ops.size(),false);
   auto cleanup=[&] {if(aliasBuffer!=aliasScratch)destroyUnlocked(aliasBuffer);destroyUnlocked(neutralBuffer);for(auto v:sampleViews)DestroyImageView(device,v,nullptr);for(auto frame:frames)DestroyFramebuffer(device,frame,nullptr);for(auto render:emptyRenders)DestroyRenderPass(device,render,nullptr);};
@@ -798,6 +810,8 @@ public:
   struct Measure {uint64_t &total;std::chrono::steady_clock::time_point start=std::chrono::steady_clock::now();~Measure(){total+=(uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-start).count();}};
   try {
    std::vector<DrawOutput> draws(ops.size());
+   std::vector<std::array<MipRange,resourceSlots>> accessed(ops.size());
+   std::vector<std::array<bool,resourceSlots>> generalSamples(ops.size());
    std::vector<Buffer *> buffers;
    auto addBuffer=[&](Buffer *b){if(b && std::find(buffers.begin(),buffers.end(),b)==buffers.end())buffers.push_back(b);};
    auto addTexture=[&](Texture *t){if(t && std::find(textures.begin(),textures.end(),t)==textures.end())textures.push_back(t);if(t && t->backingBuffer)addBuffer(t->backingBuffer);};
@@ -840,8 +854,6 @@ public:
       if(op.pipeline && op.pipeline->options.color(i).blend){VkFormatProperties props{};GetPhysicalDeviceFormatProperties(physical,t->vkFormat,&props);auto features=t->tiling==VK_IMAGE_TILING_LINEAR?props.linearTilingFeatures:props.optimalTilingFeatures;if(!(features&VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT))throw std::runtime_error("attachment blending unavailable");}
       for(unsigned j=0;j<i;++j){auto other=op.color(j);if(!other.texture)continue;if(t->memory==other.texture->memory || hostRangesOverlap(t->mapped,t->allocated,other.texture->mapped,other.texture->allocated))throw std::runtime_error("render attachment alias");}
       for(unsigned stage=0;stage<2;++stage)for(auto binding:op.buffers[stage])if(binding.buffer && (binding.buffer->memory==t->memory || hostRangesOverlap(binding.buffer->contents,binding.buffer->length,t->mapped,t->allocated)))throw std::runtime_error("attachment/buffer feedback");
-      for(unsigned slot=0;slot<resourceSlots;++slot){auto *sample=op.samples[slot];if(!slot && !sample)sample=op.sourceTexture;
-       if(sample && (sample->memory==t->memory || hostRangesOverlap(sample->mapped,sample->allocated,t->mapped,t->allocated)))throw std::runtime_error("attachment feedback");}
      }
     }
     if(op.clearOnly && (!op.texture || op.pipeline || op.load>2 || op.store>1))throw std::runtime_error("invalid empty render pass");
@@ -860,7 +872,7 @@ public:
      if(t){if(op.pipeline->textureTypes[i]!=UINT32_MAX && op.pipeline->textureTypes[i]!=t->textureType)throw std::runtime_error("sampled texture dimension mismatch or old bridge adapter");
       uint32_t base=op.sampleBase[i],count=op.sampleCount[i]?op.sampleCount[i]:t->levels-base;
       if(base>=t->levels || !count || count>t->levels-base)throw std::runtime_error("sample mip range");
-      if(t==op.texture || (t->memory==op.texture->memory || hostRangesOverlap(t->mapped,t->allocated,op.texture->mapped,op.texture->allocated)))throw std::runtime_error("attachment feedback");addTexture(t);input.formats[i]=t->format;}
+      addTexture(t);input.formats[i]=t->format;}
      if(t && sam && !t->filterable && (sam->filters&(2u|4u|16u)))throw std::runtime_error("texture format linear filtering unavailable");
      if(sam){input.filters[i]=sam->filters;input.lodMin[i]=sam->lodMin;input.lodMax[i]=sam->lodMax;}
     }
@@ -877,6 +889,72 @@ public:
       auto *pipeline=createPipeline(variant,original->options);try{original->variants.push_back({key,pipeline});}catch(...){destroyPipelineUnlocked(pipeline);throw;}original->retainedBytes+=pipeline->retainedBytes;objects.reweigh(original,original->retainedBytes,[&](Pipeline *old){destroyPipelineUnlocked(old);});op.pipeline=pipeline;
      }
      if(!translator.draw(op.pipeline->translation,&input,&draws[n],why,sizeof(why)))throw std::runtime_error(why);
+    }
+    // Analyze the final runtime variant and this draw's descriptors, not the
+    // baseline shader or the order in which Metal bindings were set.
+    auto &plan=draws[n];bool skipDraw=false;
+    for(unsigned slot=0;slot<resourceSlots;++slot){auto *sample=op.samples[slot];if(!slot && !sample)sample=op.sourceTexture;if(!sample)continue;
+     auto base=op.sampleBase[slot],count=op.sampleCount[slot]?op.sampleCount[slot]:sample->levels-base;
+     bool aliases=false,viewOverlap=false;for(unsigned k=0;k<op.colorCount;++k){auto *target=op.color(k).texture;if(target && (sample==target || sample->image==target->image || sample->memory==target->memory || hostRangesOverlap(sample->mapped,sample->allocated,target->mapped,target->allocated))){aliases=true;auto l=op.color(k).level;if(l>=base && l-base<count)viewOverlap=true;}}
+     auto &range=accessed[n][slot];
+     // Nonalias draws retain their established conservative definition checks.
+     if(!aliases){range.add(base,base+count-1);continue;}
+     bool unsafe=false;
+     for(unsigned stage=0;stage<2;++stage){auto stages=stage?16u:1u;
+      auto sampler=[&](uint32_t binding)->MipSampler {
+       for(unsigned j=0;j<plan.descriptorCount;++j){auto &d=plan.descriptors[j];if(d.binding!=binding || !(d.stages&stages))continue;
+        if(d.sampler==UINT32_MAX){if(binding>=16)return {};auto b=op.pipeline->bakedSamplerInfo[binding];return {bool(b.enabled),b.mip?2u:1u,b.minLod,b.maxLod};}
+        auto index=d.sampler;
+        if(index>=resourceSlots)return {};auto *s=index==0 && !op.samplers[0]?op.sampler:op.samplers[index];
+        if(s)return {true,(s->filters>>3)&3,s->lodMin,s->lodMax};
+       }return {};
+      };
+      auto read=[&](uint32_t binding,uint64_t offset,uint32_t &bits,bool push){
+       if(push){for(unsigned j=0;j<plan.pushCount;++j){auto &p=plan.pushes[j];if((p.stages&stages) && offset>=p.offset && offset-p.offset<=p.size && p.size-(offset-p.offset)>=4){memcpy(&bits,p.bytes+offset-p.offset,4);return true;}}return false;}
+       for(unsigned j=0;j<plan.descriptorCount;++j){auto &d=plan.descriptors[j];if(d.binding!=binding || !(d.stages&stages) || d.type!=VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER || offset>d.range || d.range-offset<4)continue;
+        if(d.source==2){bits=0;return true;}
+        Buffer *b=nullptr;if(d.source==1){if(d.slot<op.pipeline->constantBlobs.size())b=op.pipeline->constantBlobs[d.slot];}
+        else if(d.slot<resourceSlots)b=op.buffers[stage][d.slot].buffer;
+        if(!b || d.offset>b->length || offset>b->length-d.offset || b->length-d.offset-offset<4)return false;
+        for(size_t previous=0;previous<n;++previous)if(auto *written=ops[previous].dst)if(written->memory==b->memory || hostRangesOverlap(written->contents,written->length,b->contents,b->length))return false;
+        // A preceding storage-buffer shader may have changed these bytes.
+        // Descriptor reflection does not prove read-only storage accesses.
+        for(size_t previous=0;previous<n;++previous)if(ops[previous].pipeline)for(unsigned q=0;q<draws[previous].descriptorCount;++q){auto &written=draws[previous].descriptors[q];
+         if(written.source || written.type!=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER || written.slot>=resourceSlots)continue;
+         for(unsigned ws=0;ws<2;++ws)if(written.stages&(ws?16u:1u))if(auto *other=ops[previous].buffers[ws][written.slot].buffer)if(other->memory==b->memory || hostRangesOverlap(other->contents,other->length,b->contents,b->length))return false;
+        }
+        memcpy(&bits,(uint8_t *)b->contents+d.offset+offset,4);return true;
+       }return false;
+      };
+      for(unsigned j=0;j<plan.descriptorCount;++j){auto &d=plan.descriptors[j];if(d.source || d.slot!=slot || !(d.stages&stages) || (d.type!=VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE && d.type!=VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER))continue;
+       auto relative=op.pipeline->mipAccess[stage].range(d.binding,count,sampler,read);
+       if(!relative.empty())range.add(base+relative.first,base+relative.last);
+      }
+     }
+     for(unsigned k=0;k<op.colorCount;++k){auto c=op.color(k);auto *target=c.texture;if(!target)continue;
+      if(sample==target || sample->image==target->image){if(range.contains(c.level))unsafe=true;}
+      else if(sample->memory==target->memory || hostRangesOverlap(sample->mapped,sample->allocated,target->mapped,target->allocated))unsafe=true;
+     }
+     if(unsafe){
+      auto reason="attachmentFeedback slot="+std::to_string(slot)+" view="+std::to_string(base)+"+"+std::to_string(count)+" possibleRead="+(range.empty()?std::string("none"):std::to_string(range.first)+".."+std::to_string(range.last));
+      if(skipSamplingDraw(reason.c_str())){skipDraw=true;break;}throw std::runtime_error("sampling reject "+reason);
+     }
+     // Keep the original Metal view and relative LOD/query semantics. GENERAL
+     // covers its complete descriptor range, including the disjoint attachment.
+     generalSamples[n][slot]=viewOverlap;
+    }
+    if(skipDraw){
+     // Omit the shader draw, but preserve Metal's pass load/store actions so
+     // later draws in this encoder can still load the attachment normally.
+     op.pipeline=nullptr;op.renderDraw=false;op.clearOnly=true;op.sourceTexture=nullptr;
+     std::fill(std::begin(op.samples),std::end(op.samples),nullptr);draws[n]={};
+     generalSamples[n]={};continue;
+    }
+    // A descriptor layout covers its entire view, even mips it does not read.
+    // Promote other views of this image too so descriptors cannot disagree.
+    for(unsigned i=0;i<resourceSlots;++i)if(generalSamples[n][i]){
+     auto *image=op.samples[i];if(!i && !image)image=op.sourceTexture;
+     for(unsigned j=0;j<resourceSlots;++j){auto *other=op.samples[j];if(!j && !other)other=op.sourceTexture;if(other && other->image==image->image)generalSamples[n][j]=true;}
     }
     topologyPipeline(op.pipeline,op.topology);
     for(auto *blob:op.pipeline->constantBlobs)addBuffer(blob);
@@ -909,7 +987,7 @@ public:
     addBuffer(aliasBuffer);
    }
    if(neutralSize){Measure measure{objectNanos};neutralBuffer=allocateUnlocked(neutralSize);addBuffer(neutralBuffer);}
-   for(auto *t:textures)oldTextures.push_back({t,t->layout,t->defined,t->definedLevels});
+   for(auto *t:textures)oldTextures.push_back({t,t->layout,t->levelLayouts,t->defined,t->definedLevels});
    auto flushStart=std::chrono::steady_clock::now();
    // Direct shared host writes are not tracked. Only Vulkan HOST_COHERENT permits omission.
    for(auto *t:textures)if(t->mapped && !coherent(t->memoryType)) {VkMappedMemoryRange r{};r.sType=VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;r.memory=t->memory;r.size=VK_WHOLE_SIZE;++flushCalls;check(FlushMappedMemoryRanges(device,1,&r));}
@@ -930,12 +1008,18 @@ public:
    if(timestamps){CmdResetQueryPool(cmd,timestamps,0,2);CmdWriteTimestamp(cmd,VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,timestamps,0);}
    VkMemoryBarrier barrier{};barrier.sType=VK_STRUCTURE_TYPE_MEMORY_BARRIER;barrier.srcAccessMask=VK_ACCESS_HOST_WRITE_BIT;barrier.dstAccessMask=VK_ACCESS_MEMORY_READ_BIT|VK_ACCESS_MEMORY_WRITE_BIT;
    CmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_HOST_BIT,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,0,1,&barrier,0,nullptr,0,nullptr);
-   auto transition=[&](Texture *t,VkImageLayout next) {
-    VkImageMemoryBarrier ib{};ib.sType=VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;ib.oldLayout=t->layout;ib.newLayout=next;
-    ib.srcAccessMask=t->layout==VK_IMAGE_LAYOUT_UNDEFINED?0:VK_ACCESS_MEMORY_WRITE_BIT|VK_ACCESS_HOST_WRITE_BIT;
-    ib.dstAccessMask=VK_ACCESS_MEMORY_READ_BIT|VK_ACCESS_MEMORY_WRITE_BIT;ib.srcQueueFamilyIndex=ib.dstQueueFamilyIndex=VK_QUEUE_FAMILY_IGNORED;
-    ib.image=t->image;ib.subresourceRange={VK_IMAGE_ASPECT_COLOR_BIT,0,t->levels,0,1};
-    CmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT|VK_PIPELINE_STAGE_HOST_BIT,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,0,0,nullptr,0,nullptr,1,&ib);t->layout=next;
+   auto transition=[&](Texture *t,VkImageLayout next,uint32_t base=0,uint32_t count=0) {
+    if(!count)count=t->levels-base;
+    for(uint32_t l=base;l<base+count;++l){auto &layout=l?t->levelLayouts[l]:t->layout;
+     VkImageMemoryBarrier ib{};ib.sType=VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;ib.oldLayout=layout;ib.newLayout=next;
+     ib.srcAccessMask=layout==VK_IMAGE_LAYOUT_UNDEFINED?0:VK_ACCESS_MEMORY_READ_BIT|VK_ACCESS_MEMORY_WRITE_BIT|VK_ACCESS_HOST_WRITE_BIT;
+     ib.dstAccessMask=VK_ACCESS_MEMORY_READ_BIT|VK_ACCESS_MEMORY_WRITE_BIT;ib.srcQueueFamilyIndex=ib.dstQueueFamilyIndex=VK_QUEUE_FAMILY_IGNORED;
+     ib.image=t->image;ib.subresourceRange={VK_IMAGE_ASPECT_COLOR_BIT,l,1,0,1};
+#ifdef FUXI_MTL_HOST_TEST
+     imageTransitions.push_back({t,l,layout,next});
+#endif
+     CmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT|VK_PIPELINE_STAGE_HOST_BIT,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,0,0,nullptr,0,nullptr,1,&ib);layout=next;
+    }
    };
    // Bound each descriptor type and sets independently; grow geometrically, retain one pool.
    VkDescriptorPool submitPool{};
@@ -971,13 +1055,19 @@ public:
     for(unsigned slot=0;slot<resourceSlots;++slot)if(auto *t=op.samples[slot]){
      uint32_t base=op.sampleBase[slot],count=op.sampleCount[slot]?op.sampleCount[slot]:t->levels-base;
      if(base>=t->levels || !count || count>t->levels-base)throw std::runtime_error("sample mip range");
-     for(uint32_t l=base;l<base+count;++l)if(!t->isDefined(l))throw std::runtime_error("undefined sampled mip");
-     transition(t,VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+     auto range=accessed[opIndex][slot];
+     for(uint32_t l=range.first;!range.empty() && l<=range.last;++l)if(!t->isDefined(l))throw std::runtime_error("undefined sampled mip");
+     transition(t,generalSamples[opIndex][slot]?VK_IMAGE_LAYOUT_GENERAL:VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,base,count);
     }
-    if(op.sourceTexture && !op.sourceTexture->isDefined(op.srcLevel))throw std::runtime_error("undefined source texture mip");
-    if(op.sourceTexture)transition(op.sourceTexture,op.pipeline?VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL:VK_IMAGE_LAYOUT_GENERAL);
-    if(op.texture)transition(op.texture,VK_IMAGE_LAYOUT_GENERAL);
-    if(op.pipeline || op.clearOnly)for(unsigned i=0;i<op.colorCount;++i)if(auto *target=op.color(i).texture)if(target!=op.texture)transition(target,VK_IMAGE_LAYOUT_GENERAL);
+    if(op.sourceTexture && !op.pipeline && !op.sourceTexture->isDefined(op.srcLevel))throw std::runtime_error("undefined source texture mip");
+    if(op.sourceTexture && !op.pipeline)transition(op.sourceTexture,VK_IMAGE_LAYOUT_GENERAL,op.srcLevel,1);
+    if(op.pipeline && op.sourceTexture && !op.samples[0]){
+     auto *t=op.sourceTexture;auto range=accessed[opIndex][0];
+     for(uint32_t l=range.first;!range.empty() && l<=range.last;++l)if(!t->isDefined(l))throw std::runtime_error("undefined sampled mip");
+     transition(t,generalSamples[opIndex][0]?VK_IMAGE_LAYOUT_GENERAL:VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,op.sampleBase[0],op.sampleCount[0]);
+    }
+    if(op.texture && !op.pipeline && !op.clearOnly)transition(op.texture,VK_IMAGE_LAYOUT_GENERAL,op.generateMips?op.mipBase:(!op.upload && !op.sourceTexture?op.srcLevel:op.dstLevel),op.generateMips?op.mipCount:1);
+    if(op.pipeline || op.clearOnly)for(unsigned i=0;i<op.colorCount;++i){auto c=op.color(i);if(c.texture)transition(c.texture,VK_IMAGE_LAYOUT_GENERAL,c.level,1);}
     if(op.generateMips){auto *t=op.texture;
      if(!t->isDefined(op.mipBase))throw std::runtime_error("undefined mip generation source");
      for(uint32_t l=op.mipBase+1;l<op.mipBase+op.mipCount;++l){
@@ -1035,7 +1125,10 @@ public:
          if(found!=viewCache.end())view=found->view;
          else {check(CreateImageView(device,&vi,nullptr,&view));++reuseCounts.views;++submitObjectCreates;++submitViewCreates;
           try {if(viewCache.size()<viewCacheLimit)viewCache.push_back({t,vi.format,components,base,count,view});else sampleViews.push_back(view);}catch(...){DestroyImageView(device,view,nullptr);throw;}}
-        }image={d.type==VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER && sam?sam->sampler:VK_NULL_HANDLE,view,VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};write.pImageInfo=&image;
+         }image={d.type==VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER && sam?sam->sampler:VK_NULL_HANDLE,view,generalSamples[opIndex][d.slot]?VK_IMAGE_LAYOUT_GENERAL:VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};write.pImageInfo=&image;
+#ifdef FUXI_MTL_HOST_TEST
+        sampleViewUses.push_back({t,base,count,image.imageLayout});
+#endif
        }else {auto b=op.buffers[d.stages==1?0:1][d.slot];if(!b.buffer || !d.range || d.offset>((b.buffer->length+15)&~size_t(15)) || d.range>((b.buffer->length+15)&~size_t(15))-d.offset)throw std::runtime_error("planned buffer range mismatch");buffer={b.buffer->buffer,d.offset,d.range};write.pBufferInfo=&buffer;}
        {Measure measure{descriptorNanos};UpdateDescriptorSets(device,1,&write,0,nullptr);}
       }CmdBindDescriptorSets(cmd,VK_PIPELINE_BIND_POINT_GRAPHICS,op.pipeline->layout,0,1,&set,0,nullptr);
@@ -1140,7 +1233,7 @@ public:
    if(!reuseSubmitObjects){clearSubmitObjects();clearFrames();clearViews();}
 #endif
    ++submits;submitRetireNanos+=since(submitDone);
-  } catch(...) {if(submitted) poisoned=true;else {if(!completed)for(auto old:oldTextures){old.texture->layout=old.layout;old.texture->defined=old.defined;old.texture->definedLevels=old.definedLevels;}clearSubmitObjects();cleanup();}
+  } catch(...) {if(submitted) poisoned=true;else {if(!completed)for(auto old:oldTextures){old.texture->layout=old.layout;old.texture->levelLayouts=old.levelLayouts;old.texture->defined=old.defined;old.texture->definedLevels=old.definedLevels;}clearSubmitObjects();cleanup();}
    try{throw;}catch(const std::exception &e){if(diagnosticOp<ops.size() && !ops[diagnosticOp].diagnostic.empty())throw std::runtime_error(std::string(e.what())+" desc="+ops[diagnosticOp].diagnostic);throw;}
   }
  }

@@ -24,6 +24,7 @@
 #include "ClientGate.hpp"
 #include "ClientSetup.hpp"
 #include "DrawSafety.hpp"
+#include "SamplingPolicy.hpp"
 #include "BackboardGate.hpp"
 #include <thread>
 #include "Survey.hpp"
@@ -189,6 +190,7 @@ extern "C" uint64_t fuxi_metal_submit_empty() {return fuxi::Backend::emptySubmit
 extern "C" uint64_t fuxi_metal_submit_object_creates() {return fuxi::Backend::submitObjectCreates.load();}
 extern "C" uint64_t fuxi_metal_submit_pool_creates() {return fuxi::Backend::submitPoolCreates.load();}
 extern "C" uint64_t fuxi_metal_submit_frame_creates() {return fuxi::Backend::submitFrameCreates.load();}
+extern "C" uint64_t fuxi_metal_sampling_skipped_draws() {return fuxi::skippedSamplingDraws.load();}
 extern "C" uint64_t fuxi_metal_submit_view_creates() {return fuxi::Backend::submitViewCreates.load();}
 static thread_local NSString *descriptorContext=nil;
 struct DescriptorContext {
@@ -927,8 +929,7 @@ static thread_local FuxiCommandBuffer *completionCommand;
  if(!stage4Class("sampling","texture.class",t,[FuxiTexture class]))invalid(@"sampling texture.class");
  stage4Require("sampling","texture.device",(uint64_t)[t device],[t device]==_command->_queue->_device);
  stage4Require("sampling","texture.usage",((FuxiTexture *)t)->_usage,!((FuxiTexture *)t)->_usage || (((FuxiTexture *)t)->_usage&MTLTextureUsageShaderRead));
- for(unsigned k=0;k<_state.colorCount;++k){FuxiTexture *target=k?_targets[k-1]:((_state.colorMask&1)?_target:nil);if(!target)continue;
- stage4Require("sampling","attachmentFeedback",k,t!=target && !(((FuxiTexture *)t)->_surface && target->_surface && IOSurfaceGetID(((FuxiTexture *)t)->_surface)==IOSurfaceGetID(target->_surface)));}
+ // Feedback depends on the pipeline, sampler and mip range at draw time.
  [t retain];[_samples[i] release];_samples[i]=t;
 } @catch(NSException *e) {(void)e;[self rejectSelector:_cmd];}}
 - (void)setFragmentSamplerState:(id)s atIndex:(NSUInteger)i {@try {CENSUS();DescriptorContext descriptor(_passText);[self active];
@@ -1032,6 +1033,14 @@ static thread_local FuxiCommandBuffer *completionCommand;
  if(!count || (t==MTLPrimitiveTypeLineStrip && count<2))return;
  if(indices && (![indices isKindOfClass:[FuxiBuffer class]] || [indices device]!=_command->_queue->_device || (offset&1) || offset>[indices length] || count*2>[indices length]-offset))invalid(@"index bounds/device");
  DescriptorContext context(_passText);
+ for(unsigned slot=0;slot<fuxi::resourceSlots;++slot)if(_samples[slot] && _samples[slot]->_surface){
+  for(unsigned k=0;k<_state.colorCount;++k){auto target=k?_targets[k-1]:((_state.colorMask&1)?_target:nil);
+   if(target && target->_surface && IOSurfaceGetID(_samples[slot]->_surface)==IOSurfaceGetID(target->_surface)){
+    if(fuxi::skipSamplingDraw("IOSurface attachment feedback"))return;
+    stage4Require("sampling","attachmentFeedback",k,false);
+   }
+  }
+ }
  fuxi::Operation op=_state;op.renderDraw=true;op.diagnostic=[NSString stringWithFormat:@"%@ %@",_passText,_pipeline->_descriptorText?:@"pipeline=model"].UTF8String;op.texture=_target->_texture;op.pipeline=_pipeline->_pipeline;op.vertices=(uint32_t)count;op.first=(uint32_t)start;op.topology=t==MTLPrimitiveTypeLine?fuxi::Topology::Line:t==MTLPrimitiveTypeLineStrip?fuxi::Topology::LineStrip:t==MTLPrimitiveTypeTriangleStrip?fuxi::Topology::TriangleStrip:fuxi::Topology::Triangle;
  op.indices=indices?((FuxiBuffer *)indices)->_buffer:nullptr;op.indexOffset=offset;
  // CA smoke diagnostic: for a textured draw, every vertex binding and its first vertices (stride 48 floats).
