@@ -1236,7 +1236,7 @@ static NSString *renderPassText(MTLRenderPassDescriptor *d){
  auto frameStart=std::chrono::steady_clock::now();uint64_t gpuBefore=backboard?fuxi::Backend::gpuNanos.load():0;
  fuxi::FrameSample trace;bool surfaceFrame=false;
  auto countsBefore=fuxi::frameCounts;
- if(_frameTrace){trace.cpuBeforeCommit=uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(frameStart-_traceCreated).count());trace.cpu=fuxi::frameCPU();
+ if(_frameTrace){trace.cpuBeforeCommit=uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(frameStart-_traceCreated).count());trace.createdNs=uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(_traceCreated.time_since_epoch()).count());trace.cpu=fuxi::frameCPU();
   trace.encodeCountsUnknown=_traceThread!=std::this_thread::get_id();if(!trace.encodeCountsUnknown)countsBefore=_traceCounts;
  }
  {fuxi::FrameTraceScope traceScope(_frameTrace?&trace:nullptr);
@@ -1302,7 +1302,7 @@ static NSString *renderPassText(MTLRenderPassDescriptor *d){
  if(_status!=MTLCommandBufferStatusNotEnqueued)return;
  if(_encoding)[self rejectSelector:_cmd];
  _commitStart=fuxi::FrameClock::now();
- if(_frameTrace){_flightTrace.cpuBeforeCommit=uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(_commitStart-_traceCreated).count());_flightTrace.cpu=fuxi::frameCPU();
+ if(_frameTrace){_flightTrace.cpuBeforeCommit=uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(_commitStart-_traceCreated).count());_flightTrace.createdNs=uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(_traceCreated.time_since_epoch()).count());_flightTrace.cpu=fuxi::frameCPU();
   _flightTrace.encodeCountsUnknown=_traceThread!=std::this_thread::get_id();
   if(!_flightTrace.encodeCountsUnknown)_flightTrace.counts={fuxi::frameCounts.pipelines-_traceCounts.pipelines,fuxi::frameCounts.descriptors-_traceCounts.descriptors,fuxi::frameCounts.allocations-_traceCounts.allocations};
  }

@@ -28,6 +28,8 @@ inline constexpr const char *mergeSplitNames[]={"none","encoder","attachments","
 struct FrameSample {
  uint64_t wall=0,cpuBeforeCommit=0,shadowCopy=0,leaseLock=0,backendSubmit=0,gpuWait=0,gpuExec=0;
  uint64_t inflight=0,completionLatency=0;
+ // Command buffer creation (steady clock); the window derives frame-to-frame cadence.
+ uint64_t createdNs=0,interval=0;
  uint64_t mergedDraws=0;std::array<uint64_t,size_t(MergeSplit::count)> mergeSplits{};
  uint64_t draws=0,passes=0,gpuSamples=0;FrameCounts counts{};unsigned cpu=4096;bool encodeCountsUnknown=false;
 };
@@ -45,9 +47,14 @@ class FrameTraceWindow {
  uint64_t count=0,wallMax=0,draws=0,passes=0,encodeUnknown=0,gpuUnavailable=0;
  uint64_t mergedDraws=0;std::array<uint64_t,size_t(MergeSplit::count)> mergeSplits{};
  FrameCounts counts{};std::array<uint64_t,9> cpus{};
+ // Frame cadence vs 60 Hz ticks: <=1, <=2, <=3, >3 intervals of 16.7 ms.
+ uint64_t lastCreated=0;std::array<uint64_t,4> cadence{};
 public:
  void add(const FrameSample &s) {
-  samples[count%capacity]=s;++count;wallMax=std::max(wallMax,s.wall);
+  auto &stored=samples[count%capacity];stored=s;
+  // Gaps over 100 ms are idle pauses, not cadence; they do not enter the histogram.
+  if(s.createdNs && lastCreated && s.createdNs>lastCreated && s.createdNs-lastCreated<100000000){stored.interval=s.createdNs-lastCreated;uint64_t ticks=(stored.interval+8333333)/16666667;++cadence[ticks<=1?0:ticks==2?1:ticks==3?2:3];}
+  if(s.createdNs)lastCreated=s.createdNs;++count;wallMax=std::max(wallMax,s.wall);
   draws+=s.draws;passes+=s.passes;counts.pipelines+=s.counts.pipelines;counts.descriptors+=s.counts.descriptors;counts.allocations+=s.counts.allocations;
   mergedDraws+=s.mergedDraws;for(size_t i=1;i<mergeSplits.size();++i)mergeSplits[i]+=s.mergeSplits[i];
   gpuUnavailable+=!s.gpuSamples;++cpus[s.cpu<8?s.cpu:8];encodeUnknown+=s.encodeCountsUnknown;
@@ -76,9 +83,10 @@ public:
   if(systemTranslationPolicy().overlap)fprintf(out," overlap_depth=%.0f/%.0f completion_ms=%.3f/%.3f",double(percentile(&FrameSample::inflight,50)),double(percentile(&FrameSample::inflight,90)),p(&FrameSample::completionLatency,50),p(&FrameSample::completionLatency,90));
   if(systemTranslationPolicy().merge){fprintf(out," merged_draws/frame=%.2f merged_splits=",mergedDraws/n);
    for(size_t i=1;i<mergeSplits.size();++i)fprintf(out,"%s%s:%llu",i==1?"":",",mergeSplitNames[i],(unsigned long long)mergeSplits[i]);}
+  fprintf(out," interval=%.3f/%.3f ms cadence_ticks=1:%llu,2:%llu,3:%llu,4+:%llu",p(&FrameSample::interval,50),p(&FrameSample::interval,90),(unsigned long long)cadence[0],(unsigned long long)cadence[1],(unsigned long long)cadence[2],(unsigned long long)cadence[3]);
   fputc('\n',out);
   funlockfile(out);
-  count=wallMax=draws=passes=encodeUnknown=gpuUnavailable=mergedDraws=0;mergeSplits.fill(0);counts={};cpus.fill(0);
+  count=wallMax=draws=passes=encodeUnknown=gpuUnavailable=mergedDraws=0;mergeSplits.fill(0);counts={};cpus.fill(0);cadence.fill(0);
  }
 };
 }
