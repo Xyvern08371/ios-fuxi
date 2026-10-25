@@ -3,15 +3,19 @@
  * No WAITQ, interrupted-call continuation or TRUST MMIO writes. XNU permits
  * one bounded retry ONLY for the unserviced x0 == original function ID case.
  */
+#ifndef G5_META_PA
 #define G5_META_PA (G_MEM + 0x1600000)
+#endif
 #define G5_META_BYTES 0x2000u
 #define G5_ZAP_PA 0x9b09a000ULL /* sm8550.dtsi AND Fuxi live DT, no-map */
 #define G5_ZAP_BYTES 0x2000u
 #define G5_PAS 13u
 #define G5_SMC(cmd) (0x42000200u | (cmd)) /* STD, SMC64, owner SIP, PIL */
+#if !defined(G5_META_CUSTOM)
 _Static_assert((G5_META_PA & 4095) == 0, "PAS metadata alignment");
 _Static_assert(G5_META_PA >= G4_DST_PA + G4_BYTES + 4096, "PAS metadata overlaps 2D");
 _Static_assert(G5_META_PA + G5_META_BYTES <= G_MEM + G_MEM_SIZE, "PAS metadata overflow");
+#endif
 static unsigned g5_zap_loaded; /* only OUR successful auth, never inferred from TZ */
 struct g5_plan {
  unsigned phoff, phnum, header, hash_off, hash_size, relocate, loads;
@@ -92,6 +96,18 @@ static __attribute__((noinline)) void g5_smc_raw(uint64_t ret[4], uint32_t fn, u
  * First five retain the v8 layout; last three use v9 page15 words16..63.
  * Each slot: step, fn, arginfo, returned, arg0/arg1 low/high, x0..x3 low/high.
  * mem_setup arg2 is the validated span in page word16. */
+static __attribute__((noinline)) void g5_smc4_raw(uint64_t ret[4], uint32_t fn, uint32_t info,
+                       uint64_t a, uint64_t b, uint64_t c, uint64_t e)
+{
+ register uint64_t x0 __asm__("x0") = fn, x1 __asm__("x1") = info;
+ register uint64_t x2 __asm__("x2") = a, x3 __asm__("x3") = b;
+ register uint64_t x4 __asm__("x4") = c, x5 __asm__("x5") = e;
+ register uint64_t x6 __asm__("x6") = 0, x7 __asm__("x7") = 0;
+ __asm__ volatile("dsb sy\n\tsmc #0\n\tdsb sy"
+  : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3), "+r"(x4), "+r"(x5), "+r"(x6), "+r"(x7)
+  :: "x8","x9","x10","x11","x12","x13","x14","x15","x16","x17","cc","memory");
+ ret[0] = x0; ret[1] = x1; ret[2] = x2; ret[3] = x3;
+}
 static uint32_t *g5_scm_slot(uint32_t *d, unsigned i)
 {
  return i < 5 ? d+48+16*i : gpu_extra[14]+16+16*(i-5);
@@ -99,7 +115,7 @@ static uint32_t *g5_scm_slot(uint32_t *d, unsigned i)
 static int g5_scm(uint32_t *d, uint32_t fn, unsigned info,
                    uint64_t a, uint64_t b, uint64_t c, unsigned advisory)
 {
- if (d[5] >= 8) return 0;
+ if (d[5] >= 12) return 0;
  uint32_t *s = g5_scm_slot(d, d[5]++);
  s[0] = d[3]; s[1] = fn; s[2] = info;
  s[4] = a; s[5] = a>>32; s[6] = b; s[7] = b>>32;
@@ -114,6 +130,22 @@ static int g5_scm(uint32_t *d, uint32_t fn, unsigned info,
  s[3] = 1;
  /* Query x1 is a boolean, not a service status. Record even false/unknown;
   * only transport errors stop queries. Real PAS calls require x0=x1=0. */
+ int ok = !ret[0] && (advisory || !ret[1]);
+ if (!ok) d[44] = d[5];
+ return ok;
+}
+static int g5_scm4(uint32_t *d, uint32_t fn, unsigned info,
+                     uint64_t a, uint64_t b, uint64_t c, uint64_t e, unsigned advisory)
+{
+ if (d[5] >= 12) return 0;
+ uint32_t *s = g5_scm_slot(d, d[5]++);
+ s[0] = d[3]; s[1] = fn; s[2] = info;
+ s[4] = a; s[5] = a>>32; s[6] = b; s[7] = b>>32;
+ __asm__ volatile("dsb sy" ::: "memory");
+ uint64_t ret[4];
+ g5_smc4_raw(ret, fn, info, a, b, c, e);
+ for (unsigned i = 0; i < 4; i++) { s[8+i*2] = ret[i]; s[9+i*2] = ret[i]>>32; }
+ s[3] = 1;
  int ok = !ret[0] && (advisory || !ret[1]);
  if (!ok) d[44] = d[5];
  return ok;
@@ -146,6 +178,15 @@ static int g5_pas(uint32_t *d, const uint8_t *fw, const struct g5_plan *p)
  if (!g5_copy(G5_META_PA, 0, G5_META_BYTES) ||
      !g5_copy(G5_META_PA, fw, p->header) ||
      !g5_copy(G5_META_PA+p->header, fw+p->hash_off, p->hash_size)) return 0xf09;
+#ifdef G5_SHMBRIDGE
+ /* SM8450+: TZ only reads caller buffers inside a registered SHM bridge.
+  * QCOM_SCM_VMID_HLOS is 0x3 (dt-bindings/firmware/qcom,scm.h), not 0x1. */
+ d[3] = 5;
+ g5_scm(d, 0x42000C1C, 0, 0, 0, 0, 1);
+ if (!g5_scm4(d, 0x42000C1E, 0x554,
+              (G5_META_PA | 6), (G5_META_PA | 6),
+              ((uint64_t)G5_META_BYTES | (1u << 9)), 0x3u, 1)) return 0xf11;
+#endif
  if (!g5_scm(d, G5_SMC(1), 0x82, G5_PAS, G5_META_PA, 0, 0)) return 0xf07;
  d[3] = 6;
  /* Linux qcom_mdt_pas_init: any valid relocatable LOAD enables setup;

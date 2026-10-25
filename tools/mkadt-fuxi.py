@@ -49,7 +49,16 @@ def validate_live(path, ufs_readonly=False):
     if len(memory) % 16:
         raise ValueError('unexpected /memory cell layout')
     ranges = list(struct.iter_unpack('>QQ', memory))
-    if not any(base <= PHYS_BASE and PHYS_BASE + BANK_SIZE <= base + size for base, size in ranges):
+    # The live FDT may advertise the bank as adjacent ranges (e.g. 3 GiB + 6 GiB);
+    # merge them before checking the XNU window.
+    merged = []
+    for base, size in sorted(ranges):
+        if merged and base <= merged[-1][0] + merged[-1][1]:
+            b, s = merged[-1]
+            merged[-1] = (b, max(b + s, base + size) - b)
+        else:
+            merged.append((base, size))
+    if not any(base <= PHYS_BASE and PHYS_BASE + BANK_SIZE <= base + size for base, size in merged):
         raise ValueError('requested XNU RAM is outside advertised memory')
     inventory = fdt.describe(nodes, reservations)['nodes']
     for name, props in inventory.items():

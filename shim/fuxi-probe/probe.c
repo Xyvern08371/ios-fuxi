@@ -1457,6 +1457,18 @@ usb_start(uintptr_t dwc)
 
 }
 
+/* Loader-side probe: start the device controller and report the state. */
+void
+fuxi_usb_probe(void)
+{
+	uintptr_t dwc = 0xa600000;
+	printf("FUXI USB: probe start GSNPSID 0x%08x GCTL 0x%08x DCTL 0x%08x DSTS 0x%08x\n",
+	    dwc_rd(GSNPSID), dwc_rd(GCTL), dwc_rd(DCTL), dwc_rd(DSTS));
+	usb_start(dwc);
+	printf("FUXI USB: after start GCTL 0x%08x DCTL 0x%08x DSTS 0x%08x DCFG 0x%08x\n",
+	    dwc_rd(GCTL), dwc_rd(DCTL), dwc_rd(DSTS), dwc_rd(DCFG));
+}
+
 static __attribute__((noreturn)) void reboot(void)
 {
  register uint64_t fn __asm__("x0")=0x84000009;
@@ -1468,7 +1480,7 @@ void probe_main(uintptr_t fdt)
  extern char _head[], _end[];
  monitor_report[MON_MAGIC]=0x31304e4f4d495846ULL; /* FXIMON01 */
  monitor_report[MON_IMAGE]=(uintptr_t)_head; monitor_report[MON_END]=(uintptr_t)_end;
- monitor_report[MON_DEADLINE]=rsr("cntpct_el0")+rsr("cntfrq_el0")*90;
+ monitor_report[MON_DEADLINE]=rsr("cntpct_el0")+rsr("cntfrq_el0")*5;
  probe_info.magic=0x45424f5250495846ULL; /* little-endian FXIPROBE */
  probe_info.version=1;
  probe_info.midr=rsr("midr_el1"); probe_info.mpidr=rsr("mpidr_el1");
