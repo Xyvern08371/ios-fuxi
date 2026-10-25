@@ -310,7 +310,8 @@ New log lines:
   start_pos= wr_irq=`. These are the raw ABL tear-check settings.
   `vsync & 0x7ffff` is `vsync_count`, from which the configured rate is
   `19.2 MHz / (vtotal * vsync_count)`, with vtotal 2684 for this panel's DTB
-  timing. A value near 119 means 60 Hz; near 59 means 120 Hz.
+  timing. This was an estimate from Android's nominal geometry, not a
+  calibration of ABL's inherited counter; see the measured baseline below.
 - Every 600 STARTs: `te=` (TE-gate polls), `te_hz=` (TE frames per second
   measured over the window) and `gaps=a/b/c/d`. The gaps are START-to-START
   intervals of at most 1, 2 or 3 sixty-Hz periods, or longer (idle).
@@ -326,3 +327,135 @@ and uses the default 20 ms floor for the rest of the boot. An explicit
 GUESS: TE counting and reload behaviour follow the SDE driver's use of these
 registers. This has not been checked on the device. Boot with the default
 first, and only enable the gate after `te_hz` reads 60 or 120.
+
+## Opt-in panel 120 Hz (`fuxipanel120=1`, default off)
+
+The supplied device baseline is **`te_hz=60.4`, `vsync=0x180085`,
+`init=0x960`**: ABL leaves this panel at about 60 Hz. A fast DSI link or a
+120 Hz timing in the Android tree does not establish the current panel rate.
+This change has host-model coverage only; no device, full kernel build or
+DSI/DSC qualification was performed for it.
+
+Enable with `fuxipanel120=1 fuxigpuscanout=1 sweetfb_noconsole=1` plus the
+existing GPU/ABI boot arguments. Only the exact value 1 enables it; it is
+ignored without the scanout handoff. With the option absent or zero, DSI0
+is not mapped or accessed, no switch commands or tear-check writes occur,
+and the existing 60 Hz gate, floor, histogram and logs retain their behavior.
+The compositor's existing nominal 60 Hz notification/workloop schedule is
+unchanged; panel refresh is separate from rendered or presented frame rate.
+
+Panel command provenance: the requested local **`dtb/` decompiled DTB is
+unavailable in this worktree**, and the main checkout's `dtb/` is empty.
+Consequently a source DTB filename and device-specific byte comparison cannot
+be claimed. The corroborating source is
+[`qcom/display/display/dsi-panel-m3-38-0c-0a-dsc-cmd.dtsi`](https://github.com/LineageOS/android_kernel_xiaomi_sm8550-devicetrees/blob/43b5ada5654ed84c25f74789bc8f6326b7bacd20/qcom/display/display/dsi-panel-m3-38-0c-0a-dsc-cmd.dtsi),
+node `qcom,mdss_dsi_m3_38_0c_0a_dsc_cmd`, child
+`qcom,mdss-dsi-display-timings/timing@1`, property
+**`qcom,mdss-dsi-timing-switch-command`**. It matches the task's eight
+120 Hz writes exactly. Its sibling
+`qcom,mdss-dsi-timing-switch-command-state` is `dsi_hs_mode`.
+The seven-byte descriptors are `type, legacy-last, VC, flags, wait-ms,
+length-hi, length-lo`, followed by the payload:
+
+```text
+39 00 00 40 00 00 03  F0 5A 5A
+15 00 00 40 00 00 02  60 00
+39 00 00 40 00 00 04  B0 00 30 BD
+15 00 00 40 00 00 02  BD 04
+39 00 00 40 00 00 04  B0 00 16 F2
+39 00 00 40 00 00 03  F2 01 70
+15 00 00 40 00 00 02  F7 0F
+39 00 00 00 00 00 03  F0 A5 A5
+```
+
+`0x39` is DCS long write, `0x15` is DCS short write with one parameter.
+Every switch delay is **zero**. Flags `0x40` batch the first seven packets;
+the final flags `0x00` terminate the batch. The 60 Hz `timing@0` property
+differs only at `60 08`; `timing@2` is 90 Hz. All three timings specify four
+lanes at 1,100,000,000 bit/s and `qcom,mdss-mdp-transfer-time-us = 7300`.
+The per-timing **`qcom,mdss-dsi-on-command`** also contains the same frequency
+select block, but includes full initialization: `0x05` DCS short writes
+`11 00` (sleep out, wait byte `0x78` = 120 ms) and `29 00` (display on,
+zero delay), as well as a later `0x39` `F7 0F` with wait `0x14` = 20 ms.
+These initialization commands and delays are **not** replayed by this mode
+switch. The timing-switch property is the source for the implemented batch.
+
+The original implementation uses register facts from Qualcomm
+[`dsi_ctrl_hw_cmn.c`](https://github.com/LineageOS/android_kernel_qcom_sm8550-modules/blob/d00477fbff4a83babbee37b2ea56fb0ded793eec/qcom/opensource/display-drivers/msm/dsi/dsi_ctrl_hw_cmn.c)
+(`kickoff_fifo_command`, `reset_cmd_fifo`, DMA-done status),
+`dsi_ctrl_reg.h`, `dsi_ctrl_hw_2_2.c` (trigger selection), `dsi_ctrl.c`
+(embedded packet layout), `dsi_panel.c` (descriptor flags), and
+[`sde_hw_intf.c`](https://github.com/LineageOS/android_kernel_qcom_sm8550-modules/blob/d00477fbff4a83babbee37b2ea56fb0ded793eec/qcom/opensource/display-drivers/msm/sde/sde_hw_intf.c)
+(tear-counter sequencing). No GPL implementation is copied or vendored.
+
+After disabling autorefresh and claiming START, acquire waits for the inherited
+transfer's existing floor/TE gate, CTL START idle and drained write line. Before
+the first manual START, it attempts the switch **once** under the GPU/display
+lock. DSI0 (`0xae94000`) must also become idle: STATUS at +0x008 includes
+command DMA busy bit1 and command MDP busy bit2. The inherited command engine
+must already be on, video mode off, tear counter enabled and TPG unused.
+The code clears stale DMA-done status, selects software DMA trigger 4 in
++0x084 while preserving MDP/TE fields, resets the command FIFO, writes
+TPG_CTRL +0x15c = `0x30006`, and streams the embedded batch to +0x17c.
+There are **52 bytes / 13 DWORDs**, plus the hardware-required zero DWORD
+for an odd word count; DMA length +0x04c stays 52. The embedded headers carry
+LONG and final-LAST flags; three-byte long payloads pad with `ff`.
+DMA_CTRL +0x03c selects embedded, unicast HS. A barrier precedes the
+**DMA trigger +0x090**; **MDP trigger +0x094 is never used for DCS**.
+The code polls INT_CTRL +0x110 DMA_DONE bit0 and then DSI idle before cleaning
+the FIFO and restoring the inherited DMA, length, trigger and interrupt masks.
+Only DMA_DONE is acknowledged; unrelated W1C status is preserved.
+
+Each poll is bounded by **20 ms and 2001 samples**. A timeout logs
+`FUXI SCANOUT: panel120 timeout phase=... offset=... status=...`, stops the
+attempt, holds scanout and never retries or issues START. Before commands are
+sent the panel and tear configuration remain at 60 Hz. **After a trigger,
+a timeout cannot guarantee that the panel stayed at 60 Hz:** it might already
+have received `60 00`. The code leaves 60 Hz accounting, logs that panel state
+is uncertain, and requires a reboot instead of sending a speculative rollback.
+MMIO errors, controller error status after transmission and tear-check readback
+failures also hold publication. A refused unsupported setup sends no commands and continues
+with the inherited 60 Hz mode.
+
+After a successful command transfer, tear-check programming disables
+**VSYNC_COUNTER_EN, bit19 of INTF+0x288**, writes the new count and preserved
+height (+0x28c), and re-enables the counter. Interrupts are masked only around
+these four MMIO writes to meet SDE's single-buffer update constraint. The
+TEAR_CHECK_EN register (+0x284), external TE bit20, init, thresholds and line
+geometry remain intact. With the clock and geometry unchanged, line period is
+proportional to the low-19-bit count, so doubling refresh uses
+`floor(133 * 60 / 120) = 66`: **`0x180085 -> 0x180042`**, with `init=0x960`
+unchanged. Truncation produces a local counter rate about 2.015 times the old
+one; external TE supplies frame reloads. The earlier estimate of 119/59 from
+19.2 MHz and nominal DTB vtotal 2684 does not match the observed ABL count 133.
+This implementation uses the measured inherited count ratio, not that estimate;
+the `te_hz` measurement remains the device qualification criterion.
+
+Only after successful register readback does the active period become
+**8333 us**. The default 20 ms drain/fallback floor becomes **10 ms**, keeping
+the same 1.2-period margin; an explicit `fuxiscandrain=<us>` retains its units
+and value across the mode switch. `fuxiscante=1` keeps its 64-line margin (half the time with the
+adjusted counter) and uses a **20 ms** stall deadline instead of 40 ms. Gap
+buckets become at most 1/2/3 actual panel periods, then longer. The TE-rate
+window restarts after the switch so it does not mix 60 Hz and 120 Hz samples.
+The new floor alone still limits presentation below 100 frames/s; this feature
+does not promise 120 rendered/presented frames/s.
+
+Verification on device, to be performed separately by the maintainer: first
+record the no-option `te_hz` baseline. Boot with the opt-in arguments and look
+for `FUXI SCANOUT: panel120 begin ...` followed by
+`FUXI SCANOUT: panel120 switched vsync=0x180085->0x180042 ... period_us=8333`.
+Require the subsequent 600-START summaries to show **`te_hz` around 120**,
+then qualify DSC stability, image quality, TE gating, wake/blanking, cadence,
+power and thermals. A controller-done log alone proves no physical TE rate.
+An incorrect sequence can **hang DSI or blank the panel and needs a reboot**;
+boot without `fuxipanel120` to recover the ABL baseline. Do not retry in place.
+
+Host checks: `python3 tools/test-fuxi-gpu-scanout.py`,
+`python3 tools/sync-fuxi-metal.py --check`,
+`python3 tools/test-fuxi-unixnu.py`, and
+`python3 tools/test-fuxi-adreno-mapping.py`. These exercise production C with
+modeled MMIO: exact packet bytes and FIFO order/padding, boundary admission,
+one attempt, stale completion, frozen-clock and busy/done timeouts, MMIO
+failure, tear-counter disable/update/enable and readback, 60/120 Hz timing,
+and DSI mapping only with opt-in. They cannot qualify actual hardware.

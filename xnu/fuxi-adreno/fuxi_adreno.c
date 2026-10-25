@@ -40,7 +40,7 @@ extern unsigned fuxi_gpu_access(uintptr_t, uint64_t *, unsigned, unsigned);
 #define rsr(r) ({ uint64_t v; __asm__ volatile("mrs %0, " r : "=r"(v)); v; })
 #define delay fg_delay
 static void fg_delay(unsigned us) { delay_for_interval(us, NSEC_PER_USEC); }
-static unsigned fg_scanout_requested;
+static unsigned fg_scanout_requested, fg_scanout_panel120_requested;
 struct fg_window { uint64_t pa, size; uintptr_t va; };
 /* Disjoint apertures; the framebuffer is mapped by SweetFramebuffer only.
  * Stage14 uses scratch, never stage15's panel readback/CPU comparator. */
@@ -52,6 +52,7 @@ static struct fg_window fg_windows[] = {
  {FG_SCRATCH,FG_SCRATCH_SIZE,0}, {0x9b098000,0x4000,0},
  {0xae04000,0x4000,0},
  {0xae14000,0x4000,0}, {0xae34000,0x4000,0},
+ {0xae94000,0x4000,0}, /* DSI0 command FIFO, fuxipanel120=1 only */
 };
 static uint64_t fg_mapped_bytes;
 /* io_map's 8 MiB submap and ALL ml_io_map variants use KMA_NOFAIL.
@@ -88,6 +89,7 @@ static kern_return_t fg_map_windows(void)
  for (unsigned i = 0; i < sizeof(fg_windows)/sizeof(fg_windows[0]); i++) {
   struct fg_window *w = &fg_windows[i];
   if (!fg_scanout_requested && (w->pa == 0xae14000 || w->pa == 0xae34000)) continue;
+  if (!fg_scanout_panel120_requested && w->pa == 0xae94000) continue;
   kern_return_t kr = fg_map_window(w);
   if (kr != KERN_SUCCESS) {
    printf("FUXI GPU: map PA %#llx bytes %#llx failed %d, mapped %llu bytes, IO submap 0 bytes\n",

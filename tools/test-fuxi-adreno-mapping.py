@@ -16,7 +16,7 @@ submit = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(submit)
 
 PREFIX = r'''
-static unsigned fg_scanout_requested;
+static unsigned fg_scanout_requested, fg_scanout_panel120_requested;
 #include <assert.h>
 #define FG_GUARD
 static unsigned fg_abi_enabled;
@@ -172,7 +172,7 @@ static void reset(void)
  gpu_calls=alloc_calls=enter_calls=remove_calls=free_calls=enqueued=0;
  fail_alloc=fail_enter=invalid_reservation=0;
  live=cursor=removed=0;
- fg_scanout_requested=1;
+ fg_scanout_requested=fg_scanout_panel120_requested=1;
  fg_limit=17; enable_arg=1; gPhysSize=FG_RAM_SIZE;
  valid_handoff=abi_inits=abi_publishes=abi_fail=fg_abi_enabled=0;
  level_arg=clock_logs=g_gpu_selected=fg_clock_measure=0;
@@ -181,10 +181,13 @@ int main(void)
 {
  uint64_t total=0;
  for(unsigned i=0;i<COUNT;i++) total+=fg_windows[i].size;
- assert(total==0x2188000); /* Existing windows + two optional 16K DPU windows. */
- reset();fg_scanout_requested=0;assert(fg_map_windows()==KERN_SUCCESS);
- assert(live==total-32768 && fg_mapped_bytes==total-32768 && alloc_calls==COUNT-2);
- assert(!fg_pointer(0xae16000) && !fg_pointer(0xae36000));
+ assert(total==0x218c000); /* Existing windows + optional DPU and DSI0 windows. */
+ reset();fg_scanout_requested=fg_scanout_panel120_requested=0;assert(fg_map_windows()==KERN_SUCCESS);
+ assert(live==total-49152 && fg_mapped_bytes==total-49152 && alloc_calls==COUNT-3);
+ assert(!fg_pointer(0xae16000) && !fg_pointer(0xae36000) && !fg_pointer(0xae94000));
+ reset();fg_scanout_panel120_requested=0;assert(fg_map_windows()==KERN_SUCCESS);
+ assert(live==total-16384 && fg_mapped_bytes==total-16384 && alloc_calls==COUNT-1);
+ assert(fg_pointer(0xae16000) && fg_pointer(0xae36000) && !fg_pointer(0xae94000));
  reset(); assert(fg_map_windows()==KERN_SUCCESS);
  assert(live==total && fg_mapped_bytes==total && alloc_calls==COUNT && !free_calls);
  assert(enter_calls==total/PAGE_SIZE && strstr(last_log,"IO submap 0 bytes"));

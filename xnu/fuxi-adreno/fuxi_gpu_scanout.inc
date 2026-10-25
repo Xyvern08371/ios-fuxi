@@ -7,6 +7,8 @@
  */
 /* GPU-SCANOUT: Fuxi command-mode display ownership. Original implementation.
  * No panel/DSI reset, address flip, clock change or firmware dependency.
+ * fuxipanel120=1 optionally sends the panel's timing-switch commands once,
+ * only after ownership and inherited transfer drain. Default does no DSI IO.
  * Register meanings already used by the board's inherited-display probe:
  * INTF1 AUTOREFRESH_CONFIG +0x2b4 bit31; TEAR_LINE_COUNT +0x2b0 low16
  * write line; CTL START +0x1c bit0. Do not copy while a transfer can read RAM.
@@ -26,6 +28,10 @@
 #define FG_SCAN_DRAIN_US 20000u
 #define FG_SCAN_TE_MARGIN 64u     /* lines after TE before testing the write line */
 #define FG_SCAN_TE_STALL_US 40000u /* no TE this long after START: counter unusable */
+#define FG_SCAN_DSI 0x0ae94000u
+#define FG_SCAN_DSI_TIMEOUT_US 20000u
+static unsigned fg_scanout_panel120_attempted, fg_scanout_panel120_active;
+static unsigned fg_scanout_period_us = 16667u, fg_scanout_explicit_drain;
 static unsigned fg_scanout_owned, fg_scanout_failed, fg_scanout_writable;
 static unsigned fg_scanout_reserved, fg_scanout_checks, fg_scanout_checked;
 static uintptr_t fg_scanout_pixels, fg_scanout_source;
@@ -50,12 +56,15 @@ void fuxi_gpu_scanout_configure(uintptr_t pixels, unsigned enabled, unsigned che
  fg_scanout_checks = fg_scanout_requested && check == 1 ? 4 : 0;
  if (fg_scanout_requested)
 {
-  unsigned drain = 0, te = 0;
+  unsigned drain = 0, te = 0, panel120 = 0;
+  fg_scanout_panel120_requested = PE_parse_boot_argn("fuxipanel120", &panel120, sizeof(panel120)) && panel120 == 1;
   fg_scanout_te_mode = PE_parse_boot_argn("fuxiscante", &te, sizeof(te)) && te == 1;
   /* The TE gate needs no floor unless one is given explicitly. */
   if (fg_scanout_te_mode) fg_scanout_drain_us = 0;
-  if (PE_parse_boot_argn("fuxiscandrain", &drain, sizeof(drain)) && drain >= 4000 && drain <= FG_SCAN_DRAIN_US)
+  if (PE_parse_boot_argn("fuxiscandrain", &drain, sizeof(drain)) && drain >= 4000 && drain <= FG_SCAN_DRAIN_US) {
    fg_scanout_drain_us = drain;
+   fg_scanout_explicit_drain = 1;
+  }
   printf("FUXI SCANOUT: requested, fence then manual transfer, drain_us=%u te_gate=%u check=%u\n",
       fg_scanout_drain_us, fg_scanout_te_mode, fg_scanout_checks);
  }
@@ -93,7 +102,182 @@ static int fg_scanout_stop(const char *reason)
  fg_scanout_writable = 0;
  return -1;
 }
-/* 1 writable, 0 wait, -1 held after error. No spinning or sleeping. First
+/* Original register-mode implementation from hardware facts described by
+ * Qualcomm dsi_ctrl_hw_cmn.c (kickoff_fifo_command, reset_cmd_fifo),
+ * dsi_ctrl_reg.h, dsi_ctrl_hw_2_2.c (DMA trigger selection), and
+ * sde_hw_intf.c (tear-check setup). No implementation text is imported.
+ * DSI0 offsets: STATUS 008 (DMA busy bit1, MDP busy bit2), DMA_CTRL 03c,
+ * LENGTH 04c, TRIG_CTRL 084 (DMA low nibble, MDP bits6:4), DMA_SW_TRIGGER
+ * 090, INT_CTRL 110 (DMA_DONE W1C bit0; enables at odd bits), TPG_CTRL 15c,
+ * FIFO_DATA 17c, FIFO_RESET 1ec. 094 is MDP_SW_TRIGGER: never use it for DCS.
+ */
+static int fg_panel120_poll(unsigned offset, unsigned mask, unsigned want, const char *phase)
+{
+ uint64_t deadline = rsr("cntpct_el0") + rsr("cntfrq_el0")*FG_SCAN_DSI_TIMEOUT_US/1000000;
+ unsigned status = 0;
+ /* Both a wall-clock deadline and a finite sample count, even if the clock stalls. */
+ for (unsigned n = 0; n <= FG_SCAN_DSI_TIMEOUT_US/10; n++) {
+  if (!fg_scanout_read(FG_SCAN_DSI+offset, &status)) {
+   printf("FUXI SCANOUT: panel120 MMIO phase=%s offset=%#x\n", phase, offset);
+   return 0;
+  }
+  if ((status & mask) == want) return 1;
+  if (rsr("cntpct_el0") >= deadline) break;
+  delay(10);
+ }
+ printf("FUXI SCANOUT: panel120 timeout phase=%s offset=%#x status=%#x\n", phase, offset, status);
+ return 0;
+}
+/* One embedded FIFO batch, VC0, HS, no BTA, no per-packet delays. Long
+ * header: length, 0, data type, flags; short: DCS, parameter, type, flags.
+ * Flag 6 marks a long packet, flag 7 ends the batch; payload pads with ff.
+ * DTB timing@1 timing-switch-command, unlike on-command, has no 05 packets.
+ * DT descriptors have BATCH_COMMAND (flags 40) on the first seven packets,
+ * flags 00 on the last: one 52-byte batch, not eight separate triggers.
+ */
+static unsigned fg_panel120_packet_words(uint32_t words[14])
+{
+ static const struct { uint8_t type, length, data[4]; } packets[] = {
+  {0x39, 3, {0xf0, 0x5a, 0x5a}},
+  {0x15, 2, {0x60, 0x00}},
+  {0x39, 4, {0xb0, 0x00, 0x30, 0xbd}},
+  {0x15, 2, {0xbd, 0x04}},
+  {0x39, 4, {0xb0, 0x00, 0x16, 0xf2}},
+  {0x39, 3, {0xf2, 0x01, 0x70}},
+  {0x15, 2, {0xf7, 0x0f}},
+  {0x39, 3, {0xf0, 0xa5, 0xa5}},
+ };
+ unsigned used = 0;
+ for (unsigned i = 0; i < sizeof(packets)/sizeof(packets[0]); i++) {
+  unsigned flags = i == sizeof(packets)/sizeof(packets[0])-1 ? 0x80u : 0;
+  if (packets[i].type == 0x39) {
+   words[used++] = packets[i].length | ((unsigned)packets[i].type << 16) | ((flags | 0x40u) << 24);
+   uint32_t payload = 0xffffffffu;
+   for (unsigned j = 0; j < packets[i].length; j++)
+    payload = (payload & ~(0xffu << (8*j))) | ((unsigned)packets[i].data[j] << (8*j));
+   words[used++] = payload;
+  } else {
+   words[used++] = packets[i].data[0] | ((unsigned)packets[i].data[1] << 8) |
+       ((unsigned)packets[i].type << 16) | (flags << 24);
+  }
+ }
+ /* Hardware fetches pairs of DWORDs; this word is outside DMA_CMD_LENGTH. */
+ words[used] = 0;
+ return used;
+}
+static int fg_panel120_tear(unsigned vsync, unsigned height, unsigned adjusted)
+{
+ /* SDE requires the single-buffer update within 2^16 vsync-clock cycles.
+  * Mask interrupts only for these four MMIO writes, never for DSI polling. */
+ boolean_t interrupts = ml_set_interrupts_enabled(FALSE);
+ int good = fg_scanout_write(FG_SCAN_INTF+0x288, vsync & ~(1u << 19));
+ __asm__ volatile("dsb sy" ::: "memory");
+ if (good) good = fg_scanout_write(FG_SCAN_INTF+0x288, adjusted) &&
+     fg_scanout_write(FG_SCAN_INTF+0x28c, height);
+ __asm__ volatile("dsb sy" ::: "memory");
+ if (good) good = fg_scanout_write(FG_SCAN_INTF+0x288, adjusted | (1u << 19));
+ __asm__ volatile("dsb sy" ::: "memory");
+ (void)ml_set_interrupts_enabled(interrupts);
+ return good;
+}
+/* Return 0 for a refusal before transmission (keep 60 Hz), 1 on success,
+ * -1 on timeout/MMIO/uncertain state (hold until reboot).
+ * Called under FG_GUARD, with AR off, CTL START idle and write-line drained.
+ */
+static int fg_panel120_switch(void)
+{
+ unsigned dma, trigger, irq, tpg, length, ctrl, vsync, height, init, enable;
+ fg_scanout_panel120_attempted = 1; /* Never retry a partial sequence. */
+ if (!fg_panel120_poll(0x008, 0x1f, 0, "idle before switch")) {
+  printf("FUXI SCANOUT: panel120 aborted before commands; keeping 60 Hz\n");
+  return fg_scanout_stop("panel120 controller not idle");
+ }
+ if (!fg_scanout_read(FG_SCAN_DSI+0x004, &ctrl) ||
+     !fg_scanout_read(FG_SCAN_DSI+0x03c, &dma) ||
+     !fg_scanout_read(FG_SCAN_DSI+0x084, &trigger) ||
+     !fg_scanout_read(FG_SCAN_DSI+0x110, &irq) ||
+     !fg_scanout_read(FG_SCAN_DSI+0x15c, &tpg) ||
+     !fg_scanout_read(FG_SCAN_DSI+0x04c, &length) ||
+     !fg_scanout_read(FG_SCAN_INTF+0x288, &vsync) ||
+     !fg_scanout_read(FG_SCAN_INTF+0x28c, &height) ||
+     !fg_scanout_read(FG_SCAN_INTF+0x294, &init) ||
+     !fg_scanout_read(FG_SCAN_INTF+0x284, &enable)) {
+  printf("FUXI SCANOUT: panel120 aborted reading setup; keeping 60 Hz\n");
+  return fg_scanout_stop("panel120 setup MMIO");
+ }
+ /* Require the inherited command engine, enabled tear counter, and idle TPG.
+  * Do not enable/reset a controller or guess at an unrelated panel setup. */
+ if ((ctrl & 7) != 5 || tpg || (irq & (1u << 24)) || !(vsync & (1u << 19)) ||
+     (vsync & 0x7ffffu) < 2 || !enable) {
+  printf("FUXI SCANOUT: panel120 refused ctrl=%#x tpg=%#x irq=%#x vsync=%#x en=%#x; keeping 60 Hz\n",
+      ctrl, tpg, irq, vsync, enable);
+  return 0;
+ }
+ uint32_t words[14];
+ unsigned used = fg_panel120_packet_words(words);
+ unsigned masks = irq & 0xaaaaaaaau;
+ printf("FUXI SCANOUT: panel120 begin dma=%#x trigger=%#x irq=%#x vsync=%#x height=%#x init=%#x\n",
+     dma, trigger, irq, vsync, height, init);
+ /* Select software DMA trigger 4, preserving the MDP/TE trigger fields.
+  * Clear DMA_TRG_MUX bit16 and BLOCK_DMA_WITHIN_FRAME bit12 while idle. */
+ if (!fg_scanout_write(FG_SCAN_DSI+0x084, (trigger & ~0x1100fu) | 4) ||
+     !fg_scanout_write(FG_SCAN_DSI+0x110, (masks & ~2u) | 1u) ||
+     !fg_panel120_poll(0x110, 1, 0, "clear stale done") ||
+     !fg_scanout_write(FG_SCAN_DSI+0x1ec, 1)) goto uncertain;
+ __asm__ volatile("dsb sy" ::: "memory");
+ delay(1);
+ if (!fg_scanout_write(FG_SCAN_DSI+0x1ec, 0) ||
+     !fg_scanout_write(FG_SCAN_DSI+0x15c, 0x00030006)) goto uncertain;
+ for (unsigned i = 0; i < used + (used & 1); i++)
+  if (!fg_scanout_write(FG_SCAN_DSI+0x17c, words[i])) goto uncertain;
+ /* Embedded register FIFO, unicast HS: broadcast/master/LP all clear. */
+ if (!fg_scanout_write(FG_SCAN_DSI+0x03c, (dma & ~0xc4000000u) | 0x10000000u) ||
+     !fg_scanout_write(FG_SCAN_DSI+0x04c, used*4)) goto uncertain;
+ __asm__ volatile("dsb sy" ::: "memory");
+ if (!fg_scanout_write(FG_SCAN_DSI+0x090, 1) ||
+     !fg_panel120_poll(0x110, 1, 1, "DMA done") ||
+     !fg_panel120_poll(0x008, 0x1f, 0, "idle after commands")) goto uncertain;
+ unsigned done;
+ if (!fg_scanout_read(FG_SCAN_DSI+0x110, &done) || (done & (1u << 24))) goto uncertain;
+ /* Completion is certain: reset only the command FIFO and restore ABL's
+  * command settings before any MDP START. No MDP/frame trigger is issued. */
+ if (!fg_scanout_write(FG_SCAN_DSI+0x110, (masks & ~2u) | 1u) ||
+     !fg_scanout_write(FG_SCAN_DSI+0x15c, 0) ||
+     !fg_scanout_write(FG_SCAN_DSI+0x1ec, 1)) goto uncertain;
+ __asm__ volatile("dsb sy" ::: "memory");
+ delay(1);
+ if (!fg_scanout_write(FG_SCAN_DSI+0x1ec, 0) ||
+     !fg_scanout_write(FG_SCAN_DSI+0x03c, dma) ||
+     !fg_scanout_write(FG_SCAN_DSI+0x04c, length) ||
+     !fg_scanout_write(FG_SCAN_DSI+0x084, trigger) ||
+     !fg_scanout_write(FG_SCAN_DSI+0x110, masks)) goto uncertain;
+ /* Same vsync clock and line geometry: count120=floor(count60*60/120).
+  * Observed 0x180085: count=133 -> 66, resulting config 0x180042.
+  * Bit19 is VSYNC_COUNTER_EN, bit20 external TE; preserve other flags.
+  * SDE sequence: stop the counter before writing single-buffer registers. */
+ unsigned disabled = vsync & ~(1u << 19);
+ unsigned adjusted = (disabled & ~0x7ffffu) | ((vsync & 0x7ffffu)/2);
+ if (!fg_panel120_tear(vsync, height, adjusted)) goto uncertain;
+ unsigned after, height_after, init_after;
+ if (!fg_scanout_read(FG_SCAN_INTF+0x288, &after) || after != (adjusted | (1u << 19)) ||
+     !fg_scanout_read(FG_SCAN_INTF+0x28c, &height_after) || height_after != height ||
+     !fg_scanout_read(FG_SCAN_INTF+0x294, &init_after) || init_after != init) goto uncertain;
+ fg_scanout_panel120_active = 1;
+ fg_scanout_period_us = 8333;
+ if (!fg_scanout_explicit_drain && !fg_scanout_te_mode) fg_scanout_drain_us = FG_SCAN_DRAIN_US/2;
+ fg_scanout_te_init = init & 0xffff;
+ printf("FUXI SCANOUT: panel120 switched vsync=%#x->%#x height=%#x->%#x init=%#x->%#x period_us=%u drain_us=%u\n",
+     vsync, after, height, height_after, init, init_after, fg_scanout_period_us, fg_scanout_drain_us);
+ return 1;
+uncertain:
+ /* A timed-out DMA may have sent 60 00 already. Keep 60 Hz accounting,
+  * never claim success or send rollback/START into an uncertain transfer. */
+ printf("FUXI SCANOUT: panel120 aborted; panel state uncertain, reboot required\n");
+ return fg_scanout_stop("panel120 switch incomplete");
+}
+/* 1 writable, 0 wait, -1 held after error. Normal gates do not spin or sleep;
+ * the one-time panel120 switch uses bounded polling before granting writes.
+ * First
  * disable AR, then allow a complete 60 Hz interval plus margin before testing
  * the write-line and CTL idle indicators. The same guard follows every START.
  * This deliberately conservative policy is not a TE/vblank interrupt driver;
@@ -141,13 +325,15 @@ int fuxi_gpu_scanout_acquire(void)
   unsigned past = (count & 0xffffu) - fg_scanout_te_init;
   if (since == 0 || (since == 1 && (count & 0xffffu) >= fg_scanout_te_init && past < FG_SCAN_TE_MARGIN)) {
    uint64_t hz = rsr("cntfrq_el0");
-   if (rsr("cntpct_el0") >= fg_scanout_started + hz*FG_SCAN_TE_STALL_US/1000000) {
+   unsigned stall_us = fg_scanout_panel120_active ? FG_SCAN_TE_STALL_US/2 : FG_SCAN_TE_STALL_US;
+   if (rsr("cntpct_el0") >= fg_scanout_started + hz*stall_us/1000000) {
     /* No usable TE count: the default floor (from this START) for the boot. */
+    unsigned fallback = fg_scanout_panel120_active ? FG_SCAN_DRAIN_US/2 : FG_SCAN_DRAIN_US;
     printf("FUXI SCANOUT: te counter stalled count=%#x since=%u; floor fallback drain_us=%u\n",
-        count, since, FG_SCAN_DRAIN_US);
+        count, since, fallback);
     fg_scanout_te_mode = 0;
-    fg_scanout_drain_us = FG_SCAN_DRAIN_US;
-    fg_scanout_after = fg_scanout_started + hz*FG_SCAN_DRAIN_US/1000000;
+    fg_scanout_drain_us = fallback;
+    fg_scanout_after = fg_scanout_started + hz*fallback/1000000;
     fg_scanout_timeout = fg_scanout_after + hz/10;
    }
    fg_scanout_wait_te++;
@@ -165,6 +351,19 @@ int fuxi_gpu_scanout_acquire(void)
   }
   fg_scanout_wait_xfer++;
   return 0;
+ }
+ if (fg_scanout_panel120_requested && !fg_scanout_panel120_attempted) {
+  int switched = fg_panel120_switch();
+  if (switched < 0) return -1;
+  if (switched) {
+   unsigned count;
+   if (!fg_scanout_read(FG_SCAN_INTF+0x298, &count)) return fg_scanout_stop("panel120 read te count");
+   fg_scanout_arm(count);
+   /* Drop the mixed-rate diagnostic window and wait with the new gates. */
+   fg_scanout_window_start = rsr("cntpct_el0");
+   fg_scanout_te_window = count >> 16;
+   return 0;
+  }
  }
  __asm__ volatile("dsb sy" ::: "memory");
  fg_scanout_writable = 1;
@@ -192,9 +391,9 @@ int fuxi_gpu_scanout_publish(void)
  __asm__ volatile("dsb sy" ::: "memory");
  if (!fg_scanout_read(FG_SCAN_INTF+0x298, &count)) return fg_scanout_stop("read te count");
  uint64_t now = rsr("cntpct_el0"), hz = rsr("cntfrq_el0");
- /* START-to-START gaps in 60 Hz periods: <=1, <=2, <=3, longer (idle). */
+ /* START-to-START gaps in actual panel periods: <=1, <=2, <=3, longer. */
  if (fg_scanout_last_start) {
-  uint64_t gap = now - fg_scanout_last_start, tick = hz*16667/1000000;
+  uint64_t gap = now - fg_scanout_last_start, tick = hz*fg_scanout_period_us/1000000;
   fg_scanout_iv[gap <= tick + tick/8 ? 0 : gap <= 2*tick + tick/8 ? 1 : gap <= 3*tick + tick/8 ? 2 : 3]++;
  }
  fg_scanout_last_start = now;
