@@ -24,7 +24,8 @@ int main(){
   auto overlapping=alias(t,128,128);overlapping.srcX=i;overlapping.dstX=i+1;overlapping.dstY=1;
   {FrameTraceScope scope(&s);backend.submit({upload,overlapping,read});}
   assert(!memcmp(out->contents,expected.data(),expected.size()));
-  assert(!s.draws && !s.passes && s.backendSubmit && s.gpuWait);prepare+=s.backendSubmit;
+  assert(!s.draws && !s.passes && s.backendSubmit && s.backendCPU && s.gpuWait);
+  assert(s.record && s.recordCPU && s.kernelIO && s.kernelIOCPU && s.queueSubmit && s.queueSubmitCPU);prepare+=s.backendSubmit;
   if(backend.supportsTimestamps())assert(s.gpuExec);
   assert(backend.resourceBytes()==charged+(reuse?65536:0));
  }
@@ -44,6 +45,12 @@ int main(){
  Operation clear{};clear.texture=t;clear.clearOnly=true;clear.clear[3]=1;clear.areaWidth=512;
  FrameSample render;{FrameTraceScope scope(&render);backend.submit({clear});}assert(render.passes==1 && !render.draws);
  FrameSample empty;{FrameTraceScope scope(&empty);backend.submit({});}assert(!empty.gpuWait && !empty.gpuExec && !empty.passes);
+ // Async retirement must not extend submit-thread CPU time through the fence.
+ FrameSample deferred;std::function<void()> retire;
+ {FrameTraceScope scope(&deferred);backend.submit({upload,read},{},&retire);}
+ auto submittedCPU=deferred.backendCPU;assert(retire && submittedCPU && !deferred.gpuWait);
+ std::thread retireWorker([&]{FrameTraceScope scope(&deferred);retire();});retireWorker.join();
+ assert(deferred.backendCPU==submittedCPU && deferred.gpuWait);
  backend.destroy(t);backend.destroy(up);backend.destroy(out);
  assert(backend.resourceBytes()==baseline+(reuse?262144:0));backend.close();
  assert(liveMemoryObjects==objects); // retained scratch is reclaimed on clean close

@@ -353,8 +353,8 @@ public:
    if(type==memory.memoryTypeCount) throw std::runtime_error("no host-visible memory");
    VkMemoryAllocateInfo ai{};ai.sType=VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;ai.allocationSize=req.size;ai.memoryTypeIndex=type;b->memoryType=type;
    limits.reserve(ai.allocationSize);b->charged=ai.allocationSize;
-   check(AllocateMemory(device,&ai,nullptr,&b->memory));if(systemTranslationPolicy().frameTrace)++frameCounts.allocations;++liveMemoryObjects;liveMemoryBytes+=ai.allocationSize;b->memoryBytes=ai.allocationSize;check(BindBufferMemory(device,b->buffer,b->memory,0));
-   check(MapMemory(device,b->memory,0,VK_WHOLE_SIZE,0,&b->contents));memset(b->contents,0,(length+15)&~size_t(15));return b;
+   check(frameKernelCall([&]{return AllocateMemory(device,&ai,nullptr,&b->memory);}));if(systemTranslationPolicy().frameTrace)++frameCounts.allocations;++liveMemoryObjects;liveMemoryBytes+=ai.allocationSize;b->memoryBytes=ai.allocationSize;check(frameKernelCall([&]{return BindBufferMemory(device,b->buffer,b->memory,0);}));
+   check(frameKernelCall([&]{return MapMemory(device,b->memory,0,VK_WHOLE_SIZE,0,&b->contents);}));memset(b->contents,0,(length+15)&~size_t(15));return b;
   } catch(...) {destroyUnlocked(b);throw;}
  }
  // NativeMetal's no-copy buffer/linear-image design, using Fuxi HostImport's
@@ -380,8 +380,8 @@ public:
    VkImportMemoryHostPointerInfoEXT hi{};hi.sType=VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT;hi.handleType=VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;hi.pHostPointer=base;
    VkMemoryAllocateInfo ai{};ai.sType=VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;ai.pNext=&hi;ai.allocationSize=bytes;ai.memoryTypeIndex=type;
    limits.reserve(ai.allocationSize);b->charged=ai.allocationSize;
-   importCheck(AllocateMemory(device,&ai,nullptr,&b->memory));if(systemTranslationPolicy().frameTrace)++frameCounts.allocations;++liveMemoryObjects;liveMemoryBytes+=ai.allocationSize;b->memoryBytes=ai.allocationSize;b->allocated=bytes;b->memoryType=type;check(BindBufferMemory(device,b->buffer,b->memory,0));
-   check(MapMemory(device,b->memory,0,VK_WHOLE_SIZE,0,&b->contents));return b;
+   importCheck(frameKernelCall([&]{return AllocateMemory(device,&ai,nullptr,&b->memory);}));if(systemTranslationPolicy().frameTrace)++frameCounts.allocations;++liveMemoryObjects;liveMemoryBytes+=ai.allocationSize;b->memoryBytes=ai.allocationSize;b->allocated=bytes;b->memoryType=type;check(frameKernelCall([&]{return BindBufferMemory(device,b->buffer,b->memory,0);}));
+   check(frameKernelCall([&]{return MapMemory(device,b->memory,0,VK_WHOLE_SIZE,0,&b->contents);}));return b;
   }catch(...){destroyUnlocked(b);throw;}
  }
  static std::string linearAliasMismatch(const VkMemoryRequirements &req,const VkSubresourceLayout &layout,uint32_t memoryType,size_t allocated,size_t offset,size_t row) {
@@ -426,7 +426,7 @@ public:
    VkImageSubresource sub{VK_IMAGE_ASPECT_COLOR_BIT,0,0};VkSubresourceLayout layout{};GetImageSubresourceLayout(device,t->image,&sub,&layout);
    auto mismatch=linearAliasMismatch(req,layout,b->memoryType,b->allocated,offset,row);
    if(!mismatch.empty())return fallback("linear texture Vulkan memory/layout mismatch: "+mismatch);
-   check(BindImageMemory(device,t->image,b->memory,offset));t->memory=b->memory;t->memoryType=b->memoryType;t->borrowedMemory=true;t->allocated=req.size;
+   check(frameKernelCall([&]{return BindImageMemory(device,t->image,b->memory,offset);}));t->memory=b->memory;t->memoryType=b->memoryType;t->borrowedMemory=true;t->allocated=req.size;
    t->mapped=(uint8_t *)b->contents+offset;t->layout=ci.initialLayout;t->defined=true;t->usage=ci.usage;
    VkImageViewCreateInfo vi{};vi.sType=VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;vi.image=t->image;vi.viewType=VK_IMAGE_VIEW_TYPE_2D;vi.format=t->vkFormat;vi.subresourceRange={VK_IMAGE_ASPECT_COLOR_BIT,0,1,0,1};
    check(CreateImageView(device,&vi,nullptr,&t->view));t->filterable=formatProperties.linearTilingFeatures&VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT;t->backingBuffer=b;++b->references;return t;
@@ -435,9 +435,9 @@ public:
  void destroyUnlocked(Buffer *b) {
   if(!b || --b->references) return;
   if(!poisoned) {
-   if(b->contents) UnmapMemory(device,b->memory);
+   if(b->contents) frameKernelCall([&]{return UnmapMemory(device,b->memory);});
    if(b->buffer) DestroyBuffer(device,b->buffer,nullptr);
-   if(b->memory) {FreeMemory(device,b->memory,nullptr);--liveMemoryObjects;liveMemoryBytes-=b->memoryBytes;}
+   if(b->memory) {frameKernelCall([&]{return FreeMemory(device,b->memory,nullptr);});--liveMemoryObjects;liveMemoryBytes-=b->memoryBytes;}
   }
   limits.release(b->charged);delete b;
  }
@@ -447,7 +447,7 @@ public:
  }
  bool destroyTextureUnlocked(Texture *t) {
   if(!t || --t->references)return !poisoned;
-  if(!poisoned) {clearFrames(t);clearViews(t);if(t->mapped && !t->borrowedMemory)UnmapMemory(device,t->memory);for(auto v:t->attachmentViews)if(v)DestroyImageView(device,v,nullptr);if(t->view)DestroyImageView(device,t->view,nullptr);if(t->image)DestroyImage(device,t->image,nullptr);if(t->memory && !t->borrowedMemory){FreeMemory(device,t->memory,nullptr);--liveMemoryObjects;liveMemoryBytes-=t->memoryBytes;}}limits.release(t->charged);destroyUnlocked(t->backingBuffer);delete t;return !poisoned;
+  if(!poisoned) {clearFrames(t);clearViews(t);if(t->mapped && !t->borrowedMemory)frameKernelCall([&]{return UnmapMemory(device,t->memory);});for(auto v:t->attachmentViews)if(v)DestroyImageView(device,v,nullptr);if(t->view)DestroyImageView(device,t->view,nullptr);if(t->image)DestroyImage(device,t->image,nullptr);if(t->memory && !t->borrowedMemory){frameKernelCall([&]{return FreeMemory(device,t->memory,nullptr);});--liveMemoryObjects;liveMemoryBytes-=t->memoryBytes;}}limits.release(t->charged);destroyUnlocked(t->backingBuffer);delete t;return !poisoned;
  }
  bool supportsHostImport() const {return hostImport && hostAlignment && GetMemoryHostPointerPropertiesEXT && GetPhysicalDeviceImageFormatProperties2;}
  void destroySamplerUnlocked(Sampler *s) {if(s && !--s->references){if(!poisoned && s->sampler)DestroySampler(device,s->sampler,nullptr);delete s;}}
@@ -511,8 +511,8 @@ public:
    VkMemoryAllocateInfo ai{};ai.sType=VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;ai.pNext=&hi;ai.allocationSize=bytes;ai.memoryTypeIndex=type;t->memoryType=type;
    limits.reserve(ai.allocationSize);t->charged=ai.allocationSize;
    // Import/charge the whole surface, binding the image at its plane's offset.
-   check(AllocateMemory(device,&ai,nullptr,&t->memory));if(systemTranslationPolicy().frameTrace)++frameCounts.allocations;++liveMemoryObjects;liveMemoryBytes+=ai.allocationSize;t->memoryBytes=ai.allocationSize;t->allocated=bytes;check(BindImageMemory(device,t->image,t->memory,offset));
-   check(MapMemory(device,t->memory,0,VK_WHOLE_SIZE,0,&t->mapped));
+   check(frameKernelCall([&]{return AllocateMemory(device,&ai,nullptr,&t->memory);}));if(systemTranslationPolicy().frameTrace)++frameCounts.allocations;++liveMemoryObjects;liveMemoryBytes+=ai.allocationSize;t->memoryBytes=ai.allocationSize;t->allocated=bytes;check(frameKernelCall([&]{return BindImageMemory(device,t->image,t->memory,offset);}));
+   check(frameKernelCall([&]{return MapMemory(device,t->memory,0,VK_WHOLE_SIZE,0,&t->mapped);}));
    VkImageViewCreateInfo vi{};vi.sType=VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;vi.image=t->image;vi.viewType=VK_IMAGE_VIEW_TYPE_2D;vi.format=info.format;
    vi.subresourceRange={VK_IMAGE_ASPECT_COLOR_BIT,0,1,0,1};check(CreateImageView(device,&vi,nullptr,&t->view));return t;
   }catch(...) {guard.unlock();destroy(t);throw;}
@@ -555,7 +555,7 @@ public:
    if(memoryType==memory.memoryTypeCount)throw std::runtime_error("no device-local texture memory");
    VkMemoryAllocateInfo ai{};ai.sType=VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;ai.allocationSize=req.size;ai.memoryTypeIndex=memoryType;t->memoryType=memoryType;
    limits.reserve(ai.allocationSize);t->charged=ai.allocationSize;
-   check(AllocateMemory(device,&ai,nullptr,&t->memory));if(systemTranslationPolicy().frameTrace)++frameCounts.allocations;++liveMemoryObjects;liveMemoryBytes+=ai.allocationSize;t->memoryBytes=ai.allocationSize;check(BindImageMemory(device,t->image,t->memory,0));
+   check(frameKernelCall([&]{return AllocateMemory(device,&ai,nullptr,&t->memory);}));if(systemTranslationPolicy().frameTrace)++frameCounts.allocations;++liveMemoryObjects;liveMemoryBytes+=ai.allocationSize;t->memoryBytes=ai.allocationSize;check(frameKernelCall([&]{return BindImageMemory(device,t->image,t->memory,0);}));
    VkImageViewCreateInfo vi{};vi.sType=VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;vi.image=t->image;vi.viewType=t->textureType==0?VK_IMAGE_VIEW_TYPE_1D:VK_IMAGE_VIEW_TYPE_2D;vi.format=ii.format;
    vi.subresourceRange={VK_IMAGE_ASPECT_COLOR_BIT,0,levels,0,1};check(CreateImageView(device,&vi,nullptr,&t->view));return t;
   }catch(...) {destroyTextureUnlocked(t);throw;}
@@ -825,7 +825,10 @@ public:
  void submit(std::vector<Operation> ops,const std::function<void()> &scheduled={},std::function<void()> *retirement=nullptr,const std::function<void()> &prepare={}) {
   auto submitStart=std::chrono::steady_clock::now();auto submitQueued=submitStart;
   auto since=[](std::chrono::steady_clock::time_point t){return (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-t).count();};
+  auto *timing=systemTranslationPolicy().frameTrace?currentFrame:nullptr;
+  auto lockCPU=timing?frameThreadCPU():UINT64_MAX;
   std::unique_lock<std::mutex> guard(mutex);
+  if(timing)timing->backendLockCPU+=frameCPUDelta(lockCPU,frameThreadCPU());
   if(currentFrame)currentFrame->backendLock+=since(submitStart);
   requireLive();std::vector<HostUse> hostUses;
   if(retirement || systemTranslationPolicy().overlap){
@@ -840,7 +843,9 @@ public:
   bool drain=bool(prepare) || (retirement && std::any_of(ops.begin(),ops.end(),[](const auto &op){return op.indices!=nullptr;}));
   auto slotStart=FrameClock::now();
   if(currentFrame){currentFrame->drainWaits+=drain && (slots[0].busy || slots[1].busy);currentFrame->conflictWaits+=conflicts();currentFrame->slotWaits+=slots[0].busy && (!retirement || slots[1].busy);}
+  auto slotCPU=timing?frameThreadCPU():UINT64_MAX;
   submitWake.wait(guard,[&]{return (!slots[0].busy || (retirement && !slots[1].busy)) && (!drain || (!slots[0].busy && !slots[1].busy)) && !conflicts();});
+  if(timing)timing->slotWaitCPU+=frameCPUDelta(slotCPU,frameThreadCPU());
   if(currentFrame)currentFrame->slotWait+=since(slotStart);
   requireLive();auto &slot=slots[slots[0].busy?1:0];
   auto &commandPool=slot.commandPool;auto &command=slot.command;auto &submitFence=slot.submitFence;auto &queryPool=slot.queryPool;
@@ -850,6 +855,7 @@ public:
 #endif
   auto locked=currentFrame?FrameClock::now():FrameClock::time_point{};if(currentFrame)currentFrame->leaseLock+=uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(locked-submitStart).count());
   if(prepare){prepare();if(currentFrame)locked=FrameClock::now();}
+  auto backendCPU=timing?frameThreadCPU():UINT64_MAX;
   CacheActivity activity{cacheMode==CacheMode::persistent?&cacheActivity:nullptr};
   ArtifactCache::Access artifactAccess(artifactCache);
   Translator::Scope cacheScope(artifactCallbacks,artifactCache.available()?&artifactAccess:nullptr,ArtifactCache::read,ArtifactCache::write,ArtifactCache::outcome,artifactCallbacksVerified,ArtifactCache::readVerified);
@@ -862,15 +868,19 @@ public:
     !primitiveCount(op.topology,op.vertices);
   }),ops.end());
   // Empty completion participates in the same lock/order, but creates no BO or GPU fence.
-  if(ops.empty()){if(currentFrame)currentFrame->backendSubmit+=frameNanos(locked);++emptySubmits;if(scheduled)scheduled();return;}
+  if(ops.empty()){if(timing)timing->backendCPU+=frameCPUDelta(backendCPU,frameThreadCPU());if(currentFrame)currentFrame->backendSubmit+=frameNanos(locked);++emptySubmits;if(scheduled)scheduled();return;}
   bool submitted=false,completed=false;std::vector<VkImageView> sampleViews;std::vector<VkFramebuffer> frames;std::vector<VkRenderPass> emptyRenders;std::vector<Texture *> textures;
   struct TextureState {Texture *texture;VkImageLayout layout;std::array<VkImageLayout,32> levelLayouts;bool defined;uint32_t definedLevels;};std::vector<TextureState> oldTextures;
   size_t diagnosticOp=0;Buffer *neutralBuffer=nullptr,*aliasBuffer=nullptr;size_t aliasBytes=0;
   std::vector<bool> aliasCopies(ops.size(),false);
   auto cleanup=[&] {if(aliasBuffer!=aliasScratch)destroyUnlocked(aliasBuffer);destroyUnlocked(neutralBuffer);for(auto v:sampleViews)DestroyImageView(device,v,nullptr);for(auto frame:frames)DestroyFramebuffer(device,frame,nullptr);for(auto render:emptyRenders)DestroyRenderPass(device,render,nullptr);};
   // Exclusive prepare phases: object API/cache time is subtracted from recording.
-  uint64_t objectNanos=0,descriptorNanos=0;
-  struct Measure {uint64_t &total;std::chrono::steady_clock::time_point start=std::chrono::steady_clock::now();~Measure(){total+=(uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-start).count();}};
+  uint64_t objectNanos=0,descriptorNanos=0,objectCPU=0,descriptorCPU=0;
+  struct Measure {
+   uint64_t &total;uint64_t *cpu;std::chrono::steady_clock::time_point start=std::chrono::steady_clock::now();uint64_t cpuStart;
+   Measure(uint64_t &t,uint64_t *c=nullptr):total(t),cpu(c),cpuStart(c?frameThreadCPU():UINT64_MAX){}
+   ~Measure(){if(cpu)*cpu+=frameCPUDelta(cpuStart,frameThreadCPU());total+=frameNanos(start);}
+  };
   try {
    std::vector<DrawOutput> draws(ops.size());
    std::vector<std::array<MipRange,resourceSlots>> accessed(ops.size());
@@ -939,6 +949,7 @@ public:
      if(t && sam && !t->filterable && (sam->filters&(2u|4u|16u)))throw std::runtime_error("texture format linear filtering unavailable");
      if(sam){input.filters[i]=sam->filters;input.lodMin[i]=sam->lodMin;input.lodMax[i]=sam->lodMax;}
     }
+    FrameStageTimer pipelineTimer(timing,&FrameSample::pipe,&FrameSample::pipeCPU);
     char why[512]{};auto &translator=Translator::get();
     Translator::OptionsScope translationScope(translator);
     if(!translator.draw(op.pipeline->translation,&input,&draws[n],why,sizeof(why))){
@@ -955,6 +966,7 @@ public:
      }
      if(!translator.draw(op.pipeline->translation,&input,&draws[n],why,sizeof(why)))throw std::runtime_error(why);
     }
+    pipelineTimer.stop();
     // Analyze the final runtime variant and this draw's descriptors, not the
     // baseline shader or the order in which Metal bindings were set.
     auto &plan=draws[n];bool skipDraw=false;
@@ -1100,7 +1112,7 @@ public:
    size_t neutralSize=0;for(const auto &draw:draws)for(unsigned i=0;i<draw.descriptorCount;++i){const auto &d=draw.descriptors[i];if(d.source==2){
     if((d.type!=VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER && d.type!=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER) || d.offset || !d.range || d.range>maxBufferLength)throw std::runtime_error("planned neutral buffer bounds/type");
     neutralSize=std::max(neutralSize,size_t(d.range));}}
-   if(aliasBytes){Measure measure{objectNanos};
+   if(aliasBytes){Measure measure{objectNanos,timing?&objectCPU:nullptr};
     // Single synchronous lane: prior fence is complete before scratch is reused.
     // Larger requests keep the transient path; retained memory is quota charged.
     if(systemTranslationPolicy().pipelined && aliasBytes<=aliasScratchLimit){
@@ -1110,14 +1122,15 @@ public:
     }else aliasBuffer=allocateUnlocked(aliasBytes);
     addBuffer(aliasBuffer);
    }
-   if(neutralSize){Measure measure{objectNanos};neutralBuffer=allocateUnlocked(neutralSize);addBuffer(neutralBuffer);}
+   if(neutralSize){Measure measure{objectNanos,timing?&objectCPU:nullptr};neutralBuffer=allocateUnlocked(neutralSize);addBuffer(neutralBuffer);}
    for(auto *t:textures)oldTextures.push_back({t,t->layout,t->levelLayouts,t->defined,t->definedLevels});
-   auto flushStart=std::chrono::steady_clock::now();
+   auto flushStart=std::chrono::steady_clock::now();auto flushCPU=timing?frameThreadCPU():UINT64_MAX;
    // Direct shared host writes are not tracked. Only Vulkan HOST_COHERENT permits omission.
    for(auto *t:textures)if(t->mapped && !coherent(t->memoryType)) {VkMappedMemoryRange r{};r.sType=VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;r.memory=t->memory;r.size=VK_WHOLE_SIZE;++flushCalls;check(FlushMappedMemoryRanges(device,1,&r));}
    for(auto *b:buffers)if(!coherent(b->memoryType)) {VkMappedMemoryRange r{};r.sType=VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;r.memory=b->memory;r.size=VK_WHOLE_SIZE;++flushCalls;check(FlushMappedMemoryRanges(device,1,&r));}
+   if(timing)timing->flushCPU+=frameCPUDelta(flushCPU,frameThreadCPU());
    {auto ns=since(flushStart);submitFlushNanos+=ns;if(currentFrame)currentFrame->flush+=ns;}
-   {Measure measure{objectNanos};
+   {Measure measure{objectNanos,timing?&objectCPU:nullptr};
     if(!commandPool){VkCommandPoolCreateInfo pi{};pi.sType=VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;pi.queueFamilyIndex=family;check(CreateCommandPool(device,&pi,nullptr,&commandPool));++reuseCounts.commandPools;++submitObjectCreates;++submitPoolCreates;
      VkCommandBufferAllocateInfo ai{};ai.sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;ai.commandPool=commandPool;ai.level=VK_COMMAND_BUFFER_LEVEL_PRIMARY;ai.commandBufferCount=1;
      check(AllocateCommandBuffers(device,&ai,&command));++reuseCounts.commandBuffers;++submitObjectCreates;++submitPoolCreates;
@@ -1128,6 +1141,7 @@ public:
    }
    VkCommandBuffer cmd=command;VkQueryPool timestamps=queryPool;VkFence fence=submitFence;
    auto recordStart=std::chrono::steady_clock::now();uint64_t recordObjects=objectNanos;
+   auto recordCPU=timing?frameThreadCPU():UINT64_MAX;uint64_t recordObjectCPU=objectCPU;
    VkCommandBufferBeginInfo bi{};bi.sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;bi.flags=VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;check(BeginCommandBuffer(cmd,&bi));
    if(timestamps){CmdResetQueryPool(cmd,timestamps,0,2);CmdWriteTimestamp(cmd,VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,timestamps,0);}
    VkMemoryBarrier barrier{};barrier.sType=VK_STRUCTURE_TYPE_MEMORY_BARRIER;barrier.srcAccessMask=VK_ACCESS_HOST_WRITE_BIT;barrier.dstAccessMask=VK_ACCESS_MEMORY_READ_BIT|VK_ACCESS_MEMORY_WRITE_BIT;
@@ -1158,7 +1172,7 @@ public:
    };
    // Bound each descriptor type and sets independently; grow geometrically, retain one pool.
    VkDescriptorPool submitPool{};
-   {Measure measure{objectNanos};std::vector<VkDescriptorPoolSize> sizes;uint32_t sets=0;
+   {Measure measure{objectNanos,timing?&objectCPU:nullptr};std::vector<VkDescriptorPoolSize> sizes;uint32_t sets=0;
     for(size_t i=0;i<ops.size();++i){if(!ops[i].texture || !ops[i].pipeline || !draws[i].descriptorCount)continue;if(sets==4096)throw std::runtime_error("submit descriptor set bound");++sets;
      for(unsigned j=0;j<draws[i].descriptorCount;++j){auto ty=(VkDescriptorType)draws[i].descriptors[j].type;auto it=std::find_if(sizes.begin(),sizes.end(),[&](const VkDescriptorPoolSize &z){return z.type==ty;});if(it==sizes.end())sizes.push_back({ty,1});else {if(it->descriptorCount==65536)throw std::runtime_error("submit descriptor type bound");++it->descriptorCount;}}}
     if(sets>4096)throw std::runtime_error("submit descriptor set bound");
@@ -1238,7 +1252,7 @@ public:
      auto render=renderPass(op.pipeline,passOp?&*passOp:&op);
      VkFramebufferCreateInfo fi{};fi.sType=VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;fi.renderPass=render;
      fi.attachmentCount=used;fi.pAttachments=compactViews;fi.width=op.texture->levelWidth(op.dstLevel);fi.height=op.texture->levelHeight(op.dstLevel);fi.layers=1;VkFramebuffer frame{};
-     {Measure measure{objectNanos};auto found=std::find_if(frameCache.begin(),frameCache.end(),[&](auto c){return c.textures==targets && c.render==render && c.levels==levels;});
+     {Measure measure{objectNanos,timing?&objectCPU:nullptr};auto found=std::find_if(frameCache.begin(),frameCache.end(),[&](auto c){return c.textures==targets && c.render==render && c.levels==levels;});
       if(found!=frameCache.end())frame=found->frame;
       else {check(CreateFramebuffer(device,&fi,nullptr,&frame));++reuseCounts.frames;++submitObjectCreates;++submitFrameCreates;
        try {if(frameCache.size()<frameCacheLimit)frameCache.push_back({targets,render,levels,frame});else frames.push_back(frame);}catch(...){DestroyFramebuffer(device,frame,nullptr);throw;}}
@@ -1253,7 +1267,7 @@ public:
       VkDescriptorSetAllocateInfo sai{};sai.sType=VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;sai.descriptorPool=submitPool;sai.descriptorSetCount=1;sai.pSetLayouts=&op.pipeline->setLayout;
       bool fast=systemTranslationPolicy().submitFast;
       std::optional<std::array<BindingValue,16>> bindings;if(fast)bindings.emplace();std::array<VkWriteDescriptorSet,16> writes;
-      VkDescriptorSet set{};if(!fast){Measure measure{descriptorNanos};check(AllocateDescriptorSets(device,&sai,&set));if(systemTranslationPolicy().frameTrace)++frameCounts.descriptors;}
+      VkDescriptorSet set{};if(!fast){Measure measure{descriptorNanos,timing?&descriptorCPU:nullptr};check(AllocateDescriptorSets(device,&sai,&set));if(systemTranslationPolicy().frameTrace)++frameCounts.descriptors;}
       for(unsigned i=0;i<draw.descriptorCount;++i){const auto &d=draw.descriptors[i];
        VkWriteDescriptorSet write{};write.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;write.dstSet=set;write.dstBinding=d.binding;write.descriptorCount=1;write.descriptorType=(VkDescriptorType)d.type;
        VkDescriptorImageInfo image{};VkDescriptorBufferInfo buffer{};
@@ -1277,7 +1291,7 @@ public:
         if(!t || (d.type==VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER && d.sampler!=UINT32_MAX && !sam) || d.format!=(uint32_t)t->vkFormat)throw std::runtime_error("planned texture format mismatch");
         VkImageViewCreateInfo vi{};vi.sType=VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;vi.image=t->image;vi.viewType=t->textureType==0?VK_IMAGE_VIEW_TYPE_1D:VK_IMAGE_VIEW_TYPE_2D;vi.format=(VkFormat)d.format;vi.components={(VkComponentSwizzle)d.components[0],(VkComponentSwizzle)d.components[1],(VkComponentSwizzle)d.components[2],(VkComponentSwizzle)d.components[3]};uint32_t base=op.sampleBase[d.slot],count=op.sampleCount[d.slot]?op.sampleCount[d.slot]:t->levels-base;vi.subresourceRange={VK_IMAGE_ASPECT_COLOR_BIT,base,count,0,1};
         VkImageView view{};
-        {Measure measure{objectNanos};std::array<uint32_t,4> components{d.components[0],d.components[1],d.components[2],d.components[3]};
+        {Measure measure{objectNanos,timing?&objectCPU:nullptr};std::array<uint32_t,4> components{d.components[0],d.components[1],d.components[2],d.components[3]};
          auto found=std::find_if(viewCache.begin(),viewCache.end(),[&](auto c){return c.texture==t && c.format==vi.format && c.components==components && c.base==base && c.count==count;});
          if(found!=viewCache.end())view=found->view;
          else {check(CreateImageView(device,&vi,nullptr,&view));++reuseCounts.views;++submitObjectCreates;++submitViewCreates;
@@ -1288,9 +1302,9 @@ public:
 #endif
        }else {auto b=op.buffers[d.stages==1?0:1][d.slot];if(!b.buffer || !d.range || d.offset>((b.buffer->length+15)&~size_t(15)) || d.range>((b.buffer->length+15)&~size_t(15))-d.offset)throw std::runtime_error("planned buffer range mismatch");buffer={b.buffer->buffer,d.offset,d.range};write.pBufferInfo=&buffer;}
        if(fast){auto &value=(*bindings)[i];value={d.binding,d.type,image,buffer};writes[i]=write;writes[i].pImageInfo=write.pImageInfo?&value.image:nullptr;writes[i].pBufferInfo=write.pBufferInfo?&value.buffer:nullptr;}
-       else {Measure measure{descriptorNanos};UpdateDescriptorSets(device,1,&write,0,nullptr);}
+       else {Measure measure{descriptorNanos,timing?&descriptorCPU:nullptr};UpdateDescriptorSets(device,1,&write,0,nullptr);}
       }
-      if(fast){Measure measure{descriptorNanos};auto found=std::find_if(boundSets.begin(),boundSets.end(),[&](const auto &entry){return entry.layout==op.pipeline->setLayout && entry.count==draw.descriptorCount && entry.bindings==*bindings;});
+      if(fast){Measure measure{descriptorNanos,timing?&descriptorCPU:nullptr};auto found=std::find_if(boundSets.begin(),boundSets.end(),[&](const auto &entry){return entry.layout==op.pipeline->setLayout && entry.count==draw.descriptorCount && entry.bindings==*bindings;});
        if(found!=boundSets.end())set=found->set;
        else {check(AllocateDescriptorSets(device,&sai,&set));if(systemTranslationPolicy().frameTrace)++frameCounts.descriptors;
         for(unsigned i=0;i<draw.descriptorCount;++i)writes[i].dstSet=set;UpdateDescriptorSets(device,draw.descriptorCount,writes.data(),0,nullptr);
@@ -1363,7 +1377,12 @@ public:
    CmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,VK_PIPELINE_STAGE_HOST_BIT,0,1,&barrier,0,nullptr,0,nullptr);
    if(timestamps)CmdWriteTimestamp(cmd,VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,timestamps,1);
    check(EndCommandBuffer(cmd));
-   submitRecordNanos+=since(recordStart)-(objectNanos-recordObjects)-descriptorNanos;
+   auto recordNS=since(recordStart)-(objectNanos-recordObjects)-descriptorNanos;
+   submitRecordNanos+=recordNS;
+   if(timing){timing->record+=recordNS;timing->desc+=descriptorNanos;timing->descCPU+=descriptorCPU;
+    auto cpu=frameCPUDelta(recordCPU,frameThreadCPU());auto excluded=objectCPU-recordObjectCPU+descriptorCPU;
+    timing->recordCPU+=cpu>=excluded?cpu-excluded:0;
+   }
    submitObjectsNanos+=objectNanos;submitDescriptorsNanos+=descriptorNanos;
 #ifdef FUXI_MTL_HOST_TEST
    if(failBeforeQueue){failBeforeQueue=false;throw std::runtime_error("injected pre-submit failure");}
@@ -1375,8 +1394,16 @@ public:
 #ifdef FUXI_MTL_HOST_TEST
    if(failQueueAttempt){failQueueAttempt=false;check(VK_ERROR_DEVICE_LOST);}
 #endif
+   auto submitToQueue=[&]{
+    auto start=FrameClock::now();auto queueCPU=timing?frameThreadCPU():UINT64_MAX;
+    check(frameKernelCall([&]{return QueueSubmit(queue,1,&si,fence);}));
+    if(timing)timing->queueSubmitCPU+=frameCPUDelta(queueCPU,frameThreadCPU());
+    if(currentFrame){++currentFrame->queueSubmits;currentFrame->queueSubmit+=frameNanos(start);}
+    if(timing)timing->backendCPU+=frameCPUDelta(backendCPU,frameThreadCPU());
+    if(currentFrame)currentFrame->backendSubmit+=frameNanos(locked);
+   };
    if(!retirement){
-   {auto start=FrameClock::now();check(QueueSubmit(queue,1,&si,fence));if(currentFrame){++currentFrame->queueSubmits;currentFrame->queueSubmit+=frameNanos(start);}}if(currentFrame)currentFrame->backendSubmit+=frameNanos(locked);if(scheduled)scheduled();
+   submitToQueue();if(scheduled)scheduled();
    auto waitStart=currentFrame?FrameClock::now():FrameClock::time_point{}; // Lavapipe can JIT a generic CA shader on its submission worker. The
    // offline qualifier may extend only its host wait; production stays 2 s.
 #if defined(FUXI_MTL_HOST_TEST) && defined(FUXI_MTL_HOST_FENCE_NS)
@@ -1446,7 +1473,7 @@ public:
    };
    for(auto *b:pinnedBuffers)++b->references;for(auto *t:pinnedTextures)++t->references;for(auto *p:pinnedPipelines)++p->references;for(auto *s:pinnedSamplers)++s->references;
    slot.hostUses=std::move(hostUses);slot.busy=true;
-   {auto start=FrameClock::now();check(QueueSubmit(queue,1,&si,fence));if(currentFrame){++currentFrame->queueSubmits;currentFrame->queueSubmit+=frameNanos(start);}}if(currentFrame)currentFrame->backendSubmit+=frameNanos(locked);if(scheduled)scheduled();
+   submitToQueue();if(scheduled)scheduled();
    submitted=false;completed=true;
    *retirement=std::move(finish);
   } catch(...) {if(submitted){poisoned=true;slot.busy=false;submitWake.notify_all();}else if(!completed){for(auto old:oldTextures){old.texture->layout=old.layout;old.texture->levelLayouts=old.levelLayouts;old.texture->defined=old.defined;old.texture->definedLevels=old.definedLevels;}clearSubmitObjects(slot);cleanup();}

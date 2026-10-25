@@ -46,6 +46,7 @@ int main(){@autoreleasepool{
  dispatch_resume(queue->_retireQueue);blocked.get();[third waitUntilCompleted];[b waitUntilCompleted];[a waitUntilCompleted];
  assert(callbacks==4 && drawable->presents==1 && fuxi::Backend::live==0);
  assert(a->_flightTrace.commitCall && b->_flightTrace.submitQueue && third->_flightTrace.admissionWait);
+ assert(a->_flightTrace.frontendCPU && a->_flightTrace.frontendWall && third->_flightTrace.frontendWall>=third->_flightTrace.admissionWait);
  assert(queue->_traceReturn && queue->_traceDelivery && queue->_traceHandlers && queue->_traceWaitCompleted);
  [a addCompletedHandler:^(id<MTLCommandBuffer> command){assert(command.status==MTLCommandBufferStatusCompleted);++callbacks;}];[a waitUntilCompleted];assert(callbacks==5);
  [a release];[b release];[third release];[drawable release];

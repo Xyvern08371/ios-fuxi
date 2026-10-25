@@ -137,8 +137,9 @@ recording optimizations, not permission to overlap host writes with GPU reads.
 ## Reading the next device trace
 
 All appended timing pairs are p50/p90 **milliseconds**. Existing fields and
-window bounds stay intact. Frontend timing below is for overlap mode; zero
-means unavailable/not observed where appropriate.
+window bounds stay intact. The existing commit/queue frontend timings describe
+overlap mode; the new frontend CPU/wall pair also supports synchronous commits.
+Zero means unavailable/not observed where appropriate.
 
 | Fields | Interpretation |
 | --- | --- |
@@ -146,13 +147,44 @@ means unavailable/not observed where appropriate.
 | `commit_gap` | Previous commit's return boundary to this commit's entry on the same queue; idle gaps >=100 ms and overlapping callers yield zero. Boundary is immediately before releasing commitReady, since recording after return is impossible. |
 | `submit_queue` | Return boundary to execution on the serial submit worker. Explicit enqueue/commit order can enlarge this. |
 | `backend_lock`, `slot_wait`, `wait_reasons=drain,conflict,slots` | Device mutex acquisition vs backend condition-variable wait. Reason counters describe conditions observed before waiting, can overlap, and are not separate durations. |
-| `flush`, `queue_submit` | Vulkan mapped-memory flush CPU time vs actual successful vkQueueSubmit call CPU time. Both are included in backend_submit. |
+| `flush`, `queue_submit` | Vulkan mapped-memory flush wall time vs actual successful vkQueueSubmit call wall time. Both are included in backend_submit. |
 | `gpu_exec`, `gpu_wait`, `submits/frame` | GPU timestamps, host fence wait, and successful Vulkan submission count. More than one submit suggests event segmentation. |
 | `retire_lock`, `invalidate`, `retire_host`, `surface_release` | Reacquiring the backend mutex after the deferred fence, mapped-memory invalidation, host retirement including invalidation/query/destruction (excluding lock wait), and IOSurface lease release. These overlap; do not add invalidate to retire_host. |
 | `scheduled_handlers` | Inline scheduled-handler batch on the submit worker. A slow batch stalls later submissions and completion publication. |
 | `prior_delivery`, `prior_handlers`, `prior_wait_completed` | Last observed queue delivery delay, completed-handler runtime (including drawable presentation), and explicit waitUntilCompleted duration, sampled at commit entry. These are atomic queue observations, can repeat, and are **not** attributed to the current frame. Zero can mean no observation yet. |
 | `image_barriers/frame`, `read_barriers_skipped/frame`, `cross_encoder_merges/frame` | Actual image barriers emitted, read barriers omitted by bit 0, and encoder boundaries removed by bit 1. Global memory barriers are not part of image_barriers. |
 | `render_passes/frame`, `merged_draws/frame`, `merged_splits`, `interval` | Check that passes and encoder splits fall without losing draws, then compare actual frame cadence, not reciprocal wall latency. |
+
+Thread CPU diagnostics are appended after every existing field, only with
+`fuxigpuframetrace=1`. Every new value is a p50/p90 pair in milliseconds:
+
+| New fields | Interpretation |
+| --- | --- |
+| `backend_cpu` | Calling thread's user + system CPU time over the same interval as `backend_submit`: after backend mutex/slot admission and any `prepare` shadow refresh, through successful `vkQueueSubmit`. Empty submits stop at empty completion. Event segments accumulate; fence waits, retirement and scheduled callbacks are excluded. |
+| `frontend_cpu`, `frontend_wall` | Sum of residence inside FuxiMetal render/blit encoder and command-buffer preparation methods, per command buffer. Nested convenience/helper calls count once. Each call uses its own thread CPU delta, so sequential encoding across threads works. Includes overlap commit admission/snapshot work up to releasing the worker; synchronous commit stops before backend submission. Excludes callbacks, explicit completion waits, backend/retire workers, object teardown and CA's gaps between methods. This is a measured subset of client/commit work, not thread CPU for the whole `cpu_before_commit` span. |
+| `pipe`, `pipe_cpu` | Draw planning/translation and runtime pipeline specialization/variant lookup or creation. |
+| `desc`, `desc_cpu` | Descriptor allocation/update and fast descriptor-set lookup, using the existing backend descriptor measurement intervals. |
+| `record`, `record_cpu` | Vulkan command recording, excluding separately measured object/cache and descriptor API work. Resource planning/setup outside recording is still included in `backend_submit`/`backend_cpu`. |
+| `kernel_io`, `kernel_io_cpu` | Observable API envelopes for Vulkan allocation/free, memory binding/mapping/unmapping, `vkQueueSubmit`, and IOSurface lock/unlock while a frame is attributed. The external driver owns the actual GPU ABI/IOKit syscalls: these fields include userspace driver work and cannot isolate kernel time or intercept every internal syscall. IOSurface leases occur outside `backend_submit`; unlock can occur during retirement. This pair overlaps `queue_submit`, `pipe` and other containing stages; do not add them. |
+| `backend_lock_cpu`, `slot_wait_cpu`, `flush_cpu`, `queue_submit_cpu` | Thread CPU counterparts of the existing wall pairs `backend_lock`, `slot_wait`, `flush`, `queue_submit`. |
+
+Linux uses `clock_gettime(CLOCK_THREAD_CPUTIME_ID)`. Darwin uses
+`thread_info(THREAD_BASIC_INFO)` on `pthread_mach_thread_np(pthread_self())`,
+which needs no new Mach send right and is available on iOS 16 arm64. Darwin's
+microsecond CPU resolution can quantize short stages. Failed clock reads yield
+zero CPU contribution, never a wall-clock fallback. Timing is diagnostic and
+includes instrumentation overhead; disabled scopes make no clock calls,
+allocations or atomic updates. Host tests supply `FUXI_MTL_THREAD_CPU_NS` to
+exercise failures and deterministic CPU deltas.
+
+Compare each CPU pair with its matching wall pair. Much smaller CPU time
+supports off-CPU waiting/preemption; comparable times support on-CPU work,
+which can include kernel execution or spinning. Percentiles are calculated
+independently, so subtracting medians does not produce a wait-time percentile.
+The supplied approximately 5 ms `cpu_before_commit`, 4.7 ms `backend_submit`,
+7 ms `gpu_exec` and 18 ms `wall`, unchanged by the CPU clock increase, motivate
+this distinction but do not establish which wait dominates. No device was
+accessed for this extension.
 
 Large commit_gap with small admission/submit-queue/backend waits points outside
 submission (CA work, drawable availability, callback or tick scheduling).
@@ -168,8 +200,15 @@ gpu_exec without cadence improvement points back to CPU/presentation pacing.
 The CI metal target invokes `test-fuxi-metal-frontend.py`. On Linux this builds
 and runs portable C++ models under ASan/UBSan and explicitly skips native
 Foundation/Metal Objective-C runtime tests; `tools/ci/build.sh` requires macOS
-for its signed iOS bundle build. Native overlap tests now also assert the new
-commit/admission/handler attribution, but cannot execute on this Linux host.
+for its signed iOS bundle build. Native overlap tests also assert frontend
+CPU/wall and commit/admission/handler attribution, but cannot execute on this
+Linux host.
+
+The frame tests cover a real sleep versus CPU work, bounded appended fields,
+nested method attribution, gaps outside the frontend, encoding on different
+threads, failed clocks, and no CPU reads with tracing disabled. Backend controls
+also exercise contended mutex acquisition and deferred retirement without
+extending the submit CPU interval.
 
 `test-fuxi-metal-merge.py` compares exact authored pixels against the unchanged
 path for each bit independently and together, with overlap/feedback, blending,
@@ -181,7 +220,14 @@ old policy. The benchmark keeps shader/descriptor/merge settings fixed and
 varies encoder boundaries and the new mask. Host timings are observations,
 not A740 predictions or pass thresholds.
 
-Passed on Linux for this change:
+The CPU-time extension passed the frontend/model, backend (trace on/off,
+contention and fault injection), frametrace/reuse (including deferred
+retirement), merge, overlap, mipfeedback, M6 and local M9m/M9n/M9o suites,
+plus the portable metal/metal2/metal2g/metal2h ABI controls and
+`sync-fuxi-metal.py --check`. Native Objective-C and external-translator/Apple
+input suites remain outside Linux-only verification.
+
+Throughput-change Linux verification commands:
 
 * `python3 tools/test-fuxi-metal-frontend.py`
 * `python3 tools/test-fuxi-metal-backend.py --headers <vulkan-headers>`

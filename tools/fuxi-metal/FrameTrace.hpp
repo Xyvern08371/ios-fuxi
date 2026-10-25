@@ -3,6 +3,12 @@
 #include "TranslationPolicy.hpp"
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <ctime>
+#if defined(__APPLE__)
+#include <mach/mach.h>
+#include <pthread.h>
+#endif
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -10,6 +16,25 @@ namespace fuxi {
 using FrameClock=std::chrono::steady_clock;
 inline uint64_t frameNanos(FrameClock::time_point start) {
  return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(FrameClock::now()-start).count());
+}
+// Failure is a sentinel, never a wall-clock fallback. The hook also exercises
+// unsupported clocks and deterministic CPU deltas in Linux host tests.
+inline uint64_t frameThreadCPU() {
+#ifdef FUXI_MTL_THREAD_CPU_NS
+ return FUXI_MTL_THREAD_CPU_NS();
+#elif defined(__APPLE__)
+ thread_basic_info_data_t info{};mach_msg_type_number_t count=THREAD_BASIC_INFO_COUNT;
+ if(thread_info(pthread_mach_thread_np(pthread_self()),THREAD_BASIC_INFO,
+    reinterpret_cast<thread_info_t>(&info),&count)!=KERN_SUCCESS)return UINT64_MAX;
+ return (uint64_t(info.user_time.seconds)+uint64_t(info.system_time.seconds))*1000000000ULL+
+        (uint64_t(info.user_time.microseconds)+uint64_t(info.system_time.microseconds))*1000ULL;
+#else
+ timespec time{};if(clock_gettime(CLOCK_THREAD_CPUTIME_ID,&time))return UINT64_MAX;
+ return uint64_t(time.tv_sec)*1000000000ULL+uint64_t(time.tv_nsec);
+#endif
+}
+inline uint64_t frameCPUDelta(uint64_t start,uint64_t end) {
+ return start!=UINT64_MAX && end!=UINT64_MAX && end>=start?end-start:0;
 }
 inline unsigned frameCPUFromRegister(uint64_t value){return unsigned(value&0xfff);}
 inline unsigned frameCPU() {
@@ -26,6 +51,9 @@ inline thread_local FrameCounts frameCounts;
 enum class MergeSplit : size_t {none,encoder,attachments,area,actions,attachmentSample,storage,shadow,fetch,nonDraw,bufferAlias,count};
 inline constexpr const char *mergeSplitNames[]={"none","encoder","attachments","area","actions","attachment_sample","storage","shadow","fetch","non_draw","buffer_alias"};
 struct FrameSample {
+ uint64_t backendCPU=0,frontendCPU=0,frontendWall=0;
+ uint64_t pipe=0,desc=0,record=0,kernelIO=0;
+ uint64_t backendLockCPU=0,slotWaitCPU=0,pipeCPU=0,descCPU=0,recordCPU=0,flushCPU=0,kernelIOCPU=0,queueSubmitCPU=0;
  uint64_t wall=0,cpuBeforeCommit=0,shadowCopy=0,leaseLock=0,backendSubmit=0,gpuWait=0,gpuExec=0;
  uint64_t inflight=0,completionLatency=0;
  uint64_t commitCall=0,commitGap=0,admissionWait=0,snapshot=0,submitQueue=0;
@@ -44,6 +72,46 @@ struct FrameTraceScope {
  FrameSample *previous;
  explicit FrameTraceScope(FrameSample *sample):previous(currentFrame){currentFrame=sample;}
  ~FrameTraceScope(){currentFrame=previous;}
+};
+// Disabled scopes read no clocks, touch no atomics and allocate nothing.
+class FrameStageTimer {
+ FrameSample *sample;uint64_t FrameSample::*wall;uint64_t FrameSample::*cpu;
+ FrameClock::time_point start{};uint64_t cpuStart=UINT64_MAX;
+public:
+ FrameStageTimer(FrameSample *s,uint64_t FrameSample::*w,uint64_t FrameSample::*c):sample(s),wall(w),cpu(c) {
+  if(sample){start=FrameClock::now();cpuStart=frameThreadCPU();}
+ }
+ void stop(){if(sample){auto end=frameThreadCPU();sample->*wall+=frameNanos(start);sample->*cpu+=frameCPUDelta(cpuStart,end);sample=nullptr;}}
+ ~FrameStageTimer(){stop();}
+ FrameStageTimer(const FrameStageTimer &)=delete;
+ FrameStageTimer &operator=(const FrameStageTimer &)=delete;
+};
+// These are API envelopes: the external Vulkan driver owns its actual GPU ABI
+// syscalls. Do not interpret this as kernel-only execution or add it to submit.
+template<class Call> decltype(auto) frameKernelCall(Call &&call) {
+ FrameStageTimer timer(systemTranslationPolicy().frameTrace?currentFrame:nullptr,&FrameSample::kernelIO,&FrameSample::kernelIOCPU);
+ return call();
+}
+struct FrontendTimes {
+ std::atomic<uint64_t> cpu{0},wall{0};
+ void copyTo(FrameSample &s) const {s.frontendCPU=cpu.load(std::memory_order_relaxed);s.frontendWall=wall.load(std::memory_order_relaxed);}
+};
+// Sum only method residence, never gaps between calls. Nesting on the same
+// command buffer is counted once; different encoding threads take local deltas.
+class FrontendTimer {
+ FrontendTimes *times;FrontendTimer *previous=nullptr;
+ inline static thread_local FrontendTimer *active=nullptr;
+ FrameClock::time_point start{};uint64_t cpuStart=UINT64_MAX;
+public:
+ explicit FrontendTimer(FrontendTimes *t):times(t) {
+  if(!times)return;
+  for(auto *p=active;p;p=p->previous)if(p->times==t){times=nullptr;return;}
+  previous=active;active=this;start=FrameClock::now();cpuStart=frameThreadCPU();
+ }
+ void stop(){if(times){auto end=frameThreadCPU();times->wall.fetch_add(frameNanos(start),std::memory_order_relaxed);times->cpu.fetch_add(frameCPUDelta(cpuStart,end),std::memory_order_relaxed);active=previous;times=nullptr;}}
+ ~FrontendTimer(){stop();}
+ FrontendTimer(const FrontendTimer &)=delete;
+ FrontendTimer &operator=(const FrontendTimer &)=delete;
 };
 // Only BackboardGate accesses this, under its existing reporter/completion lock.
 class FrameTraceWindow {
@@ -97,6 +165,10 @@ public:
   stage("commit_call",&FrameSample::commitCall);stage("commit_gap",&FrameSample::commitGap);stage("admission_wait",&FrameSample::admissionWait);stage("snapshot",&FrameSample::snapshot);stage("submit_queue",&FrameSample::submitQueue);
   stage("backend_lock",&FrameSample::backendLock);stage("slot_wait",&FrameSample::slotWait);stage("flush",&FrameSample::flush);stage("queue_submit",&FrameSample::queueSubmit);stage("retire_lock",&FrameSample::retireLock);stage("invalidate",&FrameSample::invalidate);stage("retire_host",&FrameSample::retireHost);stage("surface_release",&FrameSample::surfaceRelease);stage("scheduled_handlers",&FrameSample::scheduledHandlers);
   stage("prior_delivery",&FrameSample::priorDelivery);stage("prior_handlers",&FrameSample::priorHandlers);stage("prior_wait_completed",&FrameSample::priorWaitCompleted);
+  stage("backend_cpu",&FrameSample::backendCPU);stage("frontend_cpu",&FrameSample::frontendCPU);stage("frontend_wall",&FrameSample::frontendWall);
+  stage("pipe",&FrameSample::pipe);stage("desc",&FrameSample::desc);stage("record",&FrameSample::record);stage("kernel_io",&FrameSample::kernelIO);
+  stage("backend_lock_cpu",&FrameSample::backendLockCPU);stage("slot_wait_cpu",&FrameSample::slotWaitCPU);
+  stage("pipe_cpu",&FrameSample::pipeCPU);stage("desc_cpu",&FrameSample::descCPU);stage("record_cpu",&FrameSample::recordCPU);stage("flush_cpu",&FrameSample::flushCPU);stage("kernel_io_cpu",&FrameSample::kernelIOCPU);stage("queue_submit_cpu",&FrameSample::queueSubmitCPU);
   fputc('\n',out);
   funlockfile(out);
   count=wallMax=draws=passes=encodeUnknown=gpuUnavailable=mergedDraws=0;mergeSplits.fill(0);counts={};totals={};cpus.fill(0);cadence.fill(0);

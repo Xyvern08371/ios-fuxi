@@ -18,7 +18,7 @@ def main():
     with tempfile.TemporaryDirectory() as tmp:
         d=Path(tmp);conf=d/'smoke.conf'
         compiler=['xcrun','clang++'] if os.uname().sysname=='Darwin' else ['clang++']
-        for name in ('ClientGateTests','BackboardGateTests','TextureLevelsTests','MipAccessTests','SurveyTests','ClientSetupTests','NativeSelectionTests','SurfaceLeaseTests','TranslationPolicyTests','CompileBoostTests','FrameTraceTests','OperationAPITests'):
+        for name in ('ClientGateTests','BackboardGateTests','TextureLevelsTests','MipAccessTests','SurveyTests','ClientSetupTests','NativeSelectionTests','SurfaceLeaseTests','TranslationPolicyTests','CompileBoostTests','FrameTraceTests','FrameCPUTests','OperationAPITests'):
             subprocess.run([*compiler,'-std=c++17','-Wall','-Wextra','-Werror','-pthread',
                             '-fsanitize=address,undefined',str(ROOT/'tools/fuxi-metal'/(name+'.cpp')),
                             '-o',str(d/name)],check=True)
@@ -27,6 +27,8 @@ def main():
                 subprocess.run([str(d/name)],env=dict(os.environ,FUXI_MTL_TEST_BOOTARGS='fuxigpuoverlap=1'),check=True,timeout=15)
             if not a.compile_only and name == 'FrameTraceTests':
                 subprocess.run([str(d/name)],env=dict(os.environ,FUXI_MTL_TEST_BOOTARGS='fuxigpumerge=1 fuxigpuoverlap=1'),check=True,timeout=15)
+            if not a.compile_only and name == 'FrameCPUTests':
+                subprocess.run([str(d/name)],env=dict(os.environ,FUXI_MTL_TEST_BOOTARGS='fuxigpuframetrace=1'),check=True,timeout=15)
             if not a.compile_only and name == 'TranslationPolicyTests':
                 keys = ('fuxigpustages', 'fuxigputrace', 'fuxigpuasync')
                 enabled = dict(os.environ, FUXI_MTL_STAGE_CACHE='1', FUXI_MTL_TRANSLATION_TRACE='1', FUXI_MTL_ASYNC_PIPELINES='1', FUXI_MTL_COMPILE_BOOST='1')
