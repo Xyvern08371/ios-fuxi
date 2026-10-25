@@ -83,6 +83,15 @@ impl Default for Push {fn default()->Self {Self{offset:0,size:0,stages:0,bytes:[
 #[derive(Default)]
 pub struct DrawOutput {descriptor_count:u32,push_count:u32,vertex_count:u32,indexed:u32,count:u32,first:u32,index_offset:u64,descriptors:[Descriptor;16],pushes:[Push;2],vertex_bindings:[u32;4],vertex_slots:[u32;4],vertex_offsets:[u64;4]}
 #[repr(C)]
+#[derive(Clone,Copy,Default)]
+pub struct DrawBufferRebase {active:u32,stage:u32,slot:u32,whole:u32,start:i64,size:u64,alignment:u64,max_range:u64}
+#[repr(C)]
+#[derive(Clone,Copy,Default)]
+pub struct DrawPushRebase {push:u32,offset:u32,kind:u32,source:u32}
+#[repr(C)]
+pub struct DrawRebase {enabled:u32,push_count:u32,buffers:[DrawBufferRebase;16],pushes:[DrawPushRebase;64]}
+impl Default for DrawRebase {fn default()->Self {Self{enabled:0,push_count:0,buffers:[DrawBufferRebase::default();16],pushes:[DrawPushRebase::default();64]}}}
+#[repr(C)]
 #[derive(Clone,Copy,Debug,Default)]
 pub struct Specialization {id:u32,offset:u32,size:u32}
 #[repr(C)]
@@ -743,6 +752,7 @@ mod tests {
         assert_eq!(std::mem::size_of::<Descriptor>(),64);
         assert_eq!(std::mem::size_of::<BakedSampler>(),44);
         assert_eq!(std::mem::size_of::<DrawInput>(),1056);
+        assert_eq!(std::mem::size_of::<DrawBufferRebase>(),48);assert_eq!(std::mem::size_of::<DrawRebase>(),1800);
         assert_eq!(std::mem::size_of::<Translation>(),2488);
         assert_eq!(std::mem::size_of::<Constant>(),156);
         assert_eq!(std::mem::size_of::<CompileOptions>(),40360);
@@ -984,6 +994,12 @@ fn check_plan(p:&metal2vulkan::bind::BindingPlan,expected:&metal2vulkan::cache::
  Ok(())
 }
 #[no_mangle] pub unsafe extern "C" fn fuxi_m2v_draw(product:*mut c_void,input:*const DrawInput,out:*mut DrawOutput,err:*mut c_char,cap:usize)->i32 {
+ draw_impl(product,input,out,std::ptr::null_mut(),err,cap)
+}
+#[no_mangle] pub unsafe extern "C" fn fuxi_m2v_draw_plan_v1(product:*mut c_void,input:*const DrawInput,out:*mut DrawOutput,rebase:*mut DrawRebase,err:*mut c_char,cap:usize)->i32 {
+ if !rebase.is_null(){*rebase=DrawRebase::default();}draw_impl(product,input,out,rebase,err,cap)
+}
+unsafe fn draw_impl(product:*mut c_void,input:*const DrawInput,out:*mut DrawOutput,rebase:*mut DrawRebase,err:*mut c_char,cap:usize)->i32 {
  attempt(err,cap,|| {
   if product.is_null() || input.is_null() || out.is_null(){return Err("nil draw argument".into());}
   let p=&*(product as *const Product);let i=&*input;
@@ -1051,8 +1067,41 @@ fn check_plan(p:&metal2vulkan::bind::BindingPlan,expected:&metal2vulkan::cache::
   for (binding,offset) in c.buffer_offsets {let b=plan.vertex_buffers.iter().find(|b|b.binding==binding && !b.per_bind_stride).ok_or("vertex binding plan")?;
    let n=o.vertex_count as usize;o.vertex_bindings[n]=binding;o.vertex_slots[n]=b.buffer_index;o.vertex_offsets[n]=offset;o.vertex_count+=1;
   }
+  if !rebase.is_null(){*rebase=draw_rebase(p,&plan,&o).unwrap_or_default();}
   *out=o;Ok(1)
  }).unwrap_or(0)
+}
+
+// Export only metadata of the accepted public plan, never infer fields from push bytes.
+fn draw_rebase(p:&Product,plan:&metal2vulkan::bind::BindingPlan,o:&DrawOutput)->Option<DrawRebase> {
+ use metal2vulkan::{pipeline::{SlotInterface,BufferForm,Window,PushField},bind::FieldLocation};
+ let mut r=DrawRebase::default();let limits=p.device.profile().limits();
+ let stage=|s|match s {Stage::Vertex=>Some(0u32),Stage::Fragment=>Some(1u32),_=>None};
+ for (j,w) in plan.descriptors.iter().enumerate(){
+  if let WriteSource::Buffer{slot}|WriteSource::InlineBytes{slot}=&w.source {
+   let SlotInterface::Buffer(b)=p.pipeline.interface.slots.get(slot)? else {return None;};
+   if !matches!(b.form,BufferForm::Descriptor(_)) || b.access.write{return None;}
+   let (whole,start,size)=match b.window {Window::Whole=>(1,0,0),Window::Bounded{start,len}=>(0,start,len),_=>return None};
+   let (alignment,max_range)=match o.descriptors[j].ty {6=>(limits.min_uniform_buffer_offset_alignment,u64::from(limits.max_uniform_buffer_range)),7=>(limits.min_storage_buffer_offset_alignment,u64::from(limits.max_storage_buffer_range)),_=>return None};
+   r.buffers[j]=DrawBufferRebase{active:1,stage:stage(slot.stage)?,slot:slot.index,whole,start,size,alignment:alignment.max(16),max_range};
+  }
+ }
+ for f in &plan.push.fields {
+  let (kind,source)=match f.field {
+   PushField::SlotBindOffset(slot)=>{let n=stage(slot.stage)?;let j=r.buffers.iter().position(|b|b.active!=0 && b.stage==n && b.slot==slot.index)?;(1,j as u32)},
+   PushField::SlotGuestBase(slot)=>{if slot.class!=SlotClass::Buffer || slot.index>=SLOTS{return None;}(2,stage(slot.stage)?*SLOTS+slot.index)},
+   PushField::BaseVertexInstance=>(3,0),
+   PushField::ColorWriteRule(_)|PushField::StorageKeptChannels|PushField::BlendColor|PushField::HalfBlendColor|PushField::VertexBufferStride(_)|PushField::Specialized(_)|PushField::TextureLevels(_)|PushField::TextureHalfChannels(_)|PushField::TextureIntegerChannels(_)|PushField::InstanceCount(_)=>continue,
+   _=>return None,
+  };
+  let FieldLocation::PushWindow{offset}=f.location else {return None;};
+  let flags=if f.stage==Stage::Vertex{1}else{16};let width=if kind==1{4}else{8};
+  if f.size!=width{return None;}
+  let j=o.pushes[..o.push_count as usize].iter().position(|w|w.stages==flags && offset>=w.offset && offset-w.offset+width<=w.size)?;
+  if r.push_count as usize>=r.pushes.len(){return None;}
+  r.pushes[r.push_count as usize]=DrawPushRebase{push:j as u32,offset:offset-o.pushes[j].offset,kind,source};r.push_count+=1;
+ }
+ r.enabled=1;Some(r)
 }
 
 #[repr(C)]

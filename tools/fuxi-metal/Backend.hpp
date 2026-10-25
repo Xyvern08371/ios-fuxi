@@ -964,8 +964,10 @@ public:
 #ifdef FUXI_MTL_HOST_TEST
     cacheDrawPlan=cacheDrawPlan && reuseDrawPlans;
 #endif
-    if(!(cacheDrawPlan && drawPlans.find(requestedPipeline,input,op.pipeline,draws[n]))){
-     char why[512]{};auto &translator=Translator::get();
+    bool planHit=cacheDrawPlan && drawPlans.find(requestedPipeline,input,op.pipeline,draws[n]);
+    if(timing){if(planHit)++timing->planHits;else ++timing->planMisses;}
+    if(!planHit){
+     char why[512]{};DrawRebase rebase{};auto &translator=Translator::get();
      Translator::OptionsScope translationScope(translator);
      auto *original=op.pipeline;std::optional<VariantKey> key;
      auto findVariant=[&]{if(!key)key.emplace(input);return std::find_if(original->variants.begin(),original->variants.end(),[&](const auto &v){return v.first==*key;});};
@@ -975,9 +977,9 @@ public:
      bool ready=false;
      if(!systemTranslationPolicy().trace && !original->variants.empty()){
       auto found=findVariant();
-      if(found!=original->variants.end() && translator.draw(found->second->translation,&input,&draws[n],why,sizeof(why))){op.pipeline=found->second;ready=true;}
+      if(found!=original->variants.end() && translator.planDraw(found->second->translation,&input,&draws[n],&rebase,why,sizeof(why))){op.pipeline=found->second;ready=true;}
      }
-     if(!ready && !translator.draw(original->translation,&input,&draws[n],why,sizeof(why))){
+     if(!ready && !translator.planDraw(original->translation,&input,&draws[n],&rebase,why,sizeof(why))){
       if(strcmp(why,"draw requires runtime variant") && strcmp(why,"draw requires different specialization"))throw std::runtime_error(why);
       auto found=findVariant();
       if(found!=original->variants.end())op.pipeline=found->second;
@@ -986,9 +988,9 @@ public:
        if(!translator.variant(original->translation,&input,&variant,why,sizeof(why)))throw std::runtime_error(why);
        auto *pipeline=createPipeline(variant,original->options);try{original->variants.push_back({*key,pipeline});}catch(...){destroyPipelineUnlocked(pipeline);throw;}original->retainedBytes+=pipeline->retainedBytes;drawPlans.invalidate(original);objects.reweigh(original,original->retainedBytes,[&](Pipeline *old){drawPlans.invalidate(old);destroyPipelineUnlocked(old);});op.pipeline=pipeline;
       }
-      if(!translator.draw(op.pipeline->translation,&input,&draws[n],why,sizeof(why)))throw std::runtime_error(why);
+      if(!translator.planDraw(op.pipeline->translation,&input,&draws[n],&rebase,why,sizeof(why)))throw std::runtime_error(why);
      }
-     if(cacheDrawPlan)drawPlans.insert(requestedPipeline,input,op.pipeline,draws[n]);
+     if(cacheDrawPlan)drawPlans.insert(requestedPipeline,input,op.pipeline,draws[n],rebase);
     }
     pipelineTimer.stop();
 #ifdef FUXI_MTL_HOST_TEST

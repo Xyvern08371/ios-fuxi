@@ -48,6 +48,11 @@ inline bool sameDrawInput(const DrawInput &a,const DrawInput &b) {
 }
 struct Push {uint32_t offset{},size{},stages{};uint8_t bytes[128]{};};
 struct DrawOutput {uint32_t descriptorCount{},pushCount{},vertexCount{},indexed{},count{},first{};uint64_t indexOffset{};Descriptor descriptors[16]{};Push pushes[2]{};uint32_t vertexBindings[4]{},vertexSlots[4]{};uint64_t vertexOffsets[4]{};};
+// Optional ABI-8 extension, emitted by our bridge from public pipeline/plan metadata.
+struct DrawBufferRebase {uint32_t active{},stage{},slot{},whole{};int64_t start{};uint64_t size{},alignment{},maxRange{};};
+struct DrawPushRebase {uint32_t push{},offset{},kind{},source{};}; // residual descriptor, guest slot, draw base
+struct DrawRebase {uint32_t enabled{},pushCount{};DrawBufferRebase buffers[16]{};DrawPushRebase pushes[64]{};};
+static_assert(sizeof(DrawBufferRebase)==48 && sizeof(DrawRebase)==1800,"draw rebase ABI");
 struct Specialization {uint32_t id{},offset{},size{};};
 struct Range {uint32_t offset{},size{},stages{};};
 struct BakedSampler {uint32_t enabled{},mag{},min{},mip{},address[3]{};float bias{},minLod{},maxLod{};uint32_t border{};};
@@ -89,6 +94,8 @@ public:
  int (*function)(void *,const char *,char *,size_t){};
  int (*compile)(void *,const char *,void *,const char *,void *,uint64_t,uint64_t,const CompileOptions *,Translation *,char *,size_t){};
  int (*draw)(void *,const DrawInput *,DrawOutput *,char *,size_t){};
+ int (*draw_plan)(void *,const DrawInput *,DrawOutput *,DrawRebase *,char *,size_t){};
+ int planDraw(void *p,const DrawInput *i,DrawOutput *o,DrawRebase *r,char *why,size_t cap){*r={};return draw_plan && !systemTranslationPolicy().trace?draw_plan(p,i,o,r,why,cap):draw(p,i,o,why,cap);}
  int (*variant)(void *,const DrawInput *,Translation *,char *,size_t){};
  int (*sampler)(void *,uint32_t,BakedSampler *,char *,size_t){};
  int (*identity)(void *,const char *,void *,const char *,const CompileOptions *,uint8_t *,char *,size_t){};
@@ -103,6 +110,7 @@ public:
 #define LOAD(n) n=(decltype(n))dlsym(dylib,"fuxi_m2v_" #n);if(!n) {dlclose(dylib);throw std::runtime_error("missing translator " #n);}
   LOAD(open) LOAD(close) LOAD(function) LOAD(compile) LOAD(draw) LOAD(variant) LOAD(sampler) LOAD(identity) LOAD(product_hash) LOAD(free)
 #undef LOAD
+  draw_plan=(decltype(draw_plan))dlsym(dylib,"fuxi_m2v_draw_plan_v1");
   texture_type=(decltype(texture_type))dlsym(dylib,"fuxi_m2v_texture_type");
   translationScope=(TranslationScope)dlsym(dylib,"fuxi_m2v_translation_scope_v1");
   auto policy=systemTranslationPolicy();if(policy.stages || policy.trace)fprintf(stderr,"FUXI MTL: translation settings stages=%u trace=%u bridge=%u\n",unsigned(policy.stages),unsigned(policy.trace),unsigned(translationScope!=nullptr));
