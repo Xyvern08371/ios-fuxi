@@ -199,6 +199,7 @@ struct DescriptorContext {
  explicit DescriptorContext(NSString *text):previous(descriptorContext){descriptorContext=text;}
  ~DescriptorContext(){descriptorContext=previous;}
 };
+static qos_class_t compositorQoS(){return strcmp(clientProcess,"backboardd")?QOS_CLASS_DEFAULT:QOS_CLASS_USER_INTERACTIVE;}
 static void failureLog(const char *format,...) {
  fuxi::backboardGate.fault();uint64_t n=failureCount.fetch_add(1);
  char message[fuxi::Survey::messageBytes];va_list args;va_start(args,format);vsnprintf(message,sizeof(message),format,args);va_end(args);
@@ -1118,7 +1119,7 @@ static NSString *renderPassText(MTLRenderPassDescriptor *d){
  if(!d || d.errorOptions!=MTLCommandBufferErrorOptionNone){unsupported(self,_cmd);return nil;}return [self commandBuffer];
 }
 - (void)setSubmissionQueue:(dispatch_queue_t)queue {CENSUS();(void)queue;}
-- (void)setCompletionQueue:(dispatch_queue_t)queue {CENSUS();if(queue)dispatch_retain(queue);if(_completionQueue)dispatch_release(_completionQueue);_completionQueue=queue;if(_deliveryQueue)dispatch_set_target_queue(_deliveryQueue,queue?:dispatch_get_global_queue(QOS_CLASS_DEFAULT,0));}
+- (void)setCompletionQueue:(dispatch_queue_t)queue {CENSUS();if(queue)dispatch_retain(queue);if(_completionQueue)dispatch_release(_completionQueue);_completionQueue=queue;if(_deliveryQueue)dispatch_set_target_queue(_deliveryQueue,queue?:dispatch_get_global_queue(compositorQoS(),0));}
 - (int)setOwnerWithIdentity:(unsigned)identity {CENSUS();(void)identity;return 46;}
 - (void)setFineGrainedBackgroundVisibilityEnabled:(BOOL)enabled {CENSUS();(void)enabled;}
 - (BOOL)setGPUPriority:(NSUInteger)priority {CENSUS();(void)priority;return NO;}
@@ -1649,7 +1650,10 @@ static NSString *surfaceDescriptorText(IOSurfaceRef surface,NSUInteger plane){
  if(!n || n>64) {unsupported(self,_cmd);return nil;}FuxiQueue *q=[self newCommandQueue];if(n==1 && q && q->_inflight){dispatch_release(q->_inflight);q->_inflight=dispatch_semaphore_create(1);}return q;
 }
 - (id)newCommandQueue {CENSUS();if(clientMode==fuxi::ClientMode::census)return nil;FuxiQueue *q=[FuxiQueue new];q->_device=[self retain];q->_depth=0;if(fuxi::systemTranslationPolicy().overlap){
- q->_submitQueue=dispatch_queue_create("fuxi.metal.submit",DISPATCH_QUEUE_SERIAL);q->_retireQueue=dispatch_queue_create("fuxi.metal.retire",DISPATCH_QUEUE_SERIAL);q->_deliveryQueue=dispatch_queue_create("fuxi.metal.handlers",DISPATCH_QUEUE_SERIAL);q->_inflight=dispatch_semaphore_create(2);
+ // The compositor's submit/retire/handler work is on the frame path; at default
+ // QoS it competes with background daemons (UniXNU AdrenoMetal c6d29ca does the same).
+ dispatch_queue_attr_t attr=dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL,compositorQoS(),0);
+ q->_submitQueue=dispatch_queue_create("fuxi.metal.submit",attr);q->_retireQueue=dispatch_queue_create("fuxi.metal.retire",attr);q->_deliveryQueue=dispatch_queue_create("fuxi.metal.handlers",attr);q->_inflight=dispatch_semaphore_create(2);
  }return q;}
 - (id)newHeapWithDescriptor:(MTLHeapDescriptor *)d {CENSUS();
  if(!d || d.type!=MTLHeapTypeAutomatic || !d.size || d.size>fuxi::Backend::maxBufferLength || (d.storageMode!=MTLStorageModeShared && d.storageMode!=MTLStorageModePrivate) || (d.cpuCacheMode!=MTLCPUCacheModeDefaultCache && d.cpuCacheMode!=MTLCPUCacheModeWriteCombined) ||
