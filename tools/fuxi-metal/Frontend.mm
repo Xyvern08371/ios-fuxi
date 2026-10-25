@@ -1667,15 +1667,19 @@ static NSString *surfaceDescriptorText(IOSurfaceRef surface,NSUInteger plane){
  if(gpuScanout){IOSurfaceUnlock(surface,0,nullptr);t->_surfaceLockHeld=NO;}
  fprintf(stderr,"FUXI MTL: IOSurface import PASS BGRA8 %lux%lu same-memory %s\n",(unsigned long)d.width,(unsigned long)d.height,layout.UTF8String);return t;
 }
+// Repeat, mirror repeat, clamp-to-zero and clamp-to-border map to core Vulkan; mirror clamp-to-edge stays refused.
+static bool fuxiAddressMode(MTLSamplerAddressMode m) {return m==MTLSamplerAddressModeClampToEdge || m==MTLSamplerAddressModeRepeat ||
+ m==MTLSamplerAddressModeMirrorRepeat || m==MTLSamplerAddressModeClampToZero || m==MTLSamplerAddressModeClampToBorderColor;}
 - (id)newSamplerStateWithDescriptor:(MTLSamplerDescriptor *)d {CENSUS();
  if(clientMode==fuxi::ClientMode::census)return nil;
  if(!d || d.minFilter>MTLSamplerMinMagFilterLinear || d.magFilter>MTLSamplerMinMagFilterLinear ||
-    d.mipFilter>MTLSamplerMipFilterLinear || d.sAddressMode!=MTLSamplerAddressModeClampToEdge ||
-    d.tAddressMode!=MTLSamplerAddressModeClampToEdge || d.rAddressMode!=MTLSamplerAddressModeClampToEdge ||
+    d.mipFilter>MTLSamplerMipFilterLinear || !fuxiAddressMode(d.sAddressMode) ||
+    !fuxiAddressMode(d.tAddressMode) || !fuxiAddressMode(d.rAddressMode) || d.borderColor>MTLSamplerBorderColorOpaqueWhite ||
     !d.normalizedCoordinates || d.maxAnisotropy!=1 || d.compareFunction!=MTLCompareFunctionNever ||
     !std::isfinite(d.lodMinClamp) || !std::isfinite(d.lodMaxClamp) || d.lodMinClamp<0 || d.lodMaxClamp<d.lodMinClamp || d.lodAverage || d.supportArgumentBuffers) {failureLog("FUXI MTL: sampler reject descriptor min=%lu mag=%lu mip=%lu lod=%.9g..%.9g address=%lu,%lu,%lu normalized=%u anisotropy=%lu compare=%lu average=%u arguments=%u\n",(unsigned long)d.minFilter,(unsigned long)d.magFilter,(unsigned long)d.mipFilter,d.lodMinClamp,d.lodMaxClamp,(unsigned long)d.sAddressMode,(unsigned long)d.tAddressMode,(unsigned long)d.rAddressMode,d.normalizedCoordinates,(unsigned long)d.maxAnisotropy,(unsigned long)d.compareFunction,d.lodAverage,d.supportArgumentBuffers);return nil;}
  FuxiSampler *state=[FuxiSampler new];state->_device=[self retain];state->_label=[d.label copy];
- try {state->_sampler=owner(self)->backend->allocateSampler(d.minFilter==MTLSamplerMinMagFilterLinear,d.magFilter==MTLSamplerMinMagFilterLinear,(uint32_t)d.mipFilter,d.lodMinClamp,d.lodMaxClamp);}
+ try {const uint32_t address[3]={(uint32_t)d.sAddressMode,(uint32_t)d.tAddressMode,(uint32_t)d.rAddressMode};
+  state->_sampler=owner(self)->backend->allocateSampler(d.minFilter==MTLSamplerMinMagFilterLinear,d.magFilter==MTLSamplerMinMagFilterLinear,(uint32_t)d.mipFilter,d.lodMinClamp,d.lodMaxClamp,address,(uint32_t)d.borderColor);}
  catch(const std::exception &e) {failureLog("FUXI MTL: sampler FAIL %s\n",e.what());[state release];return nil;}return state;
 }
 - (id)newRenderPipelineStateWithDescriptor:(MTLRenderPipelineDescriptor *)d error:(NSError **)error {CENSUS();

@@ -429,12 +429,24 @@ public:
  }
  bool supportsHostImport() const {return hostImport && hostAlignment && GetMemoryHostPointerPropertiesEXT && GetPhysicalDeviceImageFormatProperties2;}
  void destroy(Sampler *s) {std::lock_guard<std::mutex> guard(mutex);if(s){if(!poisoned && s->sampler)DestroySampler(device,s->sampler,nullptr);delete s;}}
- Sampler *allocateSampler(bool minLinear,bool magLinear,uint32_t mip=0,float minLod=0,float maxLod=FLT_MAX) {
+ // address: Metal MTLSamplerAddressMode per axis (0 clamp-to-edge, 2 repeat, 3 mirror repeat, 4 clamp-to-zero,
+ // 5 clamp-to-border with border 0/1/2 = transparent black/opaque black/opaque white). Mirror clamp-to-edge (1) is refused.
+ Sampler *allocateSampler(bool minLinear,bool magLinear,uint32_t mip=0,float minLod=0,float maxLod=FLT_MAX,const uint32_t *address=nullptr,uint32_t border=0) {
   std::lock_guard<std::mutex> guard(mutex);requireLive();auto *s=new Sampler{};s->lodMin=minLod;s->lodMax=maxLod;s->filters=1|(minLinear?2:0)|(magLinear?4:0)|(mip<<3);
   if(mip>2 || !std::isfinite(minLod) || !std::isfinite(maxLod) || minLod<0 || maxLod<minLod){delete s;throw std::runtime_error("sampler mip/LOD");}
   VkSamplerCreateInfo ci{};ci.sType=VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;ci.minFilter=minLinear?VK_FILTER_LINEAR:VK_FILTER_NEAREST;
   ci.magFilter=magLinear?VK_FILTER_LINEAR:VK_FILTER_NEAREST;ci.mipmapMode=mip==2?VK_SAMPLER_MIPMAP_MODE_LINEAR:VK_SAMPLER_MIPMAP_MODE_NEAREST;
-  ci.addressModeU=ci.addressModeV=ci.addressModeW=VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;ci.minLod=mip?std::min(minLod,VK_LOD_CLAMP_NONE):0;ci.maxLod=mip?std::min(maxLod,VK_LOD_CLAMP_NONE):0;
+  ci.addressModeU=ci.addressModeV=ci.addressModeW=VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+  if(address) {VkSamplerAddressMode *modes[3]={&ci.addressModeU,&ci.addressModeV,&ci.addressModeW};bool clampBorder=false;
+   for(unsigned i=0;i<3;++i)switch(address[i]) {
+    case 0:break;case 2:*modes[i]=VK_SAMPLER_ADDRESS_MODE_REPEAT;break;case 3:*modes[i]=VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT;break;
+    case 4:*modes[i]=VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER;break;
+    case 5:*modes[i]=VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER;clampBorder=true;break;
+    default:delete s;throw std::runtime_error("sampler address mode");}
+   if(clampBorder && border>2){delete s;throw std::runtime_error("sampler border color");}
+   // Clamp-to-zero reads transparent black; Metal's border colors map to the float borders.
+   ci.borderColor=!clampBorder||border==0?VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK:border==1?VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK:VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE;}
+  ci.minLod=mip?std::min(minLod,VK_LOD_CLAMP_NONE):0;ci.maxLod=mip?std::min(maxLod,VK_LOD_CLAMP_NONE):0;
   try {check(CreateSampler(device,&ci,nullptr,&s->sampler));return s;}catch(...) {delete s;throw;}
  }
  // The caller retains/locks the IOSurface; ABI 2 pins its task pages and handles
