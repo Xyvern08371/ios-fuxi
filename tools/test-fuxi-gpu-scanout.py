@@ -37,6 +37,8 @@ static void absolutetime_to_nanoseconds(uint64_t t,uint64_t *ns) {*ns=t*1000;}
 static uint32_t ctl[1024],intf[1024];
 static volatile uint32_t *fuxi_ctl0=ctl,*fuxi_intf1=intf;
 static int fuxi_gpu_ready(void) {return ready;}
+static unsigned modelDrain;
+static int PE_parse_boot_argn(const char *name,void *value,int size) {(void)name;if(!modelDrain || size<4)return 0;*(unsigned *)value=modelDrain;return 1;}
 static int fg_abi_live_for_scanout(void) {return abiLive;}
 static int fg_abi_observe(void) {observations++;if(!abiResult)fg_client_busy=0;return abiResult;}
 static uint64_t model_counter(const char *r) {return !strcmp(r,"cntfrq_el0")?1000000:ticks;}

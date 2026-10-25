@@ -22,6 +22,11 @@ static uintptr_t fg_scanout_pixels, fg_scanout_source;
 static unsigned fg_scanout_pitch, fg_scanout_sx, fg_scanout_sy;
 static unsigned fg_scanout_dx, fg_scanout_dy, fg_scanout_w, fg_scanout_h;
 static uint64_t fg_scanout_after, fg_scanout_timeout;
+/* Floor after each START before the transfer status is tested. Boot-arg
+ * fuxiscandrain=<us> (4000..20000) lowers it; the START/write-line checks
+ * still gate every copy. Wait polls are counted per reason. */
+static unsigned fg_scanout_drain_us = FG_SCAN_DRAIN_US;
+static unsigned fg_scanout_wait_ring, fg_scanout_wait_floor, fg_scanout_wait_xfer, fg_scanout_starts;
 static int fg_abi_observe(void);
 
 void fuxi_gpu_scanout_configure(uintptr_t pixels, unsigned enabled, unsigned check)
@@ -31,7 +36,12 @@ void fuxi_gpu_scanout_configure(uintptr_t pixels, unsigned enabled, unsigned che
  fg_scanout_requested = enabled == 1;
  fg_scanout_checks = fg_scanout_requested && check == 1 ? 4 : 0;
  if (fg_scanout_requested)
-  printf("FUXI SCANOUT: requested, fence then manual transfer, drain_us=20000 check=%u\n", fg_scanout_checks);
+{
+  unsigned drain = 0;
+  if (PE_parse_boot_argn("fuxiscandrain", &drain, sizeof(drain)) && drain >= 4000 && drain <= FG_SCAN_DRAIN_US)
+   fg_scanout_drain_us = drain;
+  printf("FUXI SCANOUT: requested, fence then manual transfer, drain_us=%u check=%u\n", fg_scanout_drain_us, fg_scanout_checks);
+ }
 }
 int fuxi_gpu_scanout_owned(void)
 {
@@ -76,7 +86,7 @@ int fuxi_gpu_scanout_acquire(void)
   if (!fg_scanout_write(FG_SCAN_INTF+0x2b4, ar & ~0x80000000u))
    return fg_scanout_stop("disable autorefresh");
   __asm__ volatile("dsb sy" ::: "memory");
-  fg_scanout_after = rsr("cntpct_el0") + rsr("cntfrq_el0")*FG_SCAN_DRAIN_US/1000000;
+  fg_scanout_after = rsr("cntpct_el0") + rsr("cntfrq_el0")*fg_scanout_drain_us/1000000;
   fg_scanout_timeout = fg_scanout_after + rsr("cntfrq_el0")/10;
   unsigned rd = 0, wr = 0, st = 0;
   (void)fg_scanout_read(FG_SCAN_INTF+0x2a8, &rd);
@@ -89,8 +99,8 @@ int fuxi_gpu_scanout_acquire(void)
  unsigned ar, line, start;
  if (!fg_scanout_read(FG_SCAN_INTF+0x2b4, &ar) || (ar & 0x80000000u))
   return fg_scanout_stop("autorefresh changed");
- if (fg_busy) return 0;
- if (rsr("cntpct_el0") < fg_scanout_after) return 0;
+ if (fg_busy) { fg_scanout_wait_ring++; return 0; }
+ if (rsr("cntpct_el0") < fg_scanout_after) { fg_scanout_wait_floor++; return 0; }
  if (!fg_scanout_read(FG_SCAN_INTF+0x2b0, &line) ||
      !fg_scanout_read(FG_SCAN_CTL+0x1c, &start)) return fg_scanout_stop("read transfer status");
  if ((start & 1) || ((line & 65535) != 0 && (line & 65535) < 2400)) {
@@ -100,6 +110,7 @@ int fuxi_gpu_scanout_acquire(void)
    printf("FUXI SCANOUT: drain timeout wr=%#x rd=%#x start=%#x\n", line, rd, start);
    return fg_scanout_stop("transfer drain timeout");
   }
+  fg_scanout_wait_xfer++;
   return 0;
  }
  __asm__ volatile("dsb sy" ::: "memory");
@@ -122,8 +133,13 @@ int fuxi_gpu_scanout_publish(void)
  __asm__ volatile("dsb sy" ::: "memory");
  fg_scanout_writable = 0;
  if (!fg_scanout_write(FG_SCAN_CTL+0x1c, 1)) return fg_scanout_stop("start transfer");
+ if (++fg_scanout_starts % 600 == 0) {
+  printf("FUXI SCANOUT: waits per 600 starts ring=%u floor=%u transfer=%u drain_us=%u\n",
+      fg_scanout_wait_ring, fg_scanout_wait_floor, fg_scanout_wait_xfer, fg_scanout_drain_us);
+  fg_scanout_wait_ring = fg_scanout_wait_floor = fg_scanout_wait_xfer = 0;
+ }
  __asm__ volatile("dsb sy" ::: "memory");
- fg_scanout_after = rsr("cntpct_el0") + rsr("cntfrq_el0")*FG_SCAN_DRAIN_US/1000000;
+ fg_scanout_after = rsr("cntpct_el0") + rsr("cntfrq_el0")*fg_scanout_drain_us/1000000;
  fg_scanout_timeout = fg_scanout_after + rsr("cntfrq_el0")/10;
  return 1;
 }

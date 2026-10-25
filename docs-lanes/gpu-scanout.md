@@ -276,3 +276,22 @@ GPU/cache/DPU/TE/DSC behavior and timing remain unverified.
    replay safely on CPU, unknown DMA/display ownership holds writes, existing
    failure/strike CPU recovery remains effective, and the next no-option boot
    restores the inherited path. No device fault test was run for this change.
+
+## Drain floor and wait counters (`fuxiscandrain=<us>`)
+
+OBSERVED (scripted gestures, backboardd on FuxiMetal with two frames in flight):
+- CA swaps at about 34/s, but the panel shows about 24 frames/s, and about 30%
+  of swaps are superseded before they are shown.
+- The scanout summary counts about 8.5 deferred acquire polls per shown frame,
+  at about 1 ms each.
+- After every START, acquire waits a fixed 20 ms floor (`FG_SCAN_DRAIN_US`)
+  before it tests CTL START and the write line. It also waits for an idle GPU
+  ring (`fg_busy`).
+
+GUESS: the floor and the ring wait, not CA rendering, set the shown frame rate.
+
+`fuxiscandrain=<us>` (4000..20000; the default stays 20000) lowers the floor.
+The START bit and write-line checks still gate every copy. Every 600 starts,
+`FUXI SCANOUT: waits per 600 starts ring=… floor=… transfer=…` reports the
+polls each gate held. A large `transfer` count at a low floor means the panel
+transfer itself is still running; tearing would show there first.
