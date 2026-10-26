@@ -871,3 +871,89 @@ producer backlog, the unchanged TE/transfer safety gates and unqualified real
 GPU/cache/DPU timing. Validate the new stage windows, animation, idle,
 blank/wake and fault/stop behavior on a separately authorized device run.
 No device access, deployment, full kernel link, push or CI run was performed.
+
+## Honest IOSurface use and SwapWait retirement
+
+2026-10-27. Read-only local iOS 16.7 shared-cache interoperability audit:
+
+- `IOSurfaceClientIsInUse` reads the shared state pointer at client +0x70,
+  then tests the aligned 64-bit word at state **+0x18**. Category queries select
+  its low/high 32-bit halves. `IOSurfaceClientGetUseCount` instead returns the
+  **client-local** count; it is not the global busy query. Increment/decrement
+  category functions call traps **0/1**, with `(surface ID, category 0/1)`,
+  only on their local zero-to-one/one-to-zero transitions.
+- QuartzCore `CA::WindowServer::IOMFBDisplay::can_update_` calls
+  `IOMobileFramebufferSwapWait` at **0x1882beb38** and, on success, clears the
+  page's swap ID at **0x1882beb40** before releasing its buffer for reuse.
+  Its `swap_wait_timeout` helper polls that call with 100 us sleeps.
+  `finish_update` also polls at **0x1882d1138**. `IOMFBFlipBook::
+  swapped_frame_displayed_p` tests success of flags **0x80000001** at
+  **0x18843eb48**. The framework's `kern_SwapWait` forwards selector **6**
+  with three scalars `(swap ID, flags, timeout)`; ordinary SwapWait passes
+  timeout zero. This reuse path uses return status, not a swap-complete callback.
+- QuartzCore's `buffer_is_unused(CABackingStoreBuffer*)` calls
+  `IOSurfaceIsInUse` at **0x188335e74** and returns its inverse; the HDR surface
+  pool also skips in-use surfaces at **0x188465cec**. These are distinct from
+  the display page's SwapWait gate. No Apple implementation or binary is
+  included here.
+
+The supplied HEAD timings, ~54 swaps/s, ~27 shown/s and FIFO overflow establish
+backlog, not its unique cause. The guess identifies real ABI defects: selector
+6 returned immediate success and shared +0x18 stayed zero. Missing asynchronous
+swap-complete alone is not the demonstrated cause. No device run proves how
+much these defects contributed to those timings.
+
+Traps now account each client's two categories separately, reject invalid IDs,
+categories, underflow and overflow, and subtract that client's outstanding uses
+on mapping release/close. The shared word includes independent kernel display
+holds in category 0, published with one aligned release store. Each category
+and the display count are bounded to 65,535. Seeds remain independent. Unknown
+DMA retirement sets a sticky in-use indication alongside existing quarantine.
+
+Every accepted layer holds a display use from swap admission through successful
+publication (after all source reads/copy retirement), or until its waiting record
+is dropped. Duplicate layers have matched independent holds. The copied panel
+image does not need the source after publication; retaining `fLast` for redraw
+therefore retains the object but no display use. Redraw reacquires holds and
+reader admission. Stop drops waiting/last records after DMA observation; an
+uncertain source remains quarantined/in-use. Teardown with an unfinished copy
+also preserves a sticky in-use indication. Failed admission rolls back only
+its own holds. Three waiting records plus one active record remain the bound.
+
+Selector 6 now returns Busy for queued/copying/unpublished records. Bit 31 polls;
+blocking calls sleep interruptibly on completion/drop, bounded to 100 ms or a
+shorter nonzero timeout. Mode 0 reports safe source release (shown or dropped),
+mode 1 requires shown, and modes 2/3 drain accepted outstanding swaps. Dropped
+mode-1 queries return Aborted. Unknown/expired IDs and stopped ownership never
+return success. A 64-entry status history refuses collisions with live records;
+SwapBegin refuses ID wrap. VSYNC notification format/cadence is unchanged.
+
+The existing 600-shown-frame `SWEET FB: stats` line appends
+**`reuse_before_show=N`**, a cumulative saturating count of records observed to
+have any newer pending or active writer lease before shown/drop accounting.
+It counts each record once, across every layer and retry. Existing writers at
+swap and later writers after shown accounting do not increment it. A pending
+reservation's later active lease can legitimately increment this diagnostic
+for the **same render**; a nonzero count alone does not prove a later CA frame.
+A separate internal writer epoch advances only when a lease starts with no
+outstanding writers. Admission rejects changed epochs under the reader lock,
+and drops stale records; pending-to-active transitions within one outstanding
+render stay eligible after all writers retire. Existing writer/read exclusion,
+fence/cache retirement and TE/transfer publication gates remain mandatory.
+
+Host validation adds `tools/test-fuxi-iosurface.py` and extends the production
+framebuffer/surface sanitizer models for category isolation, shared ABI, seeds,
+cleanup, caps, reuse/stale detection, FIFO drops, deferred publication, replay,
+DMA/stop release and SwapWait status/history/wake/timeout/interruption. Generated
+patches are **0106** (framebuffer) and **0108** (surface source/header); no GPU
+encoder or frontend change. Real CA pacing, pool pressure, panel/cache behavior
+and performance remain unqualified. No device access or deployment occurred.
+
+Validation for this revision: eleven related host suites passed (IOSurface,
+GPU scanout, unixnu, adreno, adreno-cache, adreno-mapping, Metal, hostimport,
+GPU K1, Metal frontend's portable tests and Metal backend with a software ICD).
+All twelve `tools/sync-fuxi-*.py --check` commands passed. Complete framebuffer,
+surface and GPU translation units passed syntax checks against saved XNU headers.
+Native Objective-C frontend execution requires macOS and was skipped. The two
+optional external Turnip harnesses did not start without their required external
+patch/tree arguments; no external Mesa tree was patched or modified.

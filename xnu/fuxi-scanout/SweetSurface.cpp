@@ -64,6 +64,8 @@ enum {
 #define SWEET_SURFACE_MAX_PROPS         (64u << 10)
 #define SWEET_SURFACE_ROW_ALIGN         64
 #define SWEET_SURFACE_TIMESTAMPS        0x800   /* offset in the state page */
+#define SWEET_SURFACE_STATE_USE         0x18
+#define SWEET_SURFACE_USE_MAX           65535u
 #define SWEET_SURFACE_STATE_SEED        0xc     /* u32 in the state page */
 #define kIOSurfaceLockReadOnly          0x1
 
@@ -74,6 +76,32 @@ static uint32_t      sweet_surface_next_id = 1;
 static uint32_t      sweet_surface_creates_logged;
 static uint64_t      sweet_surface_wired;       /* bytes of buffer surfaces */
 #define SWEET_SURFACE_WIRED_MAX         (1536ull << 20)
+
+static void sweet_surface_use_publish(SweetSurface *s)
+{
+ uint64_t value = ((uint64_t)s->useCounts[1] << 32) | (s->useCounts[0] + s->displayUses + s->usePoisoned);
+ __atomic_store_n((uint64_t *)((uint8_t *)s->state->getBytesNoCopy() + SWEET_SURFACE_STATE_USE), value, __ATOMIC_RELEASE);
+}
+#if defined(FUXI)
+void sweet_surface_display_poison(SweetSurface *s)
+{
+ IOLockLock(sweet_surface_lock); s->usePoisoned = true; sweet_surface_use_publish(s); IOLockUnlock(sweet_surface_lock);
+}
+#endif
+bool sweet_surface_display_hold(SweetSurface *s)
+{
+ IOLockLock(sweet_surface_lock);
+ bool ok = s->displayUses < SWEET_SURFACE_USE_MAX;
+ if (ok) { s->displayUses++; sweet_surface_use_publish(s); }
+ IOLockUnlock(sweet_surface_lock);
+ return ok;
+}
+void sweet_surface_display_drop(SweetSurface *s)
+{
+ IOLockLock(sweet_surface_lock);
+ if (s->displayUses) { s->displayUses--; sweet_surface_use_publish(s); }
+ IOLockUnlock(sweet_surface_lock);
+}
 
 OSDefineMetaClassAndStructors(SweetSurface, OSObject);
 
@@ -205,7 +233,7 @@ int sweet_surface_gpu_copy(SweetSurface *s, uintptr_t src, unsigned sx, unsigned
  }
  if (result < 0) {
   sweet_gpu_cache[slot].quarantine = true;
-  s->gpuQuarantined = true;
+  s->gpuQuarantined = true; sweet_surface_display_poison(s);
   s->retain(); /* failed submit/drain: reject writers, preserve until reset */
  }
  IOLockUnlock(sweet_writer_lock);
@@ -233,7 +261,7 @@ int sweet_surface_gpu_poll(uint64_t *elapsed)
    IOLockLock(sweet_writer_lock);
    if (result == -2) {
     sweet_gpu_cache[sweet_gpu_slot].quarantine = true;
-    sweet_gpu_inflight->gpuQuarantined = true;
+    sweet_gpu_inflight->gpuQuarantined = true; sweet_surface_display_poison(sweet_gpu_inflight);
    }
    else release = sweet_gpu_inflight;
    /* Failed-drain surface AND descriptor stay retained until reset. */
@@ -247,12 +275,13 @@ int sweet_surface_gpu_poll(uint64_t *elapsed)
  if (release) release->release(); /* free() takes the cache lock */
  return result;
 }
-bool sweet_surface_present_begin(SweetSurface **surfaces, unsigned count, uint64_t *ready = NULL)
+bool sweet_surface_present_begin(SweetSurface **surfaces, unsigned count, uint64_t *ready = NULL, const uint64_t *epochs = NULL)
 {
  if (count > 4 || !sweet_gpu_init()) return false;
  IOLockLock(sweet_writer_lock);
  bool ok = sweet_present_count == 0;
- for (unsigned i = 0; i < count; i++) if (surfaces[i]->gpuWriters || surfaces[i]->gpuQuarantined) ok = false;
+ for (unsigned i = 0; i < count; i++) if (surfaces[i]->gpuWriters || surfaces[i]->gpuQuarantined ||
+     (epochs && surfaces[i]->gpuWriterEpoch != epochs[i])) ok = false;
  if (ok) {
   for (unsigned i = 0; i < count; i++) {
    sweet_present_readers[i] = surfaces[i];
@@ -289,8 +318,14 @@ static bool sweet_gpu_writer(SweetSurface *s, bool lock, bool pending = false)
  if (!sweet_gpu_init()) return false;
  IOLockLock(sweet_writer_lock);
  if (lock) {
+  if (s->gpuWriters == ~0u || s->gpuWriterSerial == ~0ull || s->gpuWriterEpoch == ~0ull) { s->gpuQuarantined = true; sweet_surface_display_poison(s); }
+  if (s->gpuQuarantined) { IOLockUnlock(sweet_writer_lock); return false; }
+  s->gpuWriterSerial++;
+  /* Pending-to-active conversion stays in the outstanding writer epoch. */
+  if (!s->gpuWriters) s->gpuWriterEpoch++;
   while (!pending && (sweet_gpu_submitting == s || sweet_gpu_inflight == s || sweet_surface_present_reading(s)))
    IOLockSleep(sweet_writer_lock, &sweet_gpu_inflight, THREAD_UNINT);
+  if (s->gpuWriters == ~0u) { s->gpuQuarantined = true; sweet_surface_display_poison(s); }
   if (!s->gpuQuarantined) s->gpuWriters++;
  } else if (s->gpuWriters && !--s->gpuWriters && !s->gpuQuarantined) {
   s->gpuReadyTime = mach_absolute_time();
@@ -299,6 +334,14 @@ static bool sweet_gpu_writer(SweetSurface *s, bool lock, bool pending = false)
  bool ok = !s->gpuQuarantined;
  IOLockUnlock(sweet_writer_lock);
  return ok;
+}
+uint64_t sweet_surface_writer_serial(SweetSurface *s, uint64_t *epoch)
+{
+ if (!sweet_gpu_init()) { if (epoch) *epoch = ~0ull; return ~0ull; }
+ IOLockLock(sweet_writer_lock);
+ uint64_t serial = s->gpuWriterSerial; if (epoch) *epoch = s->gpuWriterEpoch;
+ IOLockUnlock(sweet_writer_lock);
+ return serial;
 }
 void sweet_surface_gpu_stats(struct fg_times *t)
 {
@@ -594,6 +637,7 @@ public:
 	IOMemoryMap  *data;
 	IOMemoryMap  *state;
 	uint32_t      count;
+ uint32_t uses[2];
 
 	bool init() APPLE_KEXT_OVERRIDE { return OSObject::init(); }
 	void free() APPLE_KEXT_OVERRIDE;
@@ -607,6 +651,10 @@ SweetSurfaceRef::free()
 	OSSafeReleaseNULL(data);
 	OSSafeReleaseNULL(state);
 	if (surface != NULL) {
+  IOLockLock(sweet_surface_lock);
+  for (unsigned i = 0; i < 2; i++) surface->useCounts[i] -= uses[i];
+  sweet_surface_use_publish(surface);
+  IOLockUnlock(sweet_surface_lock);
 		sweet_surface_put(surface);
 		surface->release();
 		surface = NULL;
@@ -657,7 +705,9 @@ public:
 	    void *reference) APPLE_KEXT_OVERRIDE;
 	IOExternalTrap *getTargetAndTrapForIndex(IOService **targetP, UInt32 index) APPLE_KEXT_OVERRIDE;
 
-	IOReturn trapUseCount(void *id, void *category, void *, void *, void *, void *);
+	IOReturn useCount(uint32_t id, uint32_t category, bool increment);
+ IOReturn trapIncrementUse(void *id, void *category, void *, void *, void *, void *);
+ IOReturn trapDecrementUse(void *id, void *category, void *, void *, void *, void *);
 	IOReturn trapLock(void *id, void *options, void *seedOut, void *, void *, void *);
 	IOReturn trapUnlock(void *id, void *options, void *seedOut, void *, void *, void *);
 	IOReturn trapRelease(void *id, void *, void *, void *, void *, void *);
@@ -1022,11 +1072,34 @@ IOSurfaceRootUserClient::externalMethod(uint32_t selector, IOExternalMethodArgum
 	}
 }
 
-IOReturn
-IOSurfaceRootUserClient::trapUseCount(__unused void *id, __unused void *category,
-    void *, void *, void *, void *)
+IOReturn IOSurfaceRootUserClient::useCount(uint32_t id, uint32_t category, bool increment)
 {
-	return kIOReturnSuccess;
+ if (category >= 2) return kIOReturnBadArgument;
+ IOLockLock(fLock);
+ SweetSurfaceRef *ref = findRef(id, NULL);
+ IOReturn ret = kIOReturnNotFound;
+ if (ref) {
+  IOLockLock(sweet_surface_lock);
+  uint32_t &local = ref->uses[category], &total = ref->surface->useCounts[category];
+  ret = kIOReturnBadArgument;
+  if (increment ? total < SWEET_SURFACE_USE_MAX : local != 0) {
+   if (increment) { local++; total++; } else { local--; total--; }
+   sweet_surface_use_publish(ref->surface); ret = kIOReturnSuccess;
+  }
+  IOLockUnlock(sweet_surface_lock);
+ }
+ IOLockUnlock(fLock);
+ return ret;
+}
+IOReturn IOSurfaceRootUserClient::trapIncrementUse(void *id, void *category, void *, void *, void *, void *)
+{
+ if ((uintptr_t)id > UINT32_MAX || (uintptr_t)category >= 2) return kIOReturnBadArgument;
+ return useCount((uint32_t)(uintptr_t)id, (uint32_t)(uintptr_t)category, true);
+}
+IOReturn IOSurfaceRootUserClient::trapDecrementUse(void *id, void *category, void *, void *, void *, void *)
+{
+ if ((uintptr_t)id > UINT32_MAX || (uintptr_t)category >= 2) return kIOReturnBadArgument;
+ return useCount((uint32_t)(uintptr_t)id, (uint32_t)(uintptr_t)category, false);
 }
 
 static IOReturn
@@ -1107,8 +1180,8 @@ IOSurfaceRootUserClient::trapRelease(void *id, void *, void *, void *, void *, v
 }
 
 static IOExternalTrap sweet_surface_traps[] = {
-	[kSweetSurfaceTrapIncrementUse]  = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapUseCount },
-	[kSweetSurfaceTrapDecrementUse]  = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapUseCount },
+	[kSweetSurfaceTrapIncrementUse]  = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapIncrementUse },
+	[kSweetSurfaceTrapDecrementUse]  = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapDecrementUse },
 	[kSweetSurfaceTrapLock]          = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapLock },
 	[kSweetSurfaceTrapUnlock]        = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapUnlock },
 	[kSweetSurfaceTrapRelease]       = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapRelease },

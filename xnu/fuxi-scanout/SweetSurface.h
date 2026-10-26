@@ -29,9 +29,11 @@ class SweetSurface : public OSObject {
 
 public:
 	uint32_t id;
+ uint32_t useCounts[2], displayUses;
+ bool usePoisoned;
 #if defined(FUXI)
  unsigned gpuWriters;
- uint64_t gpuReadyTime;
+ uint64_t gpuReadyTime, gpuWriterSerial, gpuWriterEpoch;
  bool gpuQuarantined;
 #endif
 	uint32_t width, height, bytesPerRow, offset, pixelFormat, allocSize;
@@ -60,10 +62,14 @@ int sweet_surface_gpu_copy(SweetSurface *, uintptr_t, unsigned, unsigned,
     unsigned, unsigned, unsigned, unsigned);
 int sweet_surface_gpu_poll(uint64_t *);
 void sweet_surface_gpu_stats(struct fg_times *);
+void sweet_surface_display_poison(SweetSurface *);
+uint64_t sweet_surface_writer_serial(SweetSurface *, uint64_t *epoch = NULL);
 #endif
 
 /* Retained surface for an id, or NULL. */
 SweetSurface *sweet_surface_copy(uint32_t id);
+bool sweet_surface_display_hold(SweetSurface *);
+void sweet_surface_display_drop(SweetSurface *);
 
 /*
  * Publish physical memory (the panel framebuffer) as a surface. Returns a

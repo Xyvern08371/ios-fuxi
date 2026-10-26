@@ -682,10 +682,10 @@ int main(void) {
         # Compile final production SweetSurface, including the reservation changes.
         source = (ROOT / 'xnu/fuxi-scanout/SweetSurface.cpp').read_text()
         declarations = source[source.index('struct sweet_gpu_backing'):source.index('static bool sweet_gpu_init')]
-        funcs = ''.join(cache.submit.function(source.replace('IOReturn\n', 'int '), n) for n in (
+        funcs = ''.join(display.function(source, n) for n in (
             'sweet_gpu_init', 'sweet_gpu_drop', 'sweet_gpu_release', 'sweet_surface_gpu_copy',
             'sweet_surface_gpu_poll', 'sweet_surface_present_begin', 'sweet_surface_present_end',
-            'sweet_surface_present_notify', 'sweet_surface_present_reading', 'sweet_gpu_writer', 'sweet_surface_gpu_stats',
+            'sweet_surface_writer_serial', 'sweet_surface_present_notify', 'sweet_surface_present_reading', 'sweet_gpu_writer', 'sweet_surface_gpu_stats',
             'IOSurfaceRootUserClient::trapLock', 'IOSurfaceRootUserClient::trapUnlock'))
         stubs = '''
 #define FUXI 1
@@ -701,6 +701,8 @@ struct IOSurfaceRootUserClient {
 static SweetSurface *trapSurface;
 static SweetSurface *sweet_surface_held(IOLock *,void *,uint32_t) {if(trapSurface)trapSurface->retain();return trapSurface;}
 static IOReturn sweet_surface_seed_out(SweetSurface *,void *,bool) {return 0;}
+static void sweet_surface_display_poison(SweetSurface *) {}
+static uint64_t sweet_surface_writer_serial(SweetSurface *,uint64_t *epoch=nullptr);
 static unsigned releaseWakes;
 static void released(void *context) {assert(context==&releaseWakes);releaseWakes++;}
 static bool reserved,busy,owned;
@@ -773,26 +775,42 @@ static void fuxi_gpu_scanout_release() {assert(reserved);reserved=false;}
  assert(client.trapUnlock((void *)1,nullptr,nullptr,nullptr,nullptr,nullptr)==0);
  pendingSurface.gpuQuarantined=true;assert(client.trapLock((void *)1,(void *)2,nullptr,nullptr,nullptr,nullptr)==kIOReturnNotReady && !pendingSurface.gpuWriters);
  pendingSurface.gpuQuarantined=false;trapSurface=nullptr;assert(client.trapLock((void *)1,(void *)2,nullptr,nullptr,nullptr,nullptr)==kIOReturnNotFound);
+ // Snapshot generations reject completed newer writers too, not only active leases.
+ uint64_t epoch=0,serial=sweet_surface_writer_serial(&pendingSurface,&epoch),readable=0;
+ assert(sweet_gpu_writer(&pendingSurface,true,true) && sweet_surface_writer_serial(&pendingSurface)==serial+1);
+ assert(sweet_gpu_writer(&pendingSurface,false));
+ assert(!sweet_surface_present_begin(surfaces,1,&readable,&epoch));
+ serial=sweet_surface_writer_serial(&pendingSurface,&epoch);
+ assert(sweet_surface_present_begin(surfaces,1,&readable,&epoch));sweet_surface_present_end();
+ // The original pending reservation can become active after swap, without a new epoch.
+ assert(sweet_gpu_writer(&pendingSurface,true,true));serial=sweet_surface_writer_serial(&pendingSurface,&epoch);
+ assert(sweet_gpu_writer(&pendingSurface,true));uint64_t activeEpoch=0;
+ assert(sweet_surface_writer_serial(&pendingSurface,&activeEpoch)==serial+1 && activeEpoch==epoch);
+ assert(sweet_gpu_writer(&pendingSurface,false) && sweet_gpu_writer(&pendingSurface,false));
+ assert(sweet_surface_present_begin(surfaces,1,&readable,&epoch));sweet_surface_present_end();
+ SweetSurface overflow;overflow.gpuWriters=~0u;
+ assert(!sweet_gpu_writer(&overflow,true) && overflow.gpuQuarantined && !overflow.gpuWriterSerial);
  owned=false;
  puts("PASS: production pending/reader guards, nonwaiting reservation, old-copy exclusion, two producers, quarantine");
 '''
         model = cache.MODEL.replace(' IOLockFree(sweet_gpu_lock);', extra + ' IOLockFree(sweet_gpu_lock);')
         model = model.replace('assert(sweet_surface_gpu_poll(&elapsed)==1);IOLockLock(p);', 'if(sweet_present_count)sweet_surface_present_end();else assert(sweet_surface_gpu_poll(&elapsed)==1);IOLockLock(p);')
-        compile_run(tmp, 'cache', cache.PREFIX + stubs + declarations + funcs + model, cpp=True)
+        compile_run(tmp, 'cache', cache.PREFIX.replace('uint64_t gpuReadyTime=0;', 'uint64_t gpuReadyTime=0,gpuWriterSerial=0,gpuWriterEpoch=0;') + stubs + declarations + funcs + model, cpp=True)
         source = (ROOT / 'xnu/fuxi-unixnu/SweetFramebuffer.cpp').read_text()
         declaration = source[source.index('class AppleCLCD :'):source.index('OSDefineMetaClassAndStructors(AppleCLCD')]
         declaration = declaration.replace(': public IOMobileFramebuffer', '').replace('OSDeclareDefaultStructors(AppleCLCD);', 'public:')
         methods = ''.join(display.function(source, n) for n in (
             'sweet_fb_te_configure', 'AppleCLCD::teVsyncTick', 'AppleCLCD::teVsyncLog',
             'AppleCLCD::presentWantedLocked', 'AppleCLCD::wakePresentLocked', 'sweet_fb_rearm',
-            'AppleCLCD::vsyncFired', 'AppleCLCD::scanoutLog', 'get32', 'AppleCLCD::releaseRecord',
+            'AppleCLCD::vsyncFired', 'AppleCLCD::scanoutLog', 'get32', 'AppleCLCD::observeRecord', 'AppleCLCD::recordDone', 'AppleCLCD::releaseRecord',
+            'AppleCLCD::swapWait', 'AppleCLCD::stopRecords',
             'AppleCLCD::writerRetired', 'AppleCLCD::writerWake', 'AppleCLCD::writerWakeAction',
             'AppleCLCD::presentStep', 'AppleCLCD::stageStats', 'AppleCLCD::completePresent', 'AppleCLCD::presentStats', 'AppleCLCD::presentNext', 'AppleCLCD::swap', 'AppleCLCD::present'))
         methods = re.sub(r'__asm__ volatile\s*\([^;]*\);', '(void)0;', methods)
         extra = '''
  // Pending render: retain the exact swap through idle ticks, CPU fallback and failure.
  fb.fScanout=true;fb.fUnixnuIdle=true;scanOwned=true;gpuMode=0;pollMode=1;
- surface.gpuWriters=2;fb.swap(rec);uint64_t pendingPixel=pixels[0];unsigned publications=scanPublications,ends=presentEnds,offers=surfaceCopies;
+ surface.gpuWriters=2;offer(fb,rec);uint64_t pendingPixel=pixels[0];unsigned publications=scanPublications,ends=presentEnds,offers=surfaceCopies;
  for(unsigned i=0;i<4;i++){fb.vsyncFired(&fb,&timer);assert(fb.fDirty && fb.fTickArmed && pixels[0]==pendingPixel && scanPublications==publications && surfaceCopies==offers && refs==recordRefs(fb));}
  surface.gpuWriters--;fb.vsyncFired(&fb,&timer);assert(fb.fDirty && presentEnds==ends);
  surface.gpuWriters=0;surface.gpuQuarantined=true;fb.vsyncFired(&fb,&timer);assert(fb.fDirty && pixels[0]==pendingPixel);
@@ -801,7 +819,7 @@ static void fuxi_gpu_scanout_release() {assert(reserved);reserved=false;}
  pollMode=0;fb.vsyncFired(&fb,&timer);assert(scanPublications==publications);
  pollMode=1;fb.vsyncFired(&fb,&timer);assert(!fb.fGpuPending && scanPublications==publications+1);
  // CPU fallback also waits for a producer, then reads the completed contents once.
- surface.gpuWriters=1;gpuMode=0;source[0]=0x12345678;fb.swap(rec);
+ surface.gpuWriters=1;gpuMode=0;source[0]=0x12345678;offer(fb,rec);
  fb.vsyncFired(&fb,&timer);assert(fb.fDirty && pixels[0]==pendingPixel);
  surface.gpuWriters=0;fb.vsyncFired(&fb,&timer);assert(!fb.fDirty && pixels[0]==source[0] && refs==recordRefs(fb));
  // Check the whole record before writing any layer; a ready newer record skips it.
@@ -809,13 +827,13 @@ static void fuxi_gpu_scanout_release() {assert(reserved);reserved=false;}
  SweetSurface secondSurface=surface;secondSurface.address=(uintptr_t)source2;secondSurface.gpuWriters=1;inputSurface2=&secondSurface;
  uint8_t multi[SWEET_FB_SWAP_REC_SIZE];memcpy(multi,rec,sizeof(multi));put32(multi,0x104,3);put32(multi,0x58,2);
  put32(multi,0xc4+16+8,18);put32(multi,0xc4+16+12,3);pendingPixel=pixels[0];publications=scanPublications;
- fb.swap(multi);fb.vsyncFired(&fb,&timer);assert(fb.fDirty && pixels[0]==pendingPixel && scanPublications==publications && refs==recordRefs(fb));
- fb.swap(rec);fb.vsyncFired(&fb,&timer);assert(!fb.fDirty && scanPublications==publications+1 && refs==recordRefs(fb));
- secondSurface.gpuWriters=0;fb.swap(multi);fb.vsyncFired(&fb,&timer);assert(!fb.fDirty && pixels[0]==source2[0] && refs==recordRefs(fb));
+ offer(fb,multi);fb.vsyncFired(&fb,&timer);assert(fb.fDirty && pixels[0]==pendingPixel && scanPublications==publications && refs==recordRefs(fb));
+ offer(fb,rec);fb.vsyncFired(&fb,&timer);assert(!fb.fDirty && scanPublications==publications+1 && refs==recordRefs(fb));
+ secondSurface.gpuWriters=0;offer(fb,multi);fb.vsyncFired(&fb,&timer);assert(!fb.fDirty && pixels[0]==source2[0] && refs==recordRefs(fb));
  inputSurface2=nullptr;
  // Gate deferral preserves dirty swap/pixels; no publication while waiting.
  fb.fScanout=true;fb.fScanoutLog=true;scanOwned=true;scanPublish=1;gpuMode=2;pollMode=1;
- fb.swap(rec);scanAcquire=0;
+ offer(fb,rec);scanAcquire=0;
  unsigned prior=scanPublications;uint64_t saved=pixels[0];
  fb.vsyncFired(&fb,&timer);assert(fb.fDirty && !fb.fGpuPending && pixels[0]==saved && scanPublications==prior);
  scanAcquire=1;fb.vsyncFired(&fb,&timer);assert(fb.fGpuPending && scanPublications==prior);
@@ -824,19 +842,19 @@ static void fuxi_gpu_scanout_release() {assert(reserved);reserved=false;}
  // A writer wake sees the fence, STARTs immediately and submits the next FIFO record without a timer callback.
  IOWorkLoop directLoop;WakeCall directWake={&AppleCLCD::writerWake,&fb};
  fb.fWorkLoop=&directLoop;fb.fWriterWakeCall=&directWake;scanDouble=true;
- gpuMode=2;pollMode=1;fb.swap(rec);runWake(directWake);assert(fb.fGpuPending);
- fb.swap(rec);unsigned directOffers=surfaceCopies,directStarts=scanPublications;
+ gpuMode=2;pollMode=1;offer(fb,rec);runWake(directWake);assert(fb.fGpuPending);
+ offer(fb,rec);unsigned directOffers=surfaceCopies,directStarts=scanPublications;
  uint64_t directVsync=fb.fVsyncCount;runWake(directWake);
  assert(scanPublications==directStarts+1 && surfaceCopies==directOffers+1 && fb.fGpuPending && !fb.fPendingCount && !presentReading);
  assert(fb.fVsyncCount==directVsync && fb.fStageCallbacks[2]>=2);
  // TE refusal preserves the completed image and cannot admit the next writer/record.
- scanPublish=2;fb.swap(rec);directOffers=surfaceCopies;runWake(directWake);
+ scanPublish=2;offer(fb,rec);directOffers=surfaceCopies;runWake(directWake);
  assert(fb.fPublicationPending && scanBackReady && surfaceCopies==directOffers && fb.fPendingCount==1);
  scanRetryResult=1;scanPublish=1;AppleCLCD::writerRetired(&fb);runWake(directWake);
  assert(!fb.fPublicationPending && fb.fGpuPending && surfaceCopies==directOffers+1);
  scanRetryResult=0;scanDouble=false;fb.vsyncFired(&fb,&timer);fb.fWriterWakeCall=nullptr;
  // Busy GPU ring keeps the oldest swap; no CPU copy or premature transfer.
- gpuMode=3;fb.swap(rec);prior=scanPublications;fb.vsyncFired(&fb,&timer);
+ gpuMode=3;offer(fb,rec);prior=scanPublications;fb.vsyncFired(&fb,&timer);
  assert(fb.fDirty && !fb.fGpuPending && scanPublications==prior);
  gpuMode=-1;fb.vsyncFired(&fb,&timer);assert(fb.fDirty && scanPublications==prior);
  // CPU fallback cannot write until its distinct drain/restore guard grants A.
