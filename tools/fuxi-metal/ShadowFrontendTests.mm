@@ -14,7 +14,7 @@ int main(){@autoreleasepool{
  objc_setAssociatedObject(device,&ownerKey,state,OBJC_ASSOCIATION_RETAIN_NONATOMIC);[state release];
  FuxiQueue *queue=(FuxiQueue *)[device newCommandQueue];uint8_t cpu[4096];memset(cpu,19,sizeof(cpu));
  FuxiBuffer *buffer=(FuxiBuffer *)[device newBufferWithBytesNoCopy:cpu length:sizeof(cpu) options:0 deallocator:nil];assert(buffer->_shadow);
- MTLTextureDescriptor *td=[MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:16 height:16 mipmapped:NO];td.usage=MTLTextureUsageRenderTarget;
+ MTLTextureDescriptor *td=[MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:16 height:16 mipmapped:NO];td.usage=MTLTextureUsageRenderTarget;td.storageMode=MTLStorageModePrivate;
  id target=[device newTextureWithDescriptor:td];MTLRenderPassDescriptor *pass=[MTLRenderPassDescriptor renderPassDescriptor];pass.colorAttachments[0].texture=target;pass.colorAttachments[0].loadAction=MTLLoadActionClear;pass.colorAttachments[0].storeAction=MTLStoreActionStore;
  FuxiPipeline *pipeline=[FuxiPipeline new];pipeline->_device=[device retain];pipeline->_pipeline=new fuxi::Pipeline{};
  auto *p=pipeline->_pipeline;for(auto &stage:p->shadowWindows)for(auto &window:stage)window.kind=2;
