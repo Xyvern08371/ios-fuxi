@@ -708,8 +708,9 @@ The oldest readable record is selected; pending/active writers leave records
 queued, a ready newer record can skip unreadable predecessors, and full-queue
 arrival drops the oldest waiting record. The existing all-source read guard is
 acquired before dequeue, including CPU/multilayer fallback. Final writer release
-queues a coalesced thread call whose workloop-gated action wakes the existing
-timer; the IOSurface unlock trap does no display work. Vsync/poll retries remain.
+queues a coalesced thread call whose workloop-gated action runs the full
+presentation step (stage-latency correction below); the IOSurface unlock trap
+does no display work. Vsync/poll retries remain.
 
 `fg_scanout_acquire(0)` now refuses a back buffer with a completed image waiting
 for publication. CLCD retries that image's TE/transfer-gated START before
@@ -745,3 +746,128 @@ no back-ready overwrite before TE publication. Related host tests and all
 retirement notification). No frontend or external Mesa/translator changes are
 needed. Native frontend execution, kernel link and real panel/cache/latency
 qualification remain unperformed; no phone access or deployment occurred.
+
+## Stage latency and direct presentation wakes
+
+2026-10-27. **Device results for this change: not yet observed.** The supplied
+`a72b285` observations are 600 shown frames in 22,731 ms (about 26.4/s),
+1,216 swaps, 614 not shown, copy average 1,259 us versus about 630 us before
+the FIFO correction, TE 120.8 Hz/8.27 ms and a roughly 7.3 ms transfer.
+The supplied wait window has ring/floor zero, transfer 3,227 and TE 1,785;
+5,012 deferred publications and zero dropped-ready frames. These are baseline
+observations, not measurements of the changes below. Cumulative FIFO counters
+cannot be divided by one 600-frame interval to derive that interval's rates.
+
+Code audit found no fixed 37 ms/27 fps limiter or mandatory later-vsync hop at
+every stage. The actual waits and changes are:
+
+- `AppleCLCD::swap` previously only woke the demand timer, whose first deadline
+  is one nominal 16.667 ms tick away; an already armed owned timer polls sooner.
+  Eligible scanout swaps now also queue the coalesced presentation worker, so
+  a source already retired before swap arrival need not wait for that timer.
+- `writerRetired` still queues a thread call and `writerWake` still enters the
+  workloop gate. The unlock trap never copies, polls the GPU or touches DPU.
+  Previously `writerWakeAction` scheduled another timer callback with a nominal
+  1 us timeout. It now runs `presentStep` directly and rearms only the remaining
+  work. This removes that second dispatch, not the safe workloop serialization.
+- `sweet_surface_gpu_poll` remains nonblocking. Submission waits for a later
+  poll/wake to observe the cache-clean fence, idle and ring pointers. The owned
+  timer remains period/16 (about 0.52 ms after a valid 120 Hz estimate). There
+  is no new fence spin or per-copy thread call. Dispatch delay is still possible.
+- Fence observation already reached `completePresent` in the same callback;
+  successful START already reached the next FIFO admission in that callback
+  with `fFlushTicks == 1`. Both now live in `presentStep`, shared by timer and
+  worker. A successful fence immediately attempts publication, and a successful
+  publication immediately attempts the next ready FIFO record. Neither waits
+  for the next heartbeat. An asynchronous new copy still waits for observation.
+- `fg_scanout_acquire(1)`/`fg_scanout_publish` must still defer for TE, any
+  explicit drain floor, CTL START or write-line activity. Back-ready exclusion,
+  ring/client reservation, failed DMA quarantine, MMIO/AR failure and stopped
+  ownership are unchanged. A deferred START preserves its frame and stamps.
+  `sweet_surface_present_begin` still rejects every pending/active writer and
+  quarantined source; the FIFO may skip unreadable predecessors as before.
+- The all-source reader guard was already surface-specific, but producer lease
+  operations shared the long cache lock across prepare/map/PoC clean/submit.
+  They now use a separate short lease lock. Cache transactions may briefly take
+  the lease lock; producer leases never take the cache lock. A submitting-source
+  marker closes the gap before the retained in-flight source takes over. Normal
+  writers of that exact source wait through retirement; unrelated surfaces do
+  not wait behind preparation or copying. AvoidSync remains a nonwriting pending
+  reservation. CLCD releases its admission reader immediately after successful
+  GPU submission, or after all synchronous CPU reads, before publication/logging.
+
+The apparent doubling of `SWEET FB: stats` copy time is an accounting change in
+`a72b285`: before it, GPU frames recorded `present` entry through asynchronous
+submission/return, predominantly preparation and PoC cleaning. It now records
+preparation **plus observed fence retirement**, including polling/dispatch and
+optional pixel verification. Neither the blit encoder nor its full-copy size
+changed in that commit. There is no evidence here that the hardware blit itself
+doubled. Keep the broader copy metric; use the separate stages below rather
+than dropping retirement from the reported time. Actual GPU execution versus
+fence-observation delay still cannot be separated without a GPU timestamp.
+
+Each FIFO record carries swap time and admitted-ready time. Under the lease
+lock, each final writer release stamps `gpuReadyTime` using
+`mach_absolute_time`, including when no worker runs promptly. Admission takes
+`max(swap, latest final retirement of every source)`: already readable sources
+have zero swap-to-ready delay. New pending writers still prevent admission;
+failed admission, overflow and ready skips produce no shown-stage sample.
+Replay uses the same record's original swap and rechecks current readiness.
+The active copy retains these stamps through asynchronous retirement and TE
+retry. GPU submission and observed clean-fence stamps come from
+`fuxi_gpu_copy`/`fuxi_gpu_poll`; START is stamped immediately after its successful
+MMIO write, before subsequent status reads or summary logging. A previous START
+stamp also includes black transfers, so spacing uses consecutive actual STARTs.
+For legacy unowned presentation, the publication completion time substitutes
+for START. CPU copies use synchronous read completion for both submit and
+fence, giving zero submit-to-fence time; existing GPU/CPU counts identify those
+windows. START remains a software handoff, not optical completion.
+
+One sibling line accompanies each existing 600-shown-frame stats report. No
+per-frame IOLog is added. Exact format (`A/M` are average/maximum microseconds,
+`N` sample counts and `V/P/W` callback counts):
+
+```text
+SWEET FB: stages 600 shown swap_ready_us=A/M ready_present_us=A/M present_submit_us=A/M submit_fence_us=A/M fence_start_us=A/M start_start_us=A/M samples=N/N/N/N/N/N callbacks_vsync=V poll=P wake=W callbacks_per_shown_x1000=V1/P1/W1
+```
+
+The six fields respectively measure swap-to-ready, ready-to-present entry,
+present-to-submit, submit-to-observed-fence, observed-fence-to-START and previous
+START-to-START. Samples follow the same order; missing/reversed stamps are
+omitted, never subtracted unsigned. Usually the first window has 599 spacing
+samples, then 600; an earlier black START can supply the first predecessor.
+Counters and averages/maxima reset with each 600-frame window. `V` counts timer
+callbacks producing a heartbeat, `P` timer callbacks producing none, and `W`
+executed coalesced workers (including idle/refused wakes). Divide each by 600
+for callbacks per shown frame; `V1/P1/W1` report those ratios multiplied by
+1,000 (integer, rounded down). GPU fence polls within a callback are not extra
+callbacks. Wake workers never increment vsync counts or send notifications.
+`sweetfb_hz` throttling remains respected: workers only admit frames directly
+when `fFlushTicks == 1`, but can still retire/publish outstanding work.
+
+A large swap-to-ready value attributes delay to producer leases/queued renders;
+a large ready-to-present value includes ready FIFO backlog, ring admission and
+worker/timer dispatch. Present-to-submit includes mapping/cache preparation;
+submit-to-fence includes actual GPU work and observation delay; fence-to-START
+includes publication gating/dispatch and any optional pixel verification after
+the fence stamp. Compare their maxima, spacing and callback
+counts with the unchanged transfer/TE wait counters. These measurements are
+needed to establish which stage dominates the supplied 37 ms cadence; this
+offline change does not prove a new device frame rate or a unique baseline cause.
+
+Host suites exercise the actual shared worker/timer step, ready-before-swap
+wake, coalescing, immediate fence/START/next-copy progress without notifications,
+TE refusal and exact retry, pending/active/quarantined writer exclusion, unrelated
+writers during cache-locked submission and CPU reader holds, exact stamp/avg/max
+conversion, omitted bad stamps, consecutive STARTs and two 600-frame resets.
+Both suites also syntax-check complete translation units against saved XNU
+headers when `--xnu-buildtree` is supplied; the surface header now comes from
+its canonical scanout snapshot. Regenerated patches are exactly **0098**
+(`sync-fuxi-metal.py`), **0106** (`sync-fuxi-unixnu.py`) and **0108**
+(`sync-fuxi-scanout.py`, now owning `SweetSurface.h` as well as its source).
+
+Risks still include workloop/thread-call jitter, extra lock/timestamp overhead,
+producer backlog, the unchanged TE/transfer safety gates and unqualified real
+GPU/cache/DPU timing. Validate the new stage windows, animation, idle,
+blank/wake and fault/stop behavior on a separately authorized device run.
+No device access, deployment, full kernel link, push or CI run was performed.

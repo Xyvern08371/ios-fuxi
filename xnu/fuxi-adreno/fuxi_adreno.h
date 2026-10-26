@@ -2,8 +2,8 @@
 #define FUXI_ADRENO_H
 #define FG_CACHE_SLOTS 4u
 /* Timings in mach absolute ticks, CPU uses scheduler runtime (excludes sleep).
- * Surface ownership uses SweetSurface's cache lock. When the ABI is
- * enabled, a second shared mutex serializes ring and SMMU control. */
+ * Surface leases use a short lock separate from the copy/cache transaction.
+ * The ABI shared mutex serializes ring and SMMU control. */
 struct fg_times {
  uint64_t pin, lookup, map, clean, submit, wait, unmap, cpu;
  unsigned attempts, hits, misses, sleeps, blocks, groups;
@@ -17,13 +17,16 @@ void fuxi_gpu_import_stats(uint64_t *cleaned, uint64_t *skipped, uint64_t *inval
     uint64_t *mapped, unsigned *imports);
 /* Default-off command-mode handoff. configure is called before GPU startup.
  * acquire: 1 GPU target writable, 0 deferred, -1 held. CPU writers must use
- * cpu_acquire, which drains/restores A and permanently ends double mode.
+ * cpu_acquire, which drains/restores A until the next GPU frame.
  * publish: 1 transferred, 2 back ready/deferred, 0 old path (caller kicks), -1 held.
  * retry: same results, but 0 means no ready frame; never issue a generic kick.
  * reserve/release bracket a SweetSurface cache transaction; 0 means defer.
  */
 void fuxi_gpu_scanout_configure(uintptr_t pixels, unsigned enabled, unsigned check);
 int fuxi_gpu_scanout_owned(void);
+/* One copy/ready frame at a time; timestamps are mach absolute units. */
+struct fg_present_times { uint64_t submitted, fence, start, previous_start; };
+void fuxi_gpu_scanout_stamps(struct fg_present_times *times);
 /* Caller-owned, zero-initialized TE observer. Use from one serialized timer;
  * independent observers share no mutable estimator state. Healthy observation
  * takes no GPU lock or writes; double-mode MMIO failure stops/restores A.
@@ -48,7 +51,7 @@ int fuxi_gpu_map(unsigned slot, uint64_t generation, uintptr_t source,
 /* False means failed DMA drain: keep backing prepared/retained until reset. */
 int fuxi_gpu_unmap(unsigned slot, struct fg_times *t);
 /* copy: 2 submitted, 0 fallback, -1 quarantine. poll: 0 busy, 1 done,
- * -1 failed/drained, -2 failed/quarantined. Serialized by the surface lock. */
+ * -1 failed/drained, -2 failed/quarantined. Serialized by the surface cache lock. */
 int fuxi_gpu_poll(struct fg_times *t);
 int fuxi_gpu_copy(unsigned slot, uint64_t generation, uintptr_t source, uint64_t length,
     unsigned pitch, unsigned sx, unsigned sy, unsigned dx, unsigned dy,

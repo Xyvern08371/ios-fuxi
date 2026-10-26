@@ -57,6 +57,8 @@ typedef unsigned ppnum_t;
 #define SMMU_S2CR(i) (0xc00+4*(i))
 #define FG_CACHE_SLOTS 4u
 #define FG_SOURCE_L3 8u
+struct fg_present_times {uint64_t submitted,fence,start,previous_start;};
+static struct fg_present_times fg_scanout_stamps;
 struct fg_times {
  uint64_t pin, lookup, map, clean, submit, wait, unmap, cpu;
  unsigned attempts, hits, misses, sleeps, blocks, groups;
@@ -132,13 +134,13 @@ static int model_copy(unsigned slot,uint64_t gen,uintptr_t src,uint64_t len,
 {
  int r=fuxi_gpu_copy(slot,gen,src,len,p,sx,sy,dx,dy,w,h,t);
  if(r!=2) return r;
- assert(fg_busy);
+ assert(fg_busy && fg_scanout_stamps.submitted==fg_submit_time && !fg_scanout_stamps.fence);
  unsigned before=doorbells;
  assert(!fuxi_gpu_copy(slot,gen,src,len,p,sx,sy,dx,dy,w,h,t));
  assert(doorbells==before && !fuxi_gpu_unmap(slot,t));
  for(unsigned i=0;i<200;i++) {
   r=fuxi_gpu_poll(t);
-  if(r) { assert(!fg_busy);return r==1 ? 1 : r==-2 ? -1 : 0; }
+  if(r) { assert(!fg_busy);if(r==1)assert(fg_scanout_stamps.fence>=fg_scanout_stamps.submitted);return r==1 ? 1 : r==-2 ? -1 : 0; }
   ticks+=1000; /* time passes OUTSIDE the display callback */
  }
  assert(0);return 0;

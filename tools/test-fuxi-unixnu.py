@@ -10,6 +10,8 @@ import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / 'xnu/fuxi-unixnu'
+PRESENT_TIMES = re.search(r'struct fg_present_times \{.*?\};',
+    (ROOT / 'xnu/fuxi-adreno/fuxi_adreno.h').read_text(), re.S)[0]
 TE_OBSERVER = re.search(r'struct fg_te_observer \{.*?\};',
     (ROOT / 'xnu/fuxi-adreno/fuxi_adreno.h').read_text(), re.S)[0]
 
@@ -282,11 +284,13 @@ static void fuxi_display_kick(void) {kicks++;}
 static int scanAcquire=1,scanPublish=0;
 static bool scanOwned=false,scanBackReady=false,scanDouble=false;
 static unsigned scanRetries,scanCpuAcquires;
+static fg_present_times scanTimes;
+static void fuxi_gpu_scanout_stamps(fg_present_times *t) {*t=scanTimes;}
 static int scanCpuAcquire=1;
 static int fuxi_gpu_scanout_double(void) {return scanDouble;}
 static int fuxi_gpu_scanout_pending(void) {return scanBackReady;}
 static int scanRetryResult;
-static int fuxi_gpu_scanout_retry(void) {scanRetries++;if(scanRetryResult==1)scanBackReady=false;return scanRetryResult;}
+static int fuxi_gpu_scanout_retry(void) {scanRetries++;if(scanRetryResult==1){scanBackReady=false;scanTimes.previous_start=scanTimes.start;scanTimes.start=mach_absolute_time();}return scanRetryResult;}
 static int fuxi_gpu_scanout_cpu_acquire(void) {scanCpuAcquires++;return scanCpuAcquire==1?scanAcquire:scanCpuAcquire;}
 static int fuxi_gpu_scanout_owned(void) {return scanOwned;}
 static bool teAvailable;
@@ -298,10 +302,13 @@ static int fuxi_gpu_scanout_te(struct fg_te_observer *te) {
 }
 static unsigned scanPublications;
 static int fuxi_gpu_scanout_acquire(void) {return scanAcquire;}
-static int fuxi_gpu_scanout_publish(void) {scanPublications++;if(scanPublish==2)scanBackReady=true;return scanPublish;}
-static char importStatsLog[2048],teStatsLog[2048],frameStatsLog[2048];
+static int fuxi_gpu_scanout_publish(void) {scanPublications++;if(scanPublish==1){scanTimes.previous_start=scanTimes.start;scanTimes.start=mach_absolute_time();}if(scanPublish==2)scanBackReady=true;return scanPublish;}
+static char importStatsLog[2048],teStatsLog[2048],frameStatsLog[2048],stageStatsLog[2048];
 static int IOLog(const char *format,...) {
  logs++;
+ if(strstr(format,"SWEET FB: stages")) {
+  va_list args;va_start(args,format);vsnprintf(stageStatsLog,sizeof(stageStatsLog),format,args);va_end(args);
+ }
  if(strstr(format,"SWEET FB: stats")) {
   va_list args;va_start(args,format);vsnprintf(frameStatsLog,sizeof(frameStatsLog),format,args);va_end(args);
  }
@@ -323,15 +330,16 @@ struct Memory {uint64_t size;uint64_t getLength(){return size;}};
 struct SweetSurface {
  uint32_t id=1,width=18,height=3,pixelFormat=SWEET_FB_FORMAT_BGRA,bytesPerRow=104;
  uint32_t bytesPerElement=4,elementWidth=1,elementHeight=1,offset=0;
- unsigned gpuWriters=0;bool gpuQuarantined=false;
+ unsigned gpuWriters=0;bool gpuQuarantined=false;uint64_t gpuReadyTime=0;
  uintptr_t address;Memory *memory;
  uintptr_t kernelAddress(){return address;}
  void retain(){refs++;}
  void release(){assert(refs);refs--;}
 };
 static unsigned presentBegins,presentEnds;static bool presentReading;
-static bool sweet_surface_present_begin(SweetSurface **surfaces,unsigned count) {
+static bool sweet_surface_present_begin(SweetSurface **surfaces,unsigned count,uint64_t *ready) {
  presentBegins++;assert(!presentReading);for(unsigned i=0;i<count;i++)if(surfaces[i]->gpuWriters || surfaces[i]->gpuQuarantined)return false;
+ for(unsigned i=0;i<count;i++)if(surfaces[i]->gpuReadyTime>*ready)*ready=surfaces[i]->gpuReadyTime;
  presentReading=true;return true;
 }
 static void sweet_surface_present_end() {assert(presentReading);presentReading=false;presentEnds++;}
@@ -340,8 +348,8 @@ static SweetSurface *sweet_surface_copy(uint32_t id) {assert(id==1 || (id==2 && 
 static int sweet_console_muted=1;
 static unsigned surfaceCopies;
 static void (*duringCopy)();
-static int sweet_surface_gpu_copy(SweetSurface *,uintptr_t,int,int,int,int,int,int){surfaceCopies++;if(duringCopy)duringCopy();return gpuMode;}
-static int sweet_surface_gpu_poll(uint64_t *elapsed) {*elapsed=42;return pollMode;}
+static int sweet_surface_gpu_copy(SweetSurface *,uintptr_t,int,int,int,int,int,int){surfaceCopies++;if(duringCopy)duringCopy();if(gpuMode==2){scanTimes.submitted=mach_absolute_time();scanTimes.fence=0;}return gpuMode;}
+static int sweet_surface_gpu_poll(uint64_t *elapsed) {*elapsed=42;if(pollMode==1)scanTimes.fence=mach_absolute_time();return pollMode;}
 struct fg_times {uint64_t pin,lookup,map,clean,submit,wait,unmap,cpu;unsigned attempts,hits,misses,sleeps,blocks,groups;};
 static void fuxi_gpu_import_stats(uint64_t *cleaned,uint64_t *skipped,uint64_t *invalidated,
  uint64_t *mapped,unsigned *imports) {*cleaned=64;*skipped=128;*invalidated=64;*mapped=16384;*imports=1;}
@@ -354,7 +362,7 @@ class IOMobileFramebufferUserClient {
 };
 '''
 
-DISPLAY_PREFIX = DISPLAY_PREFIX.replace('#define FUXI 1', TE_OBSERVER + '\n#define FUXI 1')
+DISPLAY_PREFIX = DISPLAY_PREFIX.replace('#define FUXI 1', TE_OBSERVER + '\n' + PRESENT_TIMES + '\n#define FUXI 1')
 
 DISPLAY_TEST = r'''
 static unsigned recordRefs(const AppleCLCD &fb) {
@@ -527,14 +535,14 @@ int main(void) {
  assert(queued.fStatFrames==complete && scanPublications==publications && queued.fQueuedDefers==4);
  surface.gpuWriters--;queued.vsyncFired(&queued,&qtimer);
  assert(queued.fPendingCount==1 && queued.fQueuedDefers==5);
- // Unlock callback only queues a coalesced call; the gated worker arms the timer.
+ // Unlock only queues a coalesced call; the gated worker presents before any timer tick.
  IOMobileFramebufferUserClient subscriber;subscriber.fFunc[5]=1;subscriber.fPort=1;qclients.objects.push_back(&subscriber);
  queued.fNextTick=ticks+queued.fTickAbs;uint64_t nextTick=queued.fNextTick,count=queued.fVsyncCount;
- unsigned oldArms=arms;surface.gpuWriters=0;AppleCLCD::writerRetired(&queued);
+ unsigned oldArms=arms;surface.gpuWriters=0;surface.gpuReadyTime=mach_absolute_time();AppleCLCD::writerRetired(&queued);
  assert(wake.pending && arms==oldArms && queued.fStatFrames==complete && scanPublications==publications);
  AppleCLCD::writerRetired(&queued);runWake(wake);
- assert(!wake.pending && arms==oldArms+1 && qtimer.next<nextTick && !qloop.gated);
- queued.vsyncFired(&queued,&qtimer);
+ assert(!wake.pending && arms==oldArms+1 && qtimer.next==nextTick && !qloop.gated);
+ assert(queued.fStage[1]==surface.gpuReadyTime && queued.fStage[2]>=surface.gpuReadyTime);
  assert(get32(queued.fLast.bytes,0x50)==4 && !queued.fDirty && queued.fStatFrames==complete+1);
  assert(queued.fVsyncCount==count && !subscriber.notifications && queued.fNextTick==nextTick);
  subscriber.fPort=0;
@@ -597,6 +605,31 @@ int main(void) {
  scanOwned=oldOwned;scanPublish=oldPublish;
  puts("PASS: production FIFO order, pending/active exclusion, final-retire wake, oldest overflow, ready skip, publication accounting, exact replay and concurrent swaps");
  }
+ {
+ // Exact production stage aggregation, mach-to-us conversion, 600-frame cadence and reset.
+ AppleCLCD staged={};staged.fLock=&lock;staged.fScanout=true;staged.fStageGpu=true;
+ bool previousOwned=scanOwned;scanOwned=true;
+ unsigned beforeLogs=logs;
+ for(unsigned i=0;i<1200;i++) {
+  uint64_t b=100000000ull+i*100000;
+  staged.fStage[0]=b;staged.fStage[1]=b+(i==599?3000:1000);staged.fStage[2]=staged.fStage[1]+2000;
+  scanTimes.submitted=staged.fStage[2]+3000;scanTimes.fence=scanTimes.submitted+4000;scanTimes.previous_start=i?scanTimes.start:0;scanTimes.start=scanTimes.fence+5000;
+  staged.fStageCallbacks[0]+=2;staged.fStageCallbacks[1]+=3;staged.fStageCallbacks[2]++;
+  staged.presentStats(12000);
+  if(i==598)assert(logs==beforeLogs);
+  if(i==599) {
+   assert(strstr(stageStatsLog,"swap_ready_us=1/3 ready_present_us=2/2 present_submit_us=3/3 submit_fence_us=4/4 fence_start_us=5/5 start_start_us=100/102"));
+   assert(strstr(stageStatsLog,"samples=600/600/600/600/600/599 callbacks_vsync=1200 poll=1800 wake=600 callbacks_per_shown_x1000=2000/3000/1000"));
+   for(unsigned j=0;j<6;j++)assert(!staged.fStageN[j] && !staged.fStageSum[j] && !staged.fStageMax[j]);
+   assert(!staged.fStatFrames && !staged.fStageCallbacks[0] && !staged.fStageCallbacks[1] && !staged.fStageCallbacks[2]);
+  }
+ }
+ assert(strstr(stageStatsLog,"samples=600/600/600/600/600/600 callbacks_vsync=1200 poll=1800 wake=600 callbacks_per_shown_x1000=2000/3000/1000"));
+ // Missing or reversed stamps are omitted, never underflow into large latency.
+ memset(staged.fStage,0,sizeof(staged.fStage));staged.fStageGpu=false;staged.fStage[0]=10;staged.fStage[1]=5;
+ staged.stageStats(1);assert(!staged.fStageN[0]);scanOwned=previousOwned;
+ puts("PASS: stage stamps, exact avg/max us, missing/reversed samples, callbacks, 600-shown cadence and window reset");
+ }
  puts("PASS: actual framebuffer present/tick/swap: demand wake/idle, GPU retirement/fallback, blanking and shadow invalidation");
 }
 '''
@@ -604,11 +637,7 @@ int main(void) {
 
 def kernel_syntax(buildtree):
     """Optional real 8796 header check using saved flags; never run its make/scripts."""
-    spec = importlib.util.spec_from_file_location('unixnu_sync', ROOT / 'tools/sync-fuxi-unixnu.py')
-    sync = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(sync)
-    sync.FILES = {'iokit/Kernel/arm/SweetSurface.h': 'SweetSurface.h'}
-    surface_header = sync.baseline()['iokit/Kernel/arm/SweetSurface.h']
+    surface_header = (ROOT / 'xnu/fuxi-scanout/SweetSurface.h').read_text()
     config = buildtree / 'build/xnu.obj/DEVELOPMENT_ARM64_FUXI'
     if not config.exists():
         config = buildtree / 'build/xnu.obj/DEVELOPMENT_ARM64_SWEET'
@@ -701,7 +730,7 @@ def main():
             'AppleCLCD::presentWantedLocked', 'AppleCLCD::wakePresentLocked', 'sweet_fb_rearm',
             'AppleCLCD::vsyncFired', 'AppleCLCD::scanoutLog', 'get32', 'AppleCLCD::releaseRecord',
             'AppleCLCD::writerRetired', 'AppleCLCD::writerWake', 'AppleCLCD::writerWakeAction',
-            'AppleCLCD::completePresent', 'AppleCLCD::presentStats', 'AppleCLCD::presentNext', 'AppleCLCD::swap', 'AppleCLCD::present'))
+            'AppleCLCD::presentStep', 'AppleCLCD::stageStats', 'AppleCLCD::completePresent', 'AppleCLCD::presentStats', 'AppleCLCD::presentNext', 'AppleCLCD::swap', 'AppleCLCD::present'))
         methods = methods.replace('__asm__ volatile ("dsb sy" ::: "memory");', '(void)0;')
         cpp = tmp / 'display.cpp'
         cpp.write_text(DISPLAY_PREFIX + declaration + methods + DISPLAY_TEST)

@@ -30,6 +30,7 @@
 #define FG_SCAN_TE_STALL_US 40000u /* no TE this long after START: counter unusable */
 #define FG_SCAN_DSI 0x0ae94000u
 #define FG_SCAN_DSI_TIMEOUT_US 20000u
+static struct fg_present_times fg_scanout_stamps;
 static unsigned fg_scanout_panel120_attempted, fg_scanout_panel120_active;
 static unsigned fg_scanout_period_us = 16667u, fg_scanout_explicit_drain;
 static unsigned fg_scanout_owned, fg_scanout_failed, fg_scanout_writable;
@@ -80,6 +81,11 @@ void fuxi_gpu_scanout_configure(uintptr_t pixels, unsigned enabled, unsigned che
   printf("FUXI SCANOUT: requested, fence then manual transfer, drain_us=%u te_gate=%u check=%u\n",
       fg_scanout_drain_us, fg_scanout_te_mode, fg_scanout_checks);
  }
+}
+void fuxi_gpu_scanout_stamps(struct fg_present_times *times)
+{
+ FG_GUARD;
+ *times = fg_scanout_stamps;
 }
 int fuxi_gpu_scanout_owned(void)
 {
@@ -555,6 +561,8 @@ static int fg_scanout_publish(void)
  if (fg_scanout_double_active && !fg_scanout_address(fg_scanout_front ? 0xb8000000u : 0xb8a00000u))
   return fg_scanout_stop("double SRC0 flush");
  if (!fg_scanout_write(FG_SCAN_CTL+0x1c, 1)) return fg_scanout_stop("start transfer");
+ fg_scanout_stamps.previous_start = fg_scanout_stamps.start;
+ fg_scanout_stamps.start = mach_absolute_time();
  if (fg_scanout_double_active) {
   fg_scanout_front ^= 1;
   fg_scanout_back_ready = 0;

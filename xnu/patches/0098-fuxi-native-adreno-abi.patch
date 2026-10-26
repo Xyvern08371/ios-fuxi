@@ -539,7 +539,7 @@
   (void)PE_parse_boot_argn("fuxigpu_stage", &fg_limit, sizeof(fg_limit));
   (void)PE_parse_boot_argn("fuxigpu_fail", &fg_force, sizeof(fg_force));
   if ((fg_limit != 13 && fg_limit != 16 && fg_limit != 17) ||
-@@ -455,12 +610,20 @@
+@@ -455,12 +610,21 @@
   * A completed fence wins over a late timer/deadline. */
  int fuxi_gpu_poll(struct fg_times *t)
  {
@@ -548,7 +548,8 @@
   int err = fg_access_failed || g3_faulted();
   if (!err && g3_read(G3_FENCE_PA+64) == fg_magic && g3_gr(0x806) == g3_wptr &&
       g3_gr(0x807) == g3_wptr && !(g3_gr(0x210) & ~1u)) {
-+  t->wait += mach_absolute_time()-fg_submit_time;
++  fg_scanout_stamps.fence = mach_absolute_time();
++  t->wait += fg_scanout_stamps.fence-fg_submit_time;
 +  if (fg_scanout_requested && !fg_scanout_verify()) {
 +   fg_fail("scanout pixel mismatch", 0x604);
 +   int drained = fg_isolate();
@@ -561,7 +562,7 @@
    return 1;
   }
   if (!err && !fg_expired()) return 0;
-@@ -468,6 +631,7 @@
+@@ -468,6 +632,7 @@
   /* Only fault containment has bounded register polling; no scheduler wait. */
   int drained = fg_isolate();
   fg_busy = 0;
@@ -569,7 +570,7 @@
   t->wait += mach_absolute_time()-fg_submit_time;
   return drained ? -1 : -2;
  }
-@@ -475,25 +639,44 @@
+@@ -475,25 +640,44 @@
      unsigned pitch, unsigned sx, unsigned sy, unsigned dx, unsigned dy,
      unsigned width, unsigned height, struct fg_times *t)
  {
@@ -617,7 +618,7 @@
   unsigned magic = ++fg_seq;
   if (!magic) magic = ++fg_seq;
   g4_end(G3_FENCE_VA+64, magic);
-@@ -505,11 +688,19 @@
+@@ -505,11 +689,20 @@
   t->submit += mach_absolute_time()-start;
   if (err || fg_access_failed) {
    fg_fail("present submit", err);
@@ -633,6 +634,7 @@
   }
   fg_magic = magic;
   fg_submit_time = mach_absolute_time();
++ fg_scanout_stamps.submitted = fg_submit_time; fg_scanout_stamps.fence = 0;
   fg_busy = 1;
   return 2; /* submitted; source is owned until poll retires this fence */
  }
@@ -640,13 +642,13 @@
  #endif
 --- a/bsd/dev/fuxi_adreno.h
 +++ b/bsd/dev/fuxi_adreno.h
-@@ -2,12 +2,46 @@
+@@ -2,19 +2,56 @@
  #define FUXI_ADRENO_H
  #define FG_CACHE_SLOTS 4u
  /* Timings in mach absolute ticks, CPU uses scheduler runtime (excludes sleep).
 - * Protected by SweetSurface's cache lock. No userspace submit interface. */
-+ * Surface ownership uses SweetSurface's cache lock. When the ABI is
-+ * enabled, a second shared mutex serializes ring and SMMU control. */
++ * Surface leases use a short lock separate from the copy/cache transaction.
++ * The ABI shared mutex serializes ring and SMMU control. */
  struct fg_times {
   uint64_t pin, lookup, map, clean, submit, wait, unmap, cpu;
   unsigned attempts, hits, misses, sleeps, blocks, groups;
@@ -660,13 +662,16 @@
 +    uint64_t *mapped, unsigned *imports);
 +/* Default-off command-mode handoff. configure is called before GPU startup.
 + * acquire: 1 GPU target writable, 0 deferred, -1 held. CPU writers must use
-+ * cpu_acquire, which drains/restores A and permanently ends double mode.
++ * cpu_acquire, which drains/restores A until the next GPU frame.
 + * publish: 1 transferred, 2 back ready/deferred, 0 old path (caller kicks), -1 held.
 + * retry: same results, but 0 means no ready frame; never issue a generic kick.
 + * reserve/release bracket a SweetSurface cache transaction; 0 means defer.
 + */
 +void fuxi_gpu_scanout_configure(uintptr_t pixels, unsigned enabled, unsigned check);
 +int fuxi_gpu_scanout_owned(void);
++/* One copy/ready frame at a time; timestamps are mach absolute units. */
++struct fg_present_times { uint64_t submitted, fence, start, previous_start; };
++void fuxi_gpu_scanout_stamps(struct fg_present_times *times);
 +/* Caller-owned, zero-initialized TE observer. Use from one serialized timer;
 + * independent observers share no mutable estimator state. Healthy observation
 + * takes no GPU lock or writes; double-mode MMIO failure stops/restores A.
@@ -688,6 +693,14 @@
  void fuxi_gpu_start(uint64_t framebuffer, unsigned width, unsigned height, unsigned pitch);
  int fuxi_gpu_map(unsigned slot, uint64_t generation, uintptr_t source,
      uint64_t length, struct fg_times *t);
+ /* False means failed DMA drain: keep backing prepared/retained until reset. */
+ int fuxi_gpu_unmap(unsigned slot, struct fg_times *t);
+ /* copy: 2 submitted, 0 fallback, -1 quarantine. poll: 0 busy, 1 done,
+- * -1 failed/drained, -2 failed/quarantined. Serialized by the surface lock. */
++ * -1 failed/drained, -2 failed/quarantined. Serialized by the surface cache lock. */
+ int fuxi_gpu_poll(struct fg_times *t);
+ int fuxi_gpu_copy(unsigned slot, uint64_t generation, uintptr_t source, uint64_t length,
+     unsigned pitch, unsigned sx, unsigned sy, unsigned dx, unsigned dy,
 --- a/bsd/dev/gpu-clock.h
 +++ b/bsd/dev/gpu-clock.h
 @@ -0,0 +1,85 @@
@@ -1203,7 +1216,7 @@
 +#endif
 --- a/bsd/dev/fuxi_gpu_scanout.inc
 +++ b/bsd/dev/fuxi_gpu_scanout.inc
-@@ -0,0 +1,665 @@
+@@ -0,0 +1,673 @@
 +/* SPDX-License-Identifier: MIT
 + * Copyright (c) 2026 NativeMetal contributors
 + * Ported from UniXNU drivers/NativeMetal/GpuScanoutClient.h (MIT).
@@ -1236,6 +1249,7 @@
 +#define FG_SCAN_TE_STALL_US 40000u /* no TE this long after START: counter unusable */
 +#define FG_SCAN_DSI 0x0ae94000u
 +#define FG_SCAN_DSI_TIMEOUT_US 20000u
++static struct fg_present_times fg_scanout_stamps;
 +static unsigned fg_scanout_panel120_attempted, fg_scanout_panel120_active;
 +static unsigned fg_scanout_period_us = 16667u, fg_scanout_explicit_drain;
 +static unsigned fg_scanout_owned, fg_scanout_failed, fg_scanout_writable;
@@ -1286,6 +1300,11 @@
 +  printf("FUXI SCANOUT: requested, fence then manual transfer, drain_us=%u te_gate=%u check=%u\n",
 +      fg_scanout_drain_us, fg_scanout_te_mode, fg_scanout_checks);
 + }
++}
++void fuxi_gpu_scanout_stamps(struct fg_present_times *times)
++{
++ FG_GUARD;
++ *times = fg_scanout_stamps;
 +}
 +int fuxi_gpu_scanout_owned(void)
 +{
@@ -1761,6 +1780,8 @@
 + if (fg_scanout_double_active && !fg_scanout_address(fg_scanout_front ? 0xb8000000u : 0xb8a00000u))
 +  return fg_scanout_stop("double SRC0 flush");
 + if (!fg_scanout_write(FG_SCAN_CTL+0x1c, 1)) return fg_scanout_stop("start transfer");
++ fg_scanout_stamps.previous_start = fg_scanout_stamps.start;
++ fg_scanout_stamps.start = mach_absolute_time();
 + if (fg_scanout_double_active) {
 +  fg_scanout_front ^= 1;
 +  fg_scanout_back_ready = 0;

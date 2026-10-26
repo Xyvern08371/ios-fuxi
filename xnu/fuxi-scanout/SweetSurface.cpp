@@ -86,7 +86,9 @@ struct sweet_gpu_backing {
  uint64_t length, pageGeneration, generation, age;
  bool quarantine;
 };
-static IOLock *sweet_gpu_lock;
+/* Cache -> lease only; producer leases never take the cache lock. */
+static IOLock *sweet_gpu_lock, *sweet_writer_lock;
+static SweetSurface *sweet_gpu_submitting;
 static sweet_gpu_backing sweet_gpu_cache[FG_CACHE_SLOTS];
 static uint64_t sweet_gpu_generation, sweet_gpu_age;
 static struct fg_times sweet_gpu_times;
@@ -104,6 +106,11 @@ static bool sweet_gpu_init(void)
   IOLock *lock = IOLockAlloc();
   if (!lock) return false;
   if (!OSCompareAndSwapPtr(NULL, lock, &sweet_gpu_lock)) IOLockFree(lock);
+ }
+ if (!sweet_writer_lock) {
+  IOLock *lock = IOLockAlloc();
+  if (!lock) return false;
+  if (!OSCompareAndSwapPtr(NULL, lock, &sweet_writer_lock)) IOLockFree(lock);
  }
  return true;
 }
@@ -139,10 +146,17 @@ int sweet_surface_gpu_copy(SweetSurface *s, uintptr_t src, unsigned sx, unsigned
  uint64_t cpu = thread_get_runtime_self(), start = mach_absolute_time();
  IOLockLock(sweet_gpu_lock);
  if (sweet_gpu_inflight) { IOLockUnlock(sweet_gpu_lock); return 2; }
+ IOLockLock(sweet_writer_lock);
  if (s->gpuWriters || s->gpuQuarantined) {
-  IOLockUnlock(sweet_gpu_lock); return fuxi_gpu_scanout_owned() ? 3 : 0;
+  IOLockUnlock(sweet_writer_lock); IOLockUnlock(sweet_gpu_lock); return fuxi_gpu_scanout_owned() ? 3 : 0;
  }
- if (!fuxi_gpu_scanout_reserve()) { IOLockUnlock(sweet_gpu_lock); return 3; }
+ sweet_gpu_submitting = s;
+ IOLockUnlock(sweet_writer_lock);
+ if (!fuxi_gpu_scanout_reserve()) {
+  IOLockLock(sweet_writer_lock); sweet_gpu_submitting = NULL;
+  IOLockWakeup(sweet_writer_lock, &sweet_gpu_inflight, false); IOLockUnlock(sweet_writer_lock);
+  IOLockUnlock(sweet_gpu_lock); return 3;
+ }
  unsigned slot = FG_CACHE_SLOTS, victim = 0, replacement = FG_CACHE_SLOTS;
  uint64_t length = s->memory->getLength()-s->offset;
  uintptr_t source = src+s->offset;
@@ -182,6 +196,7 @@ int sweet_surface_gpu_copy(SweetSurface *s, uintptr_t src, unsigned sx, unsigned
  sweet_gpu_cache[slot].age = ++sweet_gpu_age;
  result = fuxi_gpu_copy(slot, sweet_gpu_cache[slot].generation, source, length,
      s->bytesPerRow, sx, sy, dx, dy, width, height, &sweet_gpu_times);
+ IOLockLock(sweet_writer_lock);
  if (result == 2) {
   s->retain();
   sweet_gpu_inflight = s;
@@ -193,7 +208,10 @@ int sweet_surface_gpu_copy(SweetSurface *s, uintptr_t src, unsigned sx, unsigned
   s->gpuQuarantined = true;
   s->retain(); /* failed submit/drain: reject writers, preserve until reset */
  }
+ IOLockUnlock(sweet_writer_lock);
  out:
+ IOLockLock(sweet_writer_lock); sweet_gpu_submitting = NULL;
+ IOLockWakeup(sweet_writer_lock, &sweet_gpu_inflight, false); IOLockUnlock(sweet_writer_lock);
  fuxi_gpu_scanout_release();
  sweet_gpu_times.cpu += thread_get_runtime_self()-cpu;
  IOLockUnlock(sweet_gpu_lock);
@@ -212,6 +230,7 @@ int sweet_surface_gpu_poll(uint64_t *elapsed)
   result = fuxi_gpu_poll(&sweet_gpu_times);
   if (result) {
    *elapsed = mach_absolute_time()-sweet_gpu_begin;
+   IOLockLock(sweet_writer_lock);
    if (result == -2) {
     sweet_gpu_cache[sweet_gpu_slot].quarantine = true;
     sweet_gpu_inflight->gpuQuarantined = true;
@@ -219,7 +238,8 @@ int sweet_surface_gpu_poll(uint64_t *elapsed)
    else release = sweet_gpu_inflight;
    /* Failed-drain surface AND descriptor stay retained until reset. */
    sweet_gpu_inflight = NULL;
-   IOLockWakeup(sweet_gpu_lock, &sweet_gpu_inflight, false);
+   IOLockWakeup(sweet_writer_lock, &sweet_gpu_inflight, false);
+   IOLockUnlock(sweet_writer_lock);
   }
  }
  sweet_gpu_times.cpu += thread_get_runtime_self()-cpu;
@@ -227,29 +247,35 @@ int sweet_surface_gpu_poll(uint64_t *elapsed)
  if (release) release->release(); /* free() takes the cache lock */
  return result;
 }
-bool sweet_surface_present_begin(SweetSurface **surfaces, unsigned count)
+bool sweet_surface_present_begin(SweetSurface **surfaces, unsigned count, uint64_t *ready = NULL)
 {
  if (count > 4 || !sweet_gpu_init()) return false;
- IOLockLock(sweet_gpu_lock);
+ IOLockLock(sweet_writer_lock);
  bool ok = sweet_present_count == 0;
  for (unsigned i = 0; i < count; i++) if (surfaces[i]->gpuWriters || surfaces[i]->gpuQuarantined) ok = false;
- if (ok) { for (unsigned i = 0; i < count; i++) sweet_present_readers[i] = surfaces[i]; sweet_present_count = count; }
- IOLockUnlock(sweet_gpu_lock);
+ if (ok) {
+  for (unsigned i = 0; i < count; i++) {
+   sweet_present_readers[i] = surfaces[i];
+   if (ready && surfaces[i]->gpuReadyTime > *ready) *ready = surfaces[i]->gpuReadyTime;
+  }
+  sweet_present_count = count;
+ }
+ IOLockUnlock(sweet_writer_lock);
  return ok;
 }
 void sweet_surface_present_end(void)
 {
- IOLockLock(sweet_gpu_lock);
+ IOLockLock(sweet_writer_lock);
  sweet_present_count = 0;
- IOLockWakeup(sweet_gpu_lock, &sweet_gpu_inflight, false);
- IOLockUnlock(sweet_gpu_lock);
+ IOLockWakeup(sweet_writer_lock, &sweet_gpu_inflight, false);
+ IOLockUnlock(sweet_writer_lock);
 }
 void sweet_surface_present_notify(void (*wake)(void *), void *context)
 {
  if (!sweet_gpu_init()) return;
- IOLockLock(sweet_gpu_lock);
+ IOLockLock(sweet_writer_lock);
  sweet_present_wake = wake; sweet_present_context = context;
- IOLockUnlock(sweet_gpu_lock);
+ IOLockUnlock(sweet_writer_lock);
 }
 static bool sweet_surface_present_reading(SweetSurface *s)
 {
@@ -261,15 +287,17 @@ static bool sweet_surface_present_reading(SweetSurface *s)
 static bool sweet_gpu_writer(SweetSurface *s, bool lock, bool pending = false)
 {
  if (!sweet_gpu_init()) return false;
- IOLockLock(sweet_gpu_lock);
+ IOLockLock(sweet_writer_lock);
  if (lock) {
-  while (!pending && (sweet_gpu_inflight == s || sweet_surface_present_reading(s)))
-   IOLockSleep(sweet_gpu_lock, &sweet_gpu_inflight, THREAD_UNINT);
+  while (!pending && (sweet_gpu_submitting == s || sweet_gpu_inflight == s || sweet_surface_present_reading(s)))
+   IOLockSleep(sweet_writer_lock, &sweet_gpu_inflight, THREAD_UNINT);
   if (!s->gpuQuarantined) s->gpuWriters++;
- } else if (s->gpuWriters && !--s->gpuWriters && !s->gpuQuarantined && sweet_present_wake)
-  sweet_present_wake(sweet_present_context);
+ } else if (s->gpuWriters && !--s->gpuWriters && !s->gpuQuarantined) {
+  s->gpuReadyTime = mach_absolute_time();
+  if (sweet_present_wake) sweet_present_wake(sweet_present_context);
+ }
  bool ok = !s->gpuQuarantined;
- IOLockUnlock(sweet_gpu_lock);
+ IOLockUnlock(sweet_writer_lock);
  return ok;
 }
 void sweet_surface_gpu_stats(struct fg_times *t)

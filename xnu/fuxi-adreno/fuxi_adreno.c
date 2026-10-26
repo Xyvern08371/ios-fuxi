@@ -615,7 +615,8 @@ int fuxi_gpu_poll(struct fg_times *t)
  int err = fg_access_failed || g3_faulted();
  if (!err && g3_read(G3_FENCE_PA+64) == fg_magic && g3_gr(0x806) == g3_wptr &&
      g3_gr(0x807) == g3_wptr && !(g3_gr(0x210) & ~1u)) {
-  t->wait += mach_absolute_time()-fg_submit_time;
+  fg_scanout_stamps.fence = mach_absolute_time();
+  t->wait += fg_scanout_stamps.fence-fg_submit_time;
   if (fg_scanout_requested && !fg_scanout_verify()) {
    fg_fail("scanout pixel mismatch", 0x604);
    int drained = fg_isolate();
@@ -699,6 +700,7 @@ int fuxi_gpu_copy(unsigned slot, uint64_t generation, uintptr_t source, uint64_t
  }
  fg_magic = magic;
  fg_submit_time = mach_absolute_time();
+ fg_scanout_stamps.submitted = fg_submit_time; fg_scanout_stamps.fence = 0;
  fg_busy = 1;
  return 2; /* submitted; source is owned until poll retires this fence */
 }
