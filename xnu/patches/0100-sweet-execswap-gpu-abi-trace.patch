@@ -120,7 +120,7 @@
   * ABI and framing credit: UniXNU NativeAdreno contributors (MIT).
   * See NativeAdrenoABI.h and LICENSE.NativeAdreno for copied material.
   */
-@@ -8,41 +8,69 @@
+@@ -8,41 +8,74 @@
  #include <IOKit/IOPlatformExpert.h>
  #include <IOKit/IOUserClient.h>
  #include <IOKit/IOBufferMemoryDescriptor.h>
@@ -170,6 +170,11 @@
  static bool connected;
 +static bool execswapTest;
 +static unsigned testPasses, traceLines;
++/* fuxigpuwaitus: WaitFence poll period in us (default 100; 0 = IOSleep(1)).
++ * A 1 ms sleep delays every frame's retirement by up to a timer period. */
++static uint32_t waitPollUs __attribute__((unused)) = 100;
++static uint64_t waitCount __attribute__((unused)), waitPolls __attribute__((unused)),
++    waitNs __attribute__((unused)), waitMaxNs __attribute__((unused));
 +static bool abiExecswapTest(const char *swap) {
 + size_t n=strnlen(swap,192);
 + if (!n || n>=191) return false;
@@ -203,7 +208,7 @@
   struct Bo {
    IOBufferMemoryDescriptor *memory;
    IOMemoryDescriptor *importMemory;
-@@ -51,10 +79,40 @@
+@@ -51,10 +84,40 @@
    uint64_t handle, bytes, allocated, iova;
    uint32_t token, leases, metadataBytes;
    char metadata[64];
@@ -246,7 +251,38 @@
   uint64_t nextHandle_ = 1, wired_ = 0, lastFence_ = 0, firstFence_ = 0;
   uint32_t nextToken_ = 1;
   bool queues_[8] = {true};
-@@ -99,7 +157,8 @@
+@@ -68,14 +131,26 @@
+    * 100 ms. A shorter user timeout does not itself lose the context. */
+   uint64_t ticks=0;
+   nanoseconds_to_absolutetime(ns>1000000000ULL ? 1000000000ULL : ns,&ticks);
+-  uint64_t deadline=mach_absolute_time()+ticks;
++  uint64_t start=mach_absolute_time(), deadline=start+ticks, polls=0;
+   for (;;) {
+    int s=fuxi_gpu_abi_poll(fence);
+-   if (!s) return kIOReturnSuccess;
++   if (!s) { if (polls) waitStat(start,polls); return kIOReturnSuccess; }
+    if (s<0) return (s==-3 || s==-4) ? kIOReturnTimeout : kIOReturnIOError;
+    if (mach_absolute_time()>=deadline) return kIOReturnTimeout;
+-   IOSleep(1);
+-  }
++   if (waitPollUs) delay(waitPollUs); else IOSleep(1);
++   ++polls;
++  }
++ }
++ static void waitStat(uint64_t start, uint64_t polls) {
++  uint64_t ns; absolutetime_to_nanoseconds(mach_absolute_time()-start,&ns);
++  IOLockLock(openLock);
++  ++waitCount; waitPolls+=polls; waitNs+=ns; if (ns>waitMaxNs) waitMaxNs=ns;
++  if (waitCount==600) {
++   IOLog("FUXI ABI: fence waits per 600 sleeping poll_us=%u avg_us=%llu max_us=%llu polls_avg=%llu\n",
++       waitPollUs,waitNs/600000,waitMaxNs/1000,waitPolls/600);
++   waitCount=waitPolls=waitNs=waitMaxNs=0;
++  }
++  IOLockUnlock(openLock);
+  }
+  IOReturn drop(Bo &b) {
+   if (b.iova) {
+@@ -99,7 +174,8 @@
   IOReturn allocate(const NativeAdrenoAbiBoAlloc &r, NativeAdrenoAbiBoAllocReply &out) {
    if (!fg_abi_alloc_valid(r.bytes,r.align_log2,r.contiguous)) return kIOReturnBadArgument;
    uint64_t allocated=(r.bytes+16383)&~UINT64_C(16383);
@@ -256,7 +292,7 @@
    Bo *b=nullptr;
    for (auto &candidate:bos_) if (!candidate.handle) { b=&candidate; break; }
    if (!b) return kIOReturnNoResources;
-@@ -111,10 +170,8 @@
+@@ -111,10 +187,8 @@
    if (!memory && !r.contiguous) memory=IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,options,allocated,mask);
    if (!memory) return kIOReturnNoMemory;
    if (memory->prepare()!=kIOReturnSuccess) { memory->release(); return kIOReturnNoMemory; }
@@ -268,7 +304,7 @@
    uint64_t first=0;
    for (uint64_t off=0;valid && off<allocated;off+=16384) {
     IOByteCount length=0;
-@@ -123,14 +180,11 @@
+@@ -123,14 +197,11 @@
         (!off ? !(pa&((UINT64_C(1)<<r.align_log2)-1)) : !r.contiguous || pa==first+off);
     if (!valid) break;
     if (!off) first=pa;
@@ -285,7 +321,7 @@
    if (!valid) {
     if (view) view->release();
     memory->complete(); memory->release(); return kIOReturnNoMemory;
-@@ -146,7 +200,8 @@
+@@ -146,7 +217,8 @@
   IOReturn importHost(const NativeAdrenoAbiBoImport &r, NativeAdrenoAbiBoAllocReply &out) {
    if (current_task()!=task_ || task_==kernel_task || !fg_abi_import_valid(r.address,r.bytes))
     return kIOReturnBadArgument;
@@ -295,7 +331,7 @@
    Bo *b=nullptr;
    for (auto &candidate:bos_) if (!candidate.handle) { b=&candidate; break; }
    if (!b) return kIOReturnNoResources;
-@@ -189,6 +244,14 @@
+@@ -189,6 +261,14 @@
    }
    if (method==NativeAdrenoMethodWaitFence) {
     const auto &r=*static_cast<const NativeAdrenoAbiWaitFence *>(in); return wait(r.fence,r.timeout_ns);
@@ -310,7 +346,7 @@
    }
    if (method==NativeAdrenoMethodBoCpuUnmap) {
     const auto &r=*static_cast<const NativeAdrenoAbiBoCpuUnmap *>(in);
-@@ -254,8 +317,9 @@
+@@ -254,8 +334,9 @@
     if (!b || r.reserved || r.bytes>64) return kIOReturnBadArgument;
     if (method==NativeAdrenoMethodSetMetadata) { bcopy(r.text,b->metadata,r.bytes); b->metadataBytes=r.bytes; }
     else {
@@ -321,7 +357,7 @@
      bcopy(b->metadata,reply.text,reply.bytes);
     }
     return kIOReturnSuccess;
-@@ -277,24 +341,37 @@
+@@ -277,24 +358,37 @@
   bool initWithTask(task_t task, void *securityID, UInt32 type) override {
    if (!IOUserClient::initWithTask(task,securityID,type)) return false;
    task_=task; task_reference(task_);
@@ -362,7 +398,7 @@
    IOLockUnlock(lock_); return s;
   }
   IOReturn clientMemoryForType(UInt32 token, IOOptionBits *options, IOMemoryDescriptor **memory) override {
-@@ -304,7 +381,9 @@
+@@ -304,7 +398,9 @@
    if (live_) for (auto &b:bos_) if (b.handle && b.token==token && b.leases) {
     b.view->retain(); *memory=b.view; *options=kIOMapAnywhere|kIOMapWriteCombineCache; break;
    }
@@ -373,7 +409,7 @@
   }
   IOReturn clientClose() override {
    if (!lock_) return kIOReturnSuccess;
-@@ -321,24 +400,39 @@
+@@ -321,24 +417,39 @@
     IOLockLock(openLock); connected=false; IOLockUnlock(openLock);
    }
    IOLockUnlock(lock_);
@@ -416,7 +452,7 @@
    if (!handler) return kIOReturnBadArgument;
    *handler=nullptr;
    if (type!=0x4147 && type!=0) return kIOReturnUnsupported;
-@@ -351,9 +445,12 @@
+@@ -351,9 +462,14 @@
    *handler=uc; return kIOReturnSuccess;
   }
  };
@@ -427,10 +463,12 @@
 + char swap[192]={};
 + execswapTest=PE_parse_boot_argn("sweetexecswap",swap,sizeof(swap)) &&
 +     abiExecswapTest(swap);
++ PE_parse_boot_argn("fuxigpuwaitus",&waitPollUs,sizeof(waitPollUs));
++ if (waitPollUs>1000) waitPollUs=1000;
   openLock=IOLockAlloc();
   auto *service=new NativeAdrenoGpuPublished;
   if (!openLock || !service) { if (service) service->release(); return; }
-@@ -362,6 +459,16 @@
+@@ -362,6 +478,16 @@
   }
   service->setName("NativeAdrenoGpu");
   service->setProperty("NativeAdrenoABI",(uint64_t)NativeAdrenoAbiVersion,32);

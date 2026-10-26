@@ -42,6 +42,11 @@ static IOLock *openLock;
 static bool connected;
 static bool execswapTest;
 static unsigned testPasses, traceLines;
+/* fuxigpuwaitus: WaitFence poll period in us (default 100; 0 = IOSleep(1)).
+ * A 1 ms sleep delays every frame's retirement by up to a timer period. */
+static uint32_t waitPollUs __attribute__((unused)) = 100;
+static uint64_t waitCount __attribute__((unused)), waitPolls __attribute__((unused)),
+    waitNs __attribute__((unused)), waitMaxNs __attribute__((unused));
 static bool abiExecswapTest(const char *swap) {
  size_t n=strnlen(swap,192);
  if (!n || n>=191) return false;
@@ -126,14 +131,26 @@ class FuxiAdrenoUserClient : public IOUserClient {
    * 100 ms. A shorter user timeout does not itself lose the context. */
   uint64_t ticks=0;
   nanoseconds_to_absolutetime(ns>1000000000ULL ? 1000000000ULL : ns,&ticks);
-  uint64_t deadline=mach_absolute_time()+ticks;
+  uint64_t start=mach_absolute_time(), deadline=start+ticks, polls=0;
   for (;;) {
    int s=fuxi_gpu_abi_poll(fence);
-   if (!s) return kIOReturnSuccess;
+   if (!s) { if (polls) waitStat(start,polls); return kIOReturnSuccess; }
    if (s<0) return (s==-3 || s==-4) ? kIOReturnTimeout : kIOReturnIOError;
    if (mach_absolute_time()>=deadline) return kIOReturnTimeout;
-   IOSleep(1);
+   if (waitPollUs) delay(waitPollUs); else IOSleep(1);
+   ++polls;
   }
+ }
+ static void waitStat(uint64_t start, uint64_t polls) {
+  uint64_t ns; absolutetime_to_nanoseconds(mach_absolute_time()-start,&ns);
+  IOLockLock(openLock);
+  ++waitCount; waitPolls+=polls; waitNs+=ns; if (ns>waitMaxNs) waitMaxNs=ns;
+  if (waitCount==600) {
+   IOLog("FUXI ABI: fence waits per 600 sleeping poll_us=%u avg_us=%llu max_us=%llu polls_avg=%llu\n",
+       waitPollUs,waitNs/600000,waitMaxNs/1000,waitPolls/600);
+   waitCount=waitPolls=waitNs=waitMaxNs=0;
+  }
+  IOLockUnlock(openLock);
  }
  IOReturn drop(Bo &b) {
   if (b.iova) {
@@ -451,6 +468,8 @@ extern "C" void fuxi_gpu_abi_publish(void)
  char swap[192]={};
  execswapTest=PE_parse_boot_argn("sweetexecswap",swap,sizeof(swap)) &&
      abiExecswapTest(swap);
+ PE_parse_boot_argn("fuxigpuwaitus",&waitPollUs,sizeof(waitPollUs));
+ if (waitPollUs>1000) waitPollUs=1000;
  openLock=IOLockAlloc();
  auto *service=new NativeAdrenoGpuPublished;
  if (!openLock || !service) { if (service) service->release(); return; }
