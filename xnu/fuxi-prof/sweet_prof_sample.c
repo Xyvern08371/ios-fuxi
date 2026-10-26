@@ -34,7 +34,7 @@ static void sp_sweep(task_t task,struct sp_table *p) {
   thread_unlock(thread);splx(level);
   s.pc=get_saved_state_pc(ss);s.lr=get_saved_state_lr(ss);s.x16=(int32_t)get_saved_state_reg(ss,16);
   uint64_t fp=get_saved_state_fp(ss),base=fp;
-  for(unsigned n=0;n<4 && fp && !(fp&7) && fp>=base && fp-base<1024*1024;n++) {
+  for(unsigned n=0;n<8 && fp && !(fp&7) && fp>=base && fp-base<1024*1024;n++) {
    uint64_t frame[2];
    if(vm_map_read_user(map,fp,frame,sizeof(frame))!=KERN_SUCCESS)break;
    s.bt[n]=frame[1];if(frame[0]<=fp)break;fp=frame[0];

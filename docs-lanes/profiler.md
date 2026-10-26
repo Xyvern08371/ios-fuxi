@@ -20,7 +20,7 @@ At completion the output is:
 ```text
 PROF backboardd[<pid>] slide 0x<slide> mh 0x<mach-header>
 PROF backboardd t<tid> name=<name> total=<samples> dropped=<samples>
-PROF backboardd t<tid> name=<name> n=<count>/<samples> state=<run|wait|ready|stop> x16=<signed-low32> wait=0x<event> wr=<wait-result> mixed=<0|1> pc 0x<pc> lr 0x<lr> bt 0x<frame1> 0x<frame2> 0x<frame3> 0x<frame4>
+PROF backboardd t<tid> name=<name> n=<count>/<samples> state=<run|wait|ready|stop> x16=<signed-low32> wait=0x<event> wr=<wait-result> mixed=<0|1> pc 0x<pc> lr 0x<lr> bt 0x<frame1> ... 0x<frame8>
 PROF done threads=<count> sweeps=<count> late=<count> skipped=<count> untracked=<count> truncated=<count>
 ```
 

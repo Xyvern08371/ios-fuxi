@@ -5,7 +5,7 @@
 #define SP_PROBES 64u
 #define SP_TOP 12u
 #define SP_LINES 398u
-struct sp_sample { uint64_t tid,pc,lr,bt[4],event; int x16,wr; unsigned state; };
+struct sp_sample { uint64_t tid,pc,lr,bt[8],event; int x16,wr; unsigned state; };
 struct sp_key { struct sp_sample s; unsigned count,mixed,owner; };
 struct sp_thread { uint64_t tid; unsigned total,dropped; char name[64]; };
 struct sp_table { struct sp_key keys[SP_BUCKETS]; struct sp_thread threads[SP_THREADS]; unsigned nt,untracked,sweeps,late,skipped; };
@@ -57,9 +57,10 @@ static void sp_print(struct sp_table *p) {
   for(unsigned n=0;n<SP_TOP && top[n];n++) {
    if(n==limit){omitted++;break;}
    struct sp_key *k=top[n];struct sp_sample *s=&k->s;
-   printf("PROF backboardd t%llu name=%s n=%u/%u state=%s x16=%d wait=0x%llx wr=%d mixed=%u pc 0x%llx lr 0x%llx bt 0x%llx 0x%llx 0x%llx 0x%llx\n",
+   printf("PROF backboardd t%llu name=%s n=%u/%u state=%s x16=%d wait=0x%llx wr=%d mixed=%u pc 0x%llx lr 0x%llx bt 0x%llx 0x%llx 0x%llx 0x%llx 0x%llx 0x%llx 0x%llx 0x%llx\n",
     (unsigned long long)th->tid,th->name,k->count,th->total,states[s->state],s->x16,(unsigned long long)s->event,s->wr,k->mixed,
-    (unsigned long long)s->pc,(unsigned long long)s->lr,(unsigned long long)s->bt[0],(unsigned long long)s->bt[1],(unsigned long long)s->bt[2],(unsigned long long)s->bt[3]);
+    (unsigned long long)s->pc,(unsigned long long)s->lr,(unsigned long long)s->bt[0],(unsigned long long)s->bt[1],(unsigned long long)s->bt[2],(unsigned long long)s->bt[3],
+    (unsigned long long)s->bt[4],(unsigned long long)s->bt[5],(unsigned long long)s->bt[6],(unsigned long long)s->bt[7]);
   }
  }
  printf("PROF done threads=%u sweeps=%u late=%u skipped=%u untracked=%u truncated=%u\n",p->nt,p->sweeps,p->late,p->skipped,p->untracked,omitted);

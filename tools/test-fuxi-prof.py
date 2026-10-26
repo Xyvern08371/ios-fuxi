@@ -121,7 +121,7 @@ int main(void){
  }
  boot_present=1;boot_value=3601;{unsigned before=starts;sweet_prof_start();assert(starts==before && sp_delay==60);}
  worker();assert(ticks==120ULL*NSEC_PER_SEC && sleeps==30001 && blocks==sleeps && last_leeway==100000);
- assert(reads==120000 && allocs==1 && frees==1 && output==4);
+ assert(reads==240000 && allocs==1 && frees==1 && output==4);
  assert(strstr(logs[0],"PROF backboardd[1] slide 0x200000 mh 0x100000000"));
  assert(strstr(logs[1],"t42 name=CA_render_server_ total=30000 dropped=0"));
  assert(strstr(logs[2],"n=30000/30000 state=wait x16=-31 wait=0x123 wr=7 mixed=0 pc 0x180001000"));
@@ -129,9 +129,9 @@ int main(void){
  assert(strstr(logs[3],"sweeps=30000 late=0 skipped=0 untracked=0 truncated=0"));
  reset();missing=1;worker();assert(ticks==60ULL*NSEC_PER_SEC && !allocs && output==1);
  reset();allocfail=1;worker();assert(allocs==1 && !frees && output==1 && !reads);
- reset();cost=800000;worker();assert(ticks>=120ULL*NSEC_PER_SEC && ticks<120ULL*NSEC_PER_SEC+4*NSEC_PER_MSEC && strstr(logs[output-1],"late=11538"));
+ reset();cost=400000;worker(); // 8 frame reads keep the 3.2 ms sweep costassert(ticks>=120ULL*NSEC_PER_SEC && ticks<120ULL*NSEC_PER_SEC+4*NSEC_PER_MSEC && strstr(logs[output-1],"late=11538"));
  struct sp_table *p=calloc(1,sizeof(*p));assert(p);
- reset();sp_sweep(&task,p);assert(p->threads[0].total==1 && reads==4);
+ reset();sp_sweep(&task,p);assert(p->threads[0].total==1 && reads==8);
  for(unsigned state=0;state<4;state++){
   th.oncore=state==0;th.state=state==1?TH_WAIT:state==2?TH_RUN:0;sp_sweep(&task,p);
   struct sp_sample s={.tid=42,.pc=regs.pc,.lr=regs.lr,.bt={0x180003000,0x180003010},.state=state};
@@ -207,7 +207,7 @@ def symbolication():
     spec = importlib.util.spec_from_file_location('sweet_crash', ROOT / 'tools/sweet-crash.py')
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    # The existing parser already accepts pc/lr and all four bt addresses.
+    # The existing parser already accepts pc/lr and every bt address.
     text = (ROOT / 'tools/sweet-crash.py').read_text()
     pattern = re.search(r"re.findall\(r'([^']+)'", text)[1]
     for prefix in ('SMP backboardd t0', 'PROF backboardd t42 name=CA n=3/4 state=wait x16=-31 wait=0xfffffff012345678 wr=7 mixed=0'):
