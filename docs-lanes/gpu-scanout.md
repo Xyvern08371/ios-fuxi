@@ -134,7 +134,8 @@ uncooperative direct writers; those remain outside this ownership contract.
 
 ## Diagnostics and exact log forms
 
-- `fuxigpuscanoutlog=1`: per-copy logs and a cumulative summary every **120**
+- `fuxigpuscanoutlog=1`: per-copy logs (only with this boot-arg; `fuxigpuscanout=1`
+  alone prints just the summary) and a cumulative summary every **120**
   completed copies, independently of the new handoff. Use this alone for the
   existing-path baseline. The handoff enables these logs automatically.
 - `fuxigpuscanoutcheck=1`: with the handoff, compare **all pixels of the first

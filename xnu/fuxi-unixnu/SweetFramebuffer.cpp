@@ -155,7 +155,8 @@ public:
 	void         *fShadow;
 	uint64_t      fShadowBytes, fDiffStored, fDiffFull;
 	uint32_t      fDiffFrames, fIdleStops, fIdleWakes;
-	bool          fScanout, fScanoutLog, fScanoutHeld;
+	bool          fScanout, fScanoutHeld;
+	uint8_t       fScanoutLog;  /* 1 summary, 2 also per frame (fuxigpuscanoutlog=1) */
  uint32_t      fScanoutFrames, fScanoutGpu, fScanoutCpu, fScanoutDefers;
  uint64_t      fScanoutTime, fScanoutMax, fScanoutBytes, fScanoutPrepare;
 #if defined(FUXI)
@@ -412,7 +413,7 @@ AppleCLCD::start(IOService *provider)
  int quiet = 0;
  PE_parse_boot_argn("sweetfb_noconsole", &quiet, sizeof(quiet));
  fScanout = scanout == 1 && quiet == 1;
- fScanoutLog = log == 1 || fScanout;
+ fScanoutLog = log == 1 ? 2 : fScanout ? 1 : 0;
  if (scanout == 1 && !fScanout)
   IOLog("FUXI SCANOUT: unavailable, requires sweetfb_noconsole=1; existing present path\n");
  if (fScanout) { sweet_console_muted = 1; fConsolePaused = true; }
@@ -939,8 +940,10 @@ AppleCLCD::scanoutLog(bool gpu, uint64_t bytes, uint64_t copy, uint64_t prepare)
  if (gpu) ++fScanoutGpu; else ++fScanoutCpu;
  fScanoutTime += ns;
  if (ns > fScanoutMax) fScanoutMax = ns;
- IOLog("FUXI SCANOUT: frame=%u path=%s bytes=%llu copy_us=%llu prepare_us=%llu\n",
-     fScanoutFrames, gpu ? "GPU" : "CPU", bytes, ns/1000, prep/1000);
+ /* Per-frame console lines cost CPU on every swap; summary only by default. */
+ if (fScanoutLog == 2)
+  IOLog("FUXI SCANOUT: frame=%u path=%s bytes=%llu copy_us=%llu prepare_us=%llu\n",
+      fScanoutFrames, gpu ? "GPU" : "CPU", bytes, ns/1000, prep/1000);
  if (fScanoutFrames % 120 == 0)
   IOLog("FUXI SCANOUT: summary frames=%u GPU=%u CPU=%u copy_avg_us=%llu copy_max_us=%llu deferred=%u\n",
       fScanoutFrames, fScanoutGpu, fScanoutCpu, fScanoutTime/1000/fScanoutFrames,
