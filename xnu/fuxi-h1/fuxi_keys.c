@@ -537,7 +537,14 @@ fk_tour(void *arg, wait_result_t wr)
 	/* A home gesture on another page only returns to page 1 the second time. */
 	fk_tour_home();
 	fk_tour_home();
-	fk_tour_app(&shot, 670, 1710, "settings");
+	/* Settings reopens its last page: tap Back twice to reach the top list. */
+	fk_tap(670, 1710);
+	fk_script_sleep(4000);
+	fk_tap(110, 180);
+	fk_script_sleep(1500);
+	fk_tap(110, 180);
+	fk_script_sleep(2000);
+	fk_tour_shot(&shot, "settings");
 	fk_tour_app(&shot, 540, (int)fk_tour_general, "general");
 	fk_tour_app(&shot, 540, (int)fk_tour_about, "about");
 	fk_tour_home();
