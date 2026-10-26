@@ -522,11 +522,11 @@ fk_tour(void *arg, wait_result_t wr)
 	fk_tour_shot(&shot, "lock");
 	fk_tour_home();
 	fk_tour_shot(&shot, "home");
-	fk_swipe(180, 1300, 900, 1300, 250);    /* Today view */
+	fk_swipe(60, 1300, 1020, 1300, 450);    /* Today view */
 	fk_script_sleep(2000);
 	fk_tour_shot(&shot, "today");
-	fk_swipe(900, 1300, 180, 1300, 250);
-	fk_script_sleep(1500);
+	fk_tour_home();
+	fk_tour_home();
 	fk_swipe(540, 900, 540, 1600, 250);     /* Spotlight */
 	fk_script_sleep(2000);
 	fk_tour_shot(&shot, "spotlight");
@@ -534,6 +534,8 @@ fk_tour(void *arg, wait_result_t wr)
 	fk_swipe(1000, 10, 1000, 1100, 250);    /* Control Center */
 	fk_script_sleep(2000);
 	fk_tour_shot(&shot, "control-center");
+	/* A home gesture on another page only returns to page 1 the second time. */
+	fk_tour_home();
 	fk_tour_home();
 	fk_tour_app(&shot, 670, 1710, "settings");
 	fk_tour_app(&shot, 540, (int)fk_tour_general, "general");
