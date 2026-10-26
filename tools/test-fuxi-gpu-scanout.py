@@ -358,7 +358,8 @@ static void double_tests(uint8_t *panel) {
  assert(fg_scanout_current_match==1 && fg_scanout_current_mismatch==1);
  for(unsigned i=0;i<traceCount;i++)assert(trace[i].pa!=0xae050a4);
  // CPU fallback and black fill must first drain, keep fPixels=A and restore
- // its complete image even when front=B. It stays single-buffer thereafter.
+ // its complete image even when front=B. The next GPU frame re-enters double
+ // mode with A as the front, without waiting for A's transfer (B is idle).
  double_setup(panel);assert(fuxi_gpu_scanout_publish()==1);
  memset(modelB,0x39,sizeof(modelB));memset(panel,0xcc,4320u*2400);
  assert(!fuxi_gpu_scanout_cpu_acquire() && panel[0]==0xcc && fg_scanout_double_active);
@@ -368,8 +369,9 @@ static void double_tests(uint8_t *panel) {
  assert(fuxi_gpu_scanout_cpu_acquire()==1 && !fuxi_gpu_scanout_double() && !memcmp(panel,modelB,sizeof(modelB)));
  assert(sspp[0x14/4]==0xb8000000u && (ctl[0x18/4]&1));
  memset(panel,0,4320u*2400);assert(fuxi_gpu_scanout_publish()==1);
- assert(!fuxi_gpu_scanout_acquire());ctl[0x1c/4]=0;intf[0x298/4]+=1u<<16;
- assert(fuxi_gpu_scanout_acquire()==1 && !fuxi_gpu_scanout_double());
+ assert(fuxi_gpu_scanout_acquire()==1 && fuxi_gpu_scanout_double() && !fg_scanout_front && sspp[0x14/4]==0xb8000000u);
+ assert(fuxi_gpu_scanout_publish()==2);ctl[0x1c/4]=0;intf[0x2b0/4]=2400;intf[0x298/4]+=1u<<16;
+ assert(fuxi_gpu_scanout_retry()==1 && fg_scanout_front && sspp[0x14/4]==0xb8a00000u);
  // Preserve a newer ready image, whether it is A or B, before a CPU
  // partial update discards that unstarted frame.
  for(unsigned front=0;front<2;front++) {

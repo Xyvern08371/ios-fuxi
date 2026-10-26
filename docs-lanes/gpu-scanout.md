@@ -617,16 +617,19 @@ Ownership and copying:
   existing source retention, cache-clean fence, producer reservation and
   DMA quarantine checks remain in force.
 
-**CPU option: permanent single-buffer fallback to A until reboot.** CPU copy
+**CPU option: single-buffer fallback to A until the next GPU frame.** CPU copy
 and power-off black-fill callers use a distinct acquisition API. It first
 waits for GPU retirement and the same transfer/TE gates. With the display
 idle, it preserves the newest completed image in A (the ready image if one
 exists, otherwise the front), restores SRC0=A with the same flush, discards
 any ready frame, and disables flips. Existing `fPixels` writers, partial CPU
 copies, diff shadow handling and black publication then use the original
-single-buffer guard. The transition logs once. This deliberately sacrifices
-double buffering after a CPU fallback or blank rather than introduce another
-CPU pointer/lifetime contract; waking does not automatically re-enable it.
+single-buffer guard. The next GPU acquisition re-enters double mode with A as
+the front: GPU copies are full frames, so B needs no preparation and is not
+scanned while SRC0=A. OBSERVED on chain146: boot itself blanks once
+(`SWEET FB: display off` after the first GPU frame), so a permanent fallback
+disabled double mode for the whole boot. Transitions log for the first four
+re-entries only (`FUXI SCANOUT: double re-entered after CPU frame (N)`).
 
 Every stop after double ownership attempts SRC0=A plus flush before any
 possible fixed-address consumer could regain the display. A restore access
@@ -650,7 +653,7 @@ New exact log forms (`N`, `P`, `M` and addresses below are runtime values):
 ```text
 FUXI SCANOUT: double=1 A=0xb8000000 B=0xb8a00000 full_copy=1 flush=RMW|1
 FUXI SCANOUT: double=1 flips=N back_ready_drops=N publish_retries=N current_src0=P expected=P match=N mismatch=N
-FUXI SCANOUT: double CPU fallback, drained; single buffer A until reboot
+FUXI SCANOUT: double CPU fallback, drained; single buffer A until the next GPU frame
 FUXI SCANOUT: restore A failed; panel held, reboot required
 ```
 

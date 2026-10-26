@@ -49,7 +49,7 @@ static uint64_t fg_scanout_started, fg_scanout_last_start, fg_scanout_window_sta
 static int fg_abi_observe(void);
 static unsigned fg_scanout_double_active, fg_scanout_double_initialized, fg_scanout_front;
 static unsigned fg_scanout_back_ready, fg_scanout_flips, fg_scanout_ready_drops, fg_scanout_retries;
-static unsigned fg_scanout_current_match, fg_scanout_current_mismatch;
+static unsigned fg_scanout_current_match, fg_scanout_current_mismatch, fg_scanout_reentries;
 static uintptr_t fg_scanout_pixels_b;
 static int fg_scanout_acquire(unsigned publication);
 static int fg_scanout_stop(const char *reason);
@@ -499,6 +499,11 @@ static int fg_scanout_acquire(unsigned publication)
 int fuxi_gpu_scanout_acquire(void)
 {
  FG_GUARD;
+ /* A CPU frame left A as the front: GPU frames are complete, so B is free. */
+ if (fg_scanout_double_initialized && !fg_scanout_double_active && !fg_scanout_failed && fuxi_gpu_scanout_owned()) {
+  fg_scanout_double_active = 1; fg_scanout_front = fg_scanout_back_ready = 0;
+  if (++fg_scanout_reentries <= 4) printf("FUXI SCANOUT: double re-entered after CPU frame (%u)\n", fg_scanout_reentries);
+ }
  return fg_scanout_acquire(0);
 }
 int fuxi_gpu_scanout_double(void)
@@ -510,7 +515,7 @@ int fuxi_gpu_scanout_pending(void)
  return fg_scanout_back_ready && !fg_scanout_failed;
 }
 /* CPU writers retain fPixels=A. Drain first, preserve the newest image and
- * permanently use the existing single-buffer guard for the rest of this boot. */
+ * use the single-buffer guard until the next GPU frame re-enters double mode. */
 int fuxi_gpu_scanout_cpu_acquire(void)
 {
  FG_GUARD;
@@ -523,7 +528,7 @@ int fuxi_gpu_scanout_cpu_acquire(void)
  if (!fg_scanout_address(0xb8000000u)) return fg_scanout_stop("CPU restore A");
  if (fg_scanout_back_ready) fg_scanout_ready_drops++;
  fg_scanout_back_ready = fg_scanout_double_active = fg_scanout_front = 0;
- printf("FUXI SCANOUT: double CPU fallback, drained; single buffer A until reboot\n");
+ if (fg_scanout_reentries < 4) printf("FUXI SCANOUT: double CPU fallback, drained; single buffer A until the next GPU frame\n");
  return 1;
 }
 /* The caller has acquired scanout and finished ALL CPU writes or observed the
