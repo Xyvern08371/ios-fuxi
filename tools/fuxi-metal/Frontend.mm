@@ -1197,7 +1197,7 @@ static NSString *renderPassText(MTLRenderPassDescriptor *d){
  if(!_error)_error=[[NSError alloc] initWithDomain:MTLCommandBufferErrorDomain code:MTLCommandBufferErrorInvalidResource
   userInfo:@{NSLocalizedDescriptionKey:[NSString stringWithFormat:@"unsupported %@",NSStringFromSelector(s)]}];
 }
-- (void)dealloc {if(_queue){_shadows.release(_queue->_shadowPool);_queue->_operationStorage.release(_ops);_uploads.release(_queue->_uploadStorage,!owner(_queue->_device)->backend->poisoned,[](FuxiBuffer *b){[b release];});}[_queue release];[_resources release];[_handlers release];[_scheduledHandlers release];if(_completionGroup)dispatch_release(_completionGroup);if(_scheduledGroup)dispatch_release(_scheduledGroup);if(_commitReady)dispatch_release(_commitReady);[_error release];[super dealloc];}
+- (void)dealloc {if(_queue){_shadows.release(_queue->_shadowPool);_queue->_operationStorage.release(_ops);_uploads.release(_queue->_uploadStorage,owner(_queue->_device)->backend && !owner(_queue->_device)->backend->poisoned,[](FuxiBuffer *b){[b release];});}[_queue release];[_resources release];[_handlers release];[_scheduledHandlers release];if(_completionGroup)dispatch_release(_completionGroup);if(_scheduledGroup)dispatch_release(_scheduledGroup);if(_commitReady)dispatch_release(_commitReady);[_error release];[super dealloc];}
 - (id)device {FRONTEND_TIME(self);CENSUS();return _queue->_device;}
 - (id)commandQueue {FRONTEND_TIME(self);CENSUS();return _queue;}
 - (MTLCommandBufferStatus)status {CENSUS();if(!_overlap)return _status;@synchronized(self){return _overlap && _enqueued && _status==MTLCommandBufferStatusNotEnqueued?MTLCommandBufferStatusEnqueued:_status;}}
@@ -1364,7 +1364,7 @@ static NSString *renderPassText(MTLRenderPassDescriptor *d){
   for(MTLCommandBufferHandler handler in scheduled)handler((id)self);[scheduled release];}
  NSArray *handlers=[_handlers copy];[_handlers removeAllObjects];
  [self deliverCompletedHandlers:handlers];
- [handlers release];[_scheduledHandlers removeAllObjects];[_resources removeAllObjects];_resourceCache.clear();_resourceSet.clear();_queue->_operationStorage.release(_ops);_uploads.release(_queue->_uploadStorage,!owner(_queue->_device)->backend->poisoned,[](FuxiBuffer *b){[b release];});_events.clear();_shadowUses.clear();
+ [handlers release];[_scheduledHandlers removeAllObjects];[_resources removeAllObjects];_resourceCache.clear();_resourceSet.clear();_queue->_operationStorage.release(_ops);_uploads.release(_queue->_uploadStorage,owner(_queue->_device)->backend && !owner(_queue->_device)->backend->poisoned,[](FuxiBuffer *b){[b release];});_events.clear();_shadowUses.clear();
 }
 - (void)commit {CENSUS();
  if(!_overlap){[self commitSynchronous];return;}
@@ -1484,7 +1484,7 @@ static NSString *renderPassText(MTLRenderPassDescriptor *d){
  }
  @synchronized(self){_finished=YES;if(_status!=MTLCommandBufferStatusError)_status=MTLCommandBufferStatusCompleted;
   NSArray *handlers=[_handlers copy];[_handlers removeAllObjects];[self deliverCompletedHandlers:handlers];[handlers release];}
- @synchronized(self){[_scheduledHandlers removeAllObjects];}[_resources removeAllObjects];_resourceCache.clear();_resourceSet.clear();_queue->_operationStorage.release(_ops);_uploads.release(_queue->_uploadStorage,!owner(_queue->_device)->backend->poisoned,[](FuxiBuffer *b){[b release];});_events.clear();_shadows.release(_queue->_shadowPool);_shadowUses.clear();
+ @synchronized(self){[_scheduledHandlers removeAllObjects];}[_resources removeAllObjects];_resourceCache.clear();_resourceSet.clear();_queue->_operationStorage.release(_ops);_uploads.release(_queue->_uploadStorage,owner(_queue->_device)->backend && !owner(_queue->_device)->backend->poisoned,[](FuxiBuffer *b){[b release];});_events.clear();_shadows.release(_queue->_shadowPool);_shadowUses.clear();
  if(_overlap)dispatch_group_leave(_completionGroup);
 }
 - (void)waitUntilCompleted {CENSUS();if(completionCommand!=self){auto start=_frameTrace?fuxi::FrameClock::now():fuxi::FrameClock::time_point{};dispatch_group_wait(_completionGroup,DISPATCH_TIME_FOREVER);if(_frameTrace)_queue->_traceWaitCompleted=std::max<uint64_t>(1,fuxi::frameNanos(start));}}
