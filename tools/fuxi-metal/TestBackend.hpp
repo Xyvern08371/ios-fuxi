@@ -23,7 +23,7 @@ struct Buffer {void *contents;size_t length,allocated;};
 struct Texture : TextureLevels {size_t allocated{},charged{};uint32_t format=80;std::vector<uint8_t> pixels{};
  size_t offset(uint32_t level) const {size_t o=0;for(uint32_t l=0;l<level;++l)o+=levelWidth(l)*levelHeight(l)*metalTexelBytes(format);return o;}
 };
-struct Pipeline {bool sampled=false;size_t references=1;};
+struct Pipeline {ShadowWindow shadowWindows[2][resourceSlots]{};CompileOptions options{};bool sampled=false;size_t references=1;};
 struct Sampler {};
 struct Viewport {float x,y,width,height,minDepth,maxDepth;};
 struct Rect {struct {int32_t x,y;}offset;struct {uint32_t width,height;}extent;};
@@ -52,7 +52,7 @@ public:
  static inline std::atomic<uint64_t> pipelineCacheLoadResult{0},pipelineCacheLoadBytes{0},pipelineCacheSaveResult{0},pipelineCacheSaveBytes{0},pipelineCacheSaveCount{0},pipelineCacheSaveFailures{0};
  static inline std::atomic<uint64_t> submitObjectsNanos{0},submitDescriptorsNanos{0},submitRecordNanos{0},shadowCopyNanos{0},submitFlushNanos{0},submitInvalidateNanos{0},flushCalls{0},invalidateCalls{0},emptySubmits{0},submitObjectCreates{0},submitPoolCreates{0},submitFrameCreates{0},submitViewCreates{0};
  static inline std::atomic<uint64_t> submits{0},submitPrepareNanos{0},submitWaitNanos{0},submitRetireNanos{0};
- static inline bool modelPipelines=false;
+ static inline bool modelPipelines=false;static inline std::function<void(const Operation &)> modelDraw;
  void requireLive(){if(poisoned || backboardGate.refusesResources())throw std::runtime_error("device poisoned or backboardd failure latched");}
  uint32_t maxTextureDimension() const{return limits.dimension;}
  size_t resourceBytes() const{return limits.used;}
@@ -95,7 +95,7 @@ public:
   static_assert(sizeof(CompileOptions)==40360);
   std::string key=std::string(v)+"/"+f+"/";key.append((const char *)&options,sizeof(options));
   if(auto *p=objects.acquire(key)){++pipelineHits;return p;}
-  ++pipelineMisses;auto *p=new Pipeline{};objects.insert(key,key,p,sizeof(Pipeline),[&](Pipeline *old){destroy(old);});return p;
+  ++pipelineMisses;auto *p=new Pipeline{};p->options=options;objects.insert(key,key,p,sizeof(Pipeline),[&](Pipeline *old){destroy(old);});return p;
  }
  bool destroy(Texture *t) {if(t){limits.release(t->charged);delete t;}return !poisoned;}
  void destroy(Pipeline *p) {if(p && !--p->references)delete p;}
@@ -109,7 +109,7 @@ public:
   ++submissions;if(scheduled)scheduled();
   for(auto &op:ops) {
    if(op.texture){auto *t=op.texture;
-    if(op.pipeline)throw std::runtime_error("CPU model has no shaders");
+    if(op.pipeline){if(!modelDraw)throw std::runtime_error("CPU model has no shaders");modelDraw(op);continue;}
     uint32_t l=op.upload || op.sourceTexture || op.clearOnly?op.dstLevel:op.srcLevel;
     size_t w=t->levelWidth(l),h=t->levelHeight(l),pixel=texelBytes(t->format);auto *data=t->pixels.data()+t->offset(l);
     if(op.generateMips)throw std::runtime_error("model does not generate mips");

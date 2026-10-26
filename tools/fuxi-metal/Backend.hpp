@@ -85,7 +85,7 @@ struct VariantKey {
  explicit VariantKey(const DrawInput &input){for(unsigned i=0;i<resourceSlots;++i){auto *w=&words[i*8];w[0]=input.formats[i];w[1]=input.filters[i];memcpy(w+2,&input.lodMin[i],4);memcpy(w+3,&input.lodMax[i],4);for(unsigned stage=0;stage<2;++stage){w[4+stage*2]=input.buffers[stage][i].length!=0;w[5+stage*2]=input.buffers[stage][i].bytes;}}}
  bool operator==(const VariantKey &other) const {return words==other.words;}
 };
-struct Pipeline {std::array<uint32_t,resourceSlots> textureTypes{};size_t references=1,retainedBytes=0;void *translation{};CompileOptions options{};uint32_t fetchMask{};bool orderedColorAccess=false;std::vector<std::pair<uint32_t,VkRenderPass>> renders;VkPipeline pipeline{},stripPipeline{};std::array<VkPipeline,2> linePipelines{};Translation recipe{};VkPipelineLayout layout{};VkRenderPass render{};uint32_t pushOffset{},pushSize{},pushStages{};uint8_t pushBytes[128]{};VkDescriptorSetLayout setLayout{};VkSampler bakedSamplers[16]{};BakedSampler bakedSamplerInfo[16]{};MipAccess mipAccess[2];uint32_t readOnlyStorage[2]{};std::vector<Descriptor> descriptors;std::vector<Buffer *> constantBlobs;std::vector<std::array<uint8_t,32>> blobHashes;std::vector<std::pair<VariantKey,Pipeline *>> variants;
+struct Pipeline {ShadowWindow shadowWindows[2][resourceSlots]{};std::array<uint32_t,resourceSlots> textureTypes{};size_t references=1,retainedBytes=0;void *translation{};CompileOptions options{};uint32_t fetchMask{};bool orderedColorAccess=false;std::vector<std::pair<uint32_t,VkRenderPass>> renders;VkPipeline pipeline{},stripPipeline{};std::array<VkPipeline,2> linePipelines{};Translation recipe{};VkPipelineLayout layout{};VkRenderPass render{};uint32_t pushOffset{},pushSize{},pushStages{};uint8_t pushBytes[128]{};VkDescriptorSetLayout setLayout{};VkSampler bakedSamplers[16]{};BakedSampler bakedSamplerInfo[16]{};MipAccess mipAccess[2];uint32_t readOnlyStorage[2]{};std::vector<Descriptor> descriptors;std::vector<Buffer *> constantBlobs;std::vector<std::array<uint8_t,32>> blobHashes;std::vector<std::pair<VariantKey,Pipeline *>> variants;
 };
 struct BufferBind {Buffer *buffer{};uint64_t offset{};bool bytes=false;};
 struct ColorTarget {Texture *texture{};uint32_t level{},load=2,store=1;float clear[4]{};};
@@ -691,6 +691,7 @@ public:
  }
  Pipeline *createPipeline(Translation translated,const CompileOptions &options) {
   auto &tr=Translator::get();auto *p=new Pipeline{};p->options=options;
+  if(tr.shadow_windows){ShadowWindow windows[2][resourceSlots]{};if(tr.shadow_windows(translated.handle,&windows[0][0])==1)memcpy(p->shadowWindows,windows,sizeof(windows));}
   p->textureTypes.fill(2);if(tr.texture_type)for(unsigned slot=0;slot<resourceSlots;++slot)p->textureTypes[slot]=tr.texture_type(translated.handle,slot);
   auto cleanup=[&]{if(translated.handle)tr.free(translated.handle);};
   try {

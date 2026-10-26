@@ -625,6 +625,16 @@ mod tests {
     use super::*;
     use metal2vulkan::pipeline::SlotRef;
     #[test]
+    fn shadow_windows_require_proven_readonly_descriptor_access() {
+        use metal2vulkan::pipeline::{BufferForm,BufferKind,DescriptorView,Window};
+        assert_eq!(std::mem::size_of::<ShadowWindow>(),24);
+        let form=BufferForm::Descriptor(DescriptorView::UniformWords);let bounded=Window::Bounded{start:-8,len:24};
+        let w=shadow_window(form,bounded,false,BufferKind::Buffer);assert_eq!((w.kind,w.start,w.size),(1,-8,24));
+        for w in [shadow_window(form,Window::Whole,false,BufferKind::Buffer),shadow_window(form,bounded,true,BufferKind::Buffer),
+                  shadow_window(BufferForm::Psb,bounded,false,BufferKind::Buffer),shadow_window(form,bounded,false,BufferKind::VisibleFunctionTable)] {assert_eq!(w.kind,0);}
+        unsafe {assert_eq!(fuxi_m2v_shadow_windows_v1(std::ptr::null_mut(),std::ptr::null_mut()),0);}
+    }
+    #[test]
     fn bulk_module_scan_rejects_malformed_headers_and_instructions() {
         let valid=[0x07230203,0x00010500,0,2,0,0x00010000];scan_module(&valid).unwrap();
         for (at,value) in [(0,0),(1,0),(3,0),(3,3),(4,1),(5,0),(5,0x00020000)] {let mut bad=valid;bad[at]=value;assert!(scan_module(&bad).is_err());}
@@ -874,6 +884,44 @@ fn reflect_textures(pipeline:&metal2vulkan::pipeline::RenderPipeline,state:&mut 
   }
  }
  u32::MAX
+}
+// Immutable shader access proof, independent of binding offsets and draw-plan caching.
+#[repr(C)] #[derive(Clone,Copy,Default)]
+pub struct ShadowWindow {kind:u32,reserved:u32,start:i64,size:u64}
+fn shadow_window(form:metal2vulkan::pipeline::BufferForm,window:metal2vulkan::pipeline::Window,writes:bool,kind:metal2vulkan::pipeline::BufferKind)->ShadowWindow {
+ use metal2vulkan::pipeline::{BufferForm,BufferKind,Window};
+ if matches!(kind,BufferKind::Buffer) && matches!(form,BufferForm::Descriptor(_)) && !writes {
+  if let Window::Bounded{start,len}=window{return ShadowWindow{kind:1,start,size:len,..Default::default()};}
+ }
+ ShadowWindow::default()
+}
+#[no_mangle] pub unsafe extern "C" fn fuxi_m2v_shadow_windows_v1(product:*mut c_void,out:*mut ShadowWindow)->i32 {
+ use metal2vulkan::pipeline::SlotInterface;
+ if product.is_null() || out.is_null(){return 0;}
+ let p=&*(product as *const Product);let interface=&p.pipeline.interface;
+ if interface.needs_pointer_translation || interface.needs_handle_translation || interface.reaches_command_buffers{return 0;}
+ let windows=std::slice::from_raw_parts_mut(out,(SLOTS*2) as usize);
+ windows.fill(ShadowWindow{kind:2,..Default::default()});
+ for (slot,interface) in &p.pipeline.interface.slots {
+  if slot.class!=SlotClass::Buffer{continue;}
+  let stage=match slot.stage {Stage::Vertex=>0,Stage::Fragment=>1,_=>return 0};if slot.index>=SLOTS{return 0;}
+  let w=&mut windows[(stage*SLOTS+slot.index) as usize];*w=ShadowWindow::default();
+  if let SlotInterface::Buffer(b)=interface {
+   *w=shadow_window(b.form,b.window,b.access.write,b.kind);
+  }
+ }
+ // Pulled attributes synthesize Whole slots. Remove only slots proven to have no shader argument.
+ if p.options.attributes.iter().any(|a|a.format!=0 && a.buffer<SLOTS && windows[a.buffer as usize].kind==0) {
+  let mut descriptor=p.descriptor.clone();descriptor.vertex_descriptor=None;descriptor.fragment=None;
+  if let Ok(reflection)=descriptor.reflection(&Budget::standard()) {
+   for a in &p.options.attributes {
+    if a.format!=0 && a.buffer<SLOTS && windows[a.buffer as usize].kind==0 && !reflection.vertex_bindings().iter().any(|b|b.index()==a.buffer) {
+     windows[a.buffer as usize]=ShadowWindow{kind:2,..Default::default()};
+    }
+   }
+  }
+ }
+ 1
 }
 fn make_product(device:Device,descriptor:RenderPipelineDescriptor,options:&CompileOptions,mut state:BindState,variant:metal2vulkan::cache::VariantKey,initial:bool,request:Option<&[u8;32]>)->Result<Product,String> {
         let decoded=cached_render(&device,&descriptor,&variant,request)?;let pipeline=decoded.pipeline;

@@ -60,6 +60,7 @@ struct FrameSample {
  uint64_t inflight=0,completionLatency=0;
  uint64_t commitCall=0,commitGap=0,admissionWait=0,snapshot=0,submitQueue=0;
  uint64_t backendLock=0,slotWait=0,flush=0,queueSubmit=0,retireLock=0,invalidate=0,retireHost=0,surfaceRelease=0,scheduledHandlers=0;
+ uint64_t snapshotBytes=0,shadowCopyBytes=0;
  uint64_t planHits=0,planMisses=0;
  uint64_t queueSubmits=0,imageBarriers=0,readBarriersSkipped=0,crossEncoderMerges=0;
  uint64_t drainWaits=0,conflictWaits=0,slotWaits=0;
@@ -151,6 +152,7 @@ public:
   draws+=s.draws;passes+=s.passes;counts.pipelines+=s.counts.pipelines;counts.descriptors+=s.counts.descriptors;counts.allocations+=s.counts.allocations;
   mergedDraws+=s.mergedDraws;for(size_t i=1;i<mergeSplits.size();++i)mergeSplits[i]+=s.mergeSplits[i];
   totals.cpuSampledSubmits+=s.cpuSampledSubmits;totals.cpuOmittedSubmits+=s.cpuOmittedSubmits;
+  totals.snapshotBytes+=s.snapshotBytes;totals.shadowCopyBytes+=s.shadowCopyBytes;
   totals.planHits+=s.planHits;totals.planMisses+=s.planMisses;
   totals.queueSubmits+=s.queueSubmits;totals.imageBarriers+=s.imageBarriers;totals.readBarriersSkipped+=s.readBarriersSkipped;totals.crossEncoderMerges+=s.crossEncoderMerges;
   totals.drainWaits+=s.drainWaits;totals.conflictWaits+=s.conflictWaits;totals.slotWaits+=s.slotWaits;
@@ -183,6 +185,7 @@ public:
   fprintf(out," interval=%.3f/%.3f ms cadence_ticks=1:%llu,2:%llu,3:%llu,4+:%llu",p(&FrameSample::interval,50),p(&FrameSample::interval,90),(unsigned long long)cadence[0],(unsigned long long)cadence[1],(unsigned long long)cadence[2],(unsigned long long)cadence[3]);
   fprintf(out," submits/frame=%.2f image_barriers/frame=%.2f read_barriers_skipped/frame=%.2f cross_encoder_merges/frame=%.2f wait_reasons=drain:%llu,conflict:%llu,slots:%llu",totals.queueSubmits/n,totals.imageBarriers/n,totals.readBarriersSkipped/n,totals.crossEncoderMerges/n,(unsigned long long)totals.drainWaits,(unsigned long long)totals.conflictWaits,(unsigned long long)totals.slotWaits);
   fprintf(out," plan_hits/frame=%.2f plan_misses/frame=%.2f",totals.planHits/n,totals.planMisses/n);
+  fprintf(out," snapshot_bytes/frame=%.2f shadow_copy_bytes/frame=%.2f",totals.snapshotBytes/n,totals.shadowCopyBytes/n);
   auto stage=[&](const char *name,uint64_t FrameSample::*field){fprintf(out," %s=%.3f/%.3f",name,p(field,50),p(field,90));};
   stage("commit_call",&FrameSample::commitCall);stage("commit_gap",&FrameSample::commitGap);stage("admission_wait",&FrameSample::admissionWait);stage("snapshot",&FrameSample::snapshot);stage("submit_queue",&FrameSample::submitQueue);
   stage("backend_lock",&FrameSample::backendLock);stage("slot_wait",&FrameSample::slotWait);stage("flush",&FrameSample::flush);stage("queue_submit",&FrameSample::queueSubmit);stage("retire_lock",&FrameSample::retireLock);stage("invalidate",&FrameSample::invalidate);stage("retire_host",&FrameSample::retireHost);stage("surface_release",&FrameSample::surfaceRelease);stage("scheduled_handlers",&FrameSample::scheduledHandlers);

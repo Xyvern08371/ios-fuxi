@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstring>
 #include "ConstantLayout.hpp"
+#include "ShadowRanges.hpp"
 #include "CAState.hpp"
 #include "TranslationPolicy.hpp"
 #include <cstdint>
@@ -100,6 +101,7 @@ public:
  int (*sampler)(void *,uint32_t,BakedSampler *,char *,size_t){};
  int (*identity)(void *,const char *,void *,const char *,const CompileOptions *,uint8_t *,char *,size_t){};
  int (*product_hash)(void *,uint8_t *){};
+ int (*shadow_windows)(void *,ShadowWindow *){}; // Optional immutable access proof; absent means whole buffers.
  uint32_t (*texture_type)(void *,uint32_t){}; // Optional ABI-8 reflected Metal type; UINT32_MAX means unused.
  void (*free)(void *){};
  Translator() {
@@ -111,6 +113,7 @@ public:
   LOAD(open) LOAD(close) LOAD(function) LOAD(compile) LOAD(draw) LOAD(variant) LOAD(sampler) LOAD(identity) LOAD(product_hash) LOAD(free)
 #undef LOAD
   draw_plan=(decltype(draw_plan))dlsym(dylib,"fuxi_m2v_draw_plan_v1");
+  shadow_windows=(decltype(shadow_windows))dlsym(dylib,"fuxi_m2v_shadow_windows_v1");
   texture_type=(decltype(texture_type))dlsym(dylib,"fuxi_m2v_texture_type");
   translationScope=(TranslationScope)dlsym(dylib,"fuxi_m2v_translation_scope_v1");
   auto policy=systemTranslationPolicy();if(policy.stages || policy.trace)fprintf(stderr,"FUXI MTL: translation settings stages=%u trace=%u bridge=%u\n",unsigned(policy.stages),unsigned(policy.trace),unsigned(translationScope!=nullptr));
