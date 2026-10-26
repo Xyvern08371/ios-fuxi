@@ -18,7 +18,7 @@ def main():
     with tempfile.TemporaryDirectory() as tmp:
         d=Path(tmp);conf=d/'smoke.conf'
         compiler=['xcrun','clang++'] if os.uname().sysname=='Darwin' else ['clang++']
-        for name in ('ClientGateTests','BackboardGateTests','TextureLevelsTests','MipAccessTests','SurveyTests','ClientSetupTests','NativeSelectionTests','SurfaceLeaseTests','TranslationPolicyTests','CompileBoostTests','FrameTraceTests','FrameCPUTests','OperationAPITests','DrawPlanTests','DrawPlanCacheTests','ShadowRangesTests'):
+        for name in ('ClientGateTests','BackboardGateTests','TextureLevelsTests','MipAccessTests','SurveyTests','ClientSetupTests','NativeSelectionTests','SurfaceLeaseTests','TranslationPolicyTests','CompileBoostTests','FrameTraceTests','FrameCPUTests','OperationAPITests','FrontendEncodingTests','DrawPlanTests','DrawPlanCacheTests','ShadowRangesTests'):
             subprocess.run([*compiler,'-std=c++17','-Wall','-Wextra','-Werror','-pthread',
                             '-fsanitize=address,undefined',str(ROOT/'tools/fuxi-metal'/(name+'.cpp')),
                             '-o',str(d/name)],check=True)
@@ -68,10 +68,12 @@ def main():
         frameworks=['-framework','Foundation','-framework','Metal','-framework','IOSurface']
         def call(command):subprocess.run(command,check=True)
         if a.compile_only:
-            for name in ['ShadowFrontendTests','OverlapFrontendTests','AsyncPipelineFrontendTests','ConstantFrontendTests','FrontendTests','PipelineFrontendTests','CAFrontendTests','MipFrontendTests','MRTFrontendTests','GateFrontendTests','CensusTests','RenderServerFrontendTests','BlitFrontendTests','LinearFrontendTests','ScanoutFrontendTests']:
+            for name in ['EncodingFrontendTests','ShadowFrontendTests','OverlapFrontendTests','AsyncPipelineFrontendTests','ConstantFrontendTests','FrontendTests','PipelineFrontendTests','CAFrontendTests','MipFrontendTests','MRTFrontendTests','GateFrontendTests','CensusTests','RenderServerFrontendTests','BlitFrontendTests','LinearFrontendTests','ScanoutFrontendTests']:
                 call(['xcrun','clang++','-std=c++17',*flags,str(ROOT/'tools/fuxi-metal'/(name+'.mm')),*frameworks,'-o',str(d/name)])
             print('PASS: compile-only frontend tests; no test executables run')
             return
+        call(['xcrun','clang++','-std=c++17',*flags,str(ROOT/'tools/fuxi-metal/EncodingFrontendTests.mm'),*frameworks,'-o',str(d/'encoding')])
+        subprocess.run([str(d/'encoding')],env=dict(os.environ,ASAN_OPTIONS='detect_leaks=0'),check=True,timeout=30)
         call(['xcrun','clang++','-std=c++17',*flags,str(ROOT/'tools/fuxi-metal/ShadowFrontendTests.mm'),*frameworks,'-o',str(d/'shadows')])
         subprocess.run([str(d/'shadows')],env=dict(os.environ,ASAN_OPTIONS='detect_leaks=0',FUXI_MTL_TEST_BOOTARGS='fuxigpuoverlap=1 fuxigpuframetrace=1'),check=True,timeout=30)
         call(['xcrun','clang++','-std=c++17',*flags,str(ROOT/'tools/fuxi-metal/OverlapFrontendTests.mm'),*frameworks,'-o',str(d/'overlap')])

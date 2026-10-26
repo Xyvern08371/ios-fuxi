@@ -23,6 +23,10 @@ int main(){
  frontend.copyTo(sample);frontend.copyTo(sample);
  if(systemTranslationPolicy().frameCPU){assert(sample.frontendCPU==7200 && sample.frontendWall>0 && reads==2);}
  else assert(!reads && !sample.frontendCPU && !sample.frontendWall);
+ FrontendTimes drawTimes;for(unsigned i=0;i<149;++i){FrontendDrawTimer draw(&drawTimes);}
+ FrameSample drawSample;drawTimes.copyTo(drawSample);
+ if(systemTranslationPolicy().frameCPU)assert(drawTimes.drawCalls==149 && drawSample.frontendDrawSamples==10 && drawSample.frontendDraw>0);
+ else assert(!drawTimes.drawCalls && !drawSample.frontendDrawSamples && !drawSample.frontendDraw);
  auto before=reads.load();
  for(unsigned i=0;i<120;++i){FrameStageTimer timer(&sample,&FrameSample::pipe);fakeCPU+=12;}
  try{FrameStageTimer timer(&sample,&FrameSample::pipe);throw 1;}catch(int){}

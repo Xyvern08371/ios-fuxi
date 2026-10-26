@@ -1,5 +1,6 @@
 /* Original Fuxi diagnostic frontend. Vulkan headers/source remain external. */
 #pragma once
+#include "FrontendEncoding.hpp"
 #define VK_NO_PROTOTYPES
 #include <vulkan/vulkan.h>
 #include <dlfcn.h>
@@ -99,7 +100,7 @@ struct Operation {
  // Metal renderTargetWidth/Height: the pass's top-left render area; 0 means the whole target.
  uint32_t areaWidth{},areaHeight{};
  uint32_t srcLevel{},dstLevel{},sampleBase[resourceSlots]{},sampleCount[resourceSlots]{};bool generateMips=false;uint32_t mipBase{},mipCount{};
- std::string diagnostic{};// texture/dstLevel also name the first present target when slot 0 is absent.
+ OperationDiagnostic diagnostic{};// texture/dstLevel also name the first present target when slot 0 is absent.
  uint32_t colorCount=1,colorMask=1;ColorTarget colors[7]{};
  // Command-local Metal encoder identity. Zero is unknown and never merges.
  // The frontend rejects nonzero slices/depth planes and multisampling.

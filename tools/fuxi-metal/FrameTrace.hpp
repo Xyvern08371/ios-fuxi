@@ -53,7 +53,7 @@ inline thread_local FrameCounts frameCounts;
 enum class MergeSplit : size_t {none,encoder,attachments,area,actions,attachmentSample,storage,shadow,fetch,nonDraw,bufferAlias,count};
 inline constexpr const char *mergeSplitNames[]={"none","encoder","attachments","area","actions","attachment_sample","storage","shadow","fetch","non_draw","buffer_alias"};
 struct FrameSample {
- uint64_t backendCPU=0,frontendCPU=0,frontendWall=0;
+ uint64_t backendCPU=0,frontendCPU=0,frontendWall=0,frontendDraw=0,frontendDrawSamples=0;
  uint64_t cpuSampledSubmits=0,cpuOmittedSubmits=0;
  uint64_t pipe=0,desc=0,record=0,kernelIO=0;
  uint64_t backendLockCPU=0,slotWaitCPU=0,pipeCPU=0,descCPU=0,recordCPU=0,flushCPU=0,kernelIOCPU=0,queueSubmitCPU=0;
@@ -101,7 +101,7 @@ template<class Call> decltype(auto) frameKernelCall(Call &&call) {
 // This includes client work between methods; never subtract clocks from different
 // threads. Valid Metal encoding serializes access to a command buffer's encoders.
 struct FrontendTimes {
- std::atomic<uint64_t> wall{0};
+ std::atomic<uint64_t> wall{0};uint64_t drawWall=0,drawCalls=0,drawSamples=0;
  uint64_t cpuStart=UINT64_MAX,cpu=0;bool started=false,migrated=false,finished=false;
  std::thread::id thread;
  void begin(){
@@ -110,12 +110,19 @@ struct FrontendTimes {
   else if(thread!=std::this_thread::get_id())migrated=true;
  }
  void copyTo(FrameSample &s) {
-  s.frontendWall=wall.load(std::memory_order_relaxed);
+  s.frontendWall=wall.load(std::memory_order_relaxed);s.frontendDraw=drawSamples?drawWall*drawCalls/drawSamples:0;s.frontendDrawSamples=drawSamples;
   if(started && !finished){finished=true;
    if(!migrated && thread==std::this_thread::get_id())cpu=frameCPUDelta(cpuStart,frameThreadCPU());
   }
   s.frontendCPU=cpu;
  }
+};
+// Sample one in sixteen draw calls at level 2; report an estimated total, no CPU clock reads.
+class FrontendDrawTimer {
+ FrontendTimes *times=nullptr;FrameClock::time_point start{};
+public:
+ explicit FrontendDrawTimer(FrontendTimes *t){if(t && systemTranslationPolicy().frameCPU && (t->drawCalls++&15u)==0){times=t;start=FrameClock::now();}}
+ ~FrontendDrawTimer(){if(times){times->drawWall+=frameNanos(start);++times->drawSamples;}}
 };
 // Only level 2 enables frontend method wall timing. Nesting counts once; the
 // CPU clock is read at most twice per command buffer, never once per method.
@@ -154,6 +161,7 @@ public:
   mergedDraws+=s.mergedDraws;for(size_t i=1;i<mergeSplits.size();++i)mergeSplits[i]+=s.mergeSplits[i];
   totals.cpuSampledSubmits+=s.cpuSampledSubmits;totals.cpuOmittedSubmits+=s.cpuOmittedSubmits;
   totals.snapshotBytes+=s.snapshotBytes;totals.shadowCopyBytes+=s.shadowCopyBytes;totals.shadowScannedIndices+=s.shadowScannedIndices;for(size_t i=0;i<totals.shadowFullReasons.size();++i)totals.shadowFullReasons[i]+=s.shadowFullReasons[i];
+  totals.frontendDrawSamples+=s.frontendDrawSamples;
   totals.planHits+=s.planHits;totals.planMisses+=s.planMisses;
   totals.queueSubmits+=s.queueSubmits;totals.imageBarriers+=s.imageBarriers;totals.readBarriersSkipped+=s.readBarriersSkipped;totals.crossEncoderMerges+=s.crossEncoderMerges;
   totals.drainWaits+=s.drainWaits;totals.conflictWaits+=s.conflictWaits;totals.slotWaits+=s.slotWaits;
@@ -193,6 +201,7 @@ public:
   stage("backend_lock",&FrameSample::backendLock);stage("slot_wait",&FrameSample::slotWait);stage("flush",&FrameSample::flush);stage("queue_submit",&FrameSample::queueSubmit);stage("retire_lock",&FrameSample::retireLock);stage("invalidate",&FrameSample::invalidate);stage("retire_host",&FrameSample::retireHost);stage("surface_release",&FrameSample::surfaceRelease);stage("scheduled_handlers",&FrameSample::scheduledHandlers);
   stage("prior_delivery",&FrameSample::priorDelivery);stage("prior_handlers",&FrameSample::priorHandlers);stage("prior_wait_completed",&FrameSample::priorWaitCompleted);
   stage("backend_cpu",&FrameSample::backendCPU);stage("frontend_cpu",&FrameSample::frontendCPU);stage("frontend_wall",&FrameSample::frontendWall);
+  fprintf(out," frontend_draw_ns/frame=%.0f/%.0f frontend_draw_samples/frame=%.2f",double(percentile(&FrameSample::frontendDraw,50)),double(percentile(&FrameSample::frontendDraw,90)),totals.frontendDrawSamples/n);
   stage("pipe",&FrameSample::pipe);stage("desc",&FrameSample::desc);stage("record",&FrameSample::record);stage("kernel_io",&FrameSample::kernelIO);
   stage("backend_lock_cpu",&FrameSample::backendLockCPU);stage("slot_wait_cpu",&FrameSample::slotWaitCPU);
   stage("pipe_cpu",&FrameSample::pipeCPU);stage("desc_cpu",&FrameSample::descCPU);stage("record_cpu",&FrameSample::recordCPU);stage("flush_cpu",&FrameSample::flushCPU);stage("kernel_io_cpu",&FrameSample::kernelIOCPU);stage("queue_submit_cpu",&FrameSample::queueSubmitCPU);
