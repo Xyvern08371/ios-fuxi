@@ -1203,7 +1203,7 @@
 +#endif
 --- a/bsd/dev/fuxi_gpu_scanout.inc
 +++ b/bsd/dev/fuxi_gpu_scanout.inc
-@@ -0,0 +1,664 @@
+@@ -0,0 +1,665 @@
 +/* SPDX-License-Identifier: MIT
 + * Copyright (c) 2026 NativeMetal contributors
 + * Ported from UniXNU drivers/NativeMetal/GpuScanoutClient.h (MIT).
@@ -1639,6 +1639,7 @@
 + }
 + if (fg_busy) { fg_scanout_wait_ring++; return 0; }
 + if (fg_scanout_double_active && !publication) {
++  if (fg_scanout_back_ready) return 0;
 +  fg_scanout_writable = 1;
 +  return 1;
 + }

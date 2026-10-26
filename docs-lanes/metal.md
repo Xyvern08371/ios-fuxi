@@ -2127,9 +2127,10 @@ swaps the drawable IOSurface. The inferred requirement is that swap must not
 copy an incomplete surface, rather than requiring the CPU to observe Vulkan
 submission. This is an inference about this CA path, not all private Apple uses.
 
-**Kernel ordering, facts from code:** swap saves the newest record/`fDirty`;
-the timer copies it later. Normal IOSurface writer locks count `gpuWriters`
-under `sweet_gpu_lock` after waiting for an older display copy of that surface.
+**Kernel ordering, facts from the original reservation change:** swap saved
+the newest record/`fDirty`; the timer copied it later. The FIFO correction
+below supersedes that mailbox behavior. Normal IOSurface writer locks count
+`gpuWriters` under `sweet_gpu_lock` after waiting for an older display copy of that surface.
 The worker holds its lease from before submission through render-fence/cache
 retirement. GPU copy rejects writers/quarantine (owned mode returns 3 and
 preserves dirty work without CPU fallback). `fuxi_gpu_scanout_reserve` also
@@ -2170,9 +2171,9 @@ Before copying any layer, guarded present retains the exact source objects and
 atomically checks all of them for producers/quarantine, holding a read reservation
 through CPU/GPU copying. A pending surface defers the **whole** record, leaves
 the previous panel frame, restores dirty work and keeps polling without another
-swap. A newer swap remains latest-wins; retry never overwrites it with an older
-record. The guard covers CPU/multi-layer/unsupported-GPU fallback too. If pending
-commit races an existing read, its count increments immediately but the worker's
+swap. The FIFO correction below retains pending records instead of replacing
+them with each newer swap. The guard covers CPU/multi-layer/unsupported-GPU
+fallback too. If pending commit races an existing read, its count increments immediately but the worker's
 normal lock waits for that read, and for the copy fence if a GPU copy started.
 If commit wins first, present cannot start reading. Render fence/cache retirement
 precedes the final producer unlock. This mutual exclusion proves ordering without
@@ -2218,3 +2219,63 @@ Patches **0106** and **0108** are regenerated; **0098** is unchanged. Every
 `tools/sync-fuxi-*.py --check` passes. Device qualification still must establish
 IOSurface option propagation, image/cache correctness, failure behavior,
 backlog/latency and CA/START cadence; no phone access or deployment occurred.
+
+### Presentation FIFO correction
+
+2026-10-27. The supplied device observations on 7a0decf show the intended
+zero scheduled wait, but about 23 shown frames/s and about 36 present deferrals
+per shown frame. Code confirms the starvation mechanism: `AppleCLCD::swap`
+replaced its single record and counted dirty replacement as not shown;
+`present` rejected a pending/active producer, restored only dirty state, and
+writer retirement did not wake the presenter. Faster CA commits could therefore
+replace each pending record before the next poll could consume it.
+
+CLCD now keeps three waiting records, retaining the exact source objects at
+swap. It selects the oldest readable record under the queue lock and takes the
+existing all-layer read reservation before removing it. An unreadable head stays
+queued without a drop; the first readable newer record may skip unreadable
+predecessors. Overflow drops the oldest waiting record. Copying runs outside the
+queue lock, so swaps can arrive during a copy. A ring/ownership refusal restores
+the selected record to the head; if arrivals filled the FIFO meanwhile, that
+older deferred record is the overflow victim. The last accepted record is
+retained separately for redraw and exact failed-copy CPU replay, ahead of newer
+queued swaps. This bounds waiting records, not frontend command-buffer backlog.
+
+The final nonquarantined writer decrement queues one coalesced thread call.
+Its worker enters the existing workloop gate and arms the existing presentation
+timer at 1 us only for dirty, powered-on, unheld work. Unlock performs no display
+work or timer manipulation. Registration/unregistration uses the surface lock;
+teardown unregisters and cancels/waits for the call. Early wakeups preserve
+notification deadlines/counts, including before scanout ownership is acquired.
+
+A completed double-buffer copy waiting for TE publication cannot be overwritten
+by another GPU copy. CLCD keeps polling it before selecting another FIFO entry.
+All existing CPU/black-fill, double re-entry, console, drain, quarantine and stop
+guards remain. SWEET FB completed-frame accounting advances at successful START
+(or the legacy kick), including a deferred publication retry; submission and
+failed copies do not count. The FUXI SCANOUT 120-copy summary still counts copies,
+not panel transfers. Neither counter proves optical panel completion.
+
+The existing 600-frame SWEET FB line adds cumulative `queued_pending`,
+`fifo_overflow`, `ready_skips` and `ownership_defers`. The first counts record
+read-admission refusals, including pending/active writers and quarantine; the
+last counts fence/ring/ownership/drain/publication retry deferrals. These are
+poll/record attempts, not frame losses. `not shown` counts only overflow plus
+ready skips since the preceding stats line; queued pending records are excluded.
+No new per-frame log or logging cadence is added.
+
+Host coverage exercises production FIFO order, multiple writer deferral and
+retirement, final-release wake/coalescing/gate delivery, oldest overflow, ready
+skips, source retention, arrivals during copy, exact CPU replay, TE back-buffer
+protection and publication accounting, plus existing fail-closed paths. The
+portable frontend/lease and overlap tests and saved-XNU AArch64 syntax checks
+remain applicable. Native Objective-C frontend execution and real GPU/cache,
+TE/START cadence, image integrity and bounded device latency still need device
+qualification; no phone access, deployment, kernel link, push or CI run occurred.
+The frontend reservation/fence-retirement contract is unchanged. Generated
+patches changed: **0098**, **0106**, **0108**; **0100** is unchanged.
+
+Validation passed: 14 related host suites (including production scanout/unixnu,
+frontend lease models, lavapipe overlap and external KMD submit), all 12 sync
+checks, and complete framebuffer/surface/Adreno/console/vfs/UFS syntax with saved
+XNU headers. Native Objective-C tests are skipped on Linux.

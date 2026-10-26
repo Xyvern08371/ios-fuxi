@@ -15,7 +15,7 @@ TE_OBSERVER = re.search(r'struct fg_te_observer \{.*?\};',
 
 
 def function(source, name):
-    match = re.search(r'^(?:static (?:inline )?)?(?:int|void|bool|uint32_t|uint64_t)\s*\n?' +
+    match = re.search(r'^(?:static (?:inline )?)?(?:int|void|bool|uint32_t|uint64_t|IOReturn)\s*\n?' +
                       re.escape(name) + r'\([^;]*?\)\s*\{', source, re.M)
     assert match, name
     depth, end = 1, match.end()
@@ -240,16 +240,28 @@ DISPLAY_PREFIX = r'''
 #define MACH_PORT_NULL 0
 #define SWEET_FB_SWAP_REC_SIZE 0x46c
 #define SWEET_FB_LAYERS 4
+#define SWEET_FB_QUEUE_DEPTH 3
 #define SWEET_FB_NOTIFY_TYPES 8
 #define SWEET_FB_NOTIFY_VSYNC 5
 #define SWEET_FB_FORMAT_BGRA 0x42475241
 #define kIOTimeOptionsWithLeeway 1
+#define kIOReturnSuccess 0
 #define OSSafeReleaseNULL(p) do {if(p){p->release();p=nullptr;}}while(0)
 typedef void OSObject;
 typedef int IOReturn;
 struct IOService {};
 struct IOMemoryMap {};
-struct IOWorkLoop {};
+struct IOWorkLoop {
+ bool gated=false;
+ IOReturn runAction(IOReturn (*action)(OSObject *,void *,void *,void *,void *),OSObject *owner) {
+  assert(!gated);gated=true;auto r=action(owner,nullptr,nullptr,nullptr,nullptr);gated=false;return r;
+ }
+};
+using thread_call_param_t=void *;
+struct WakeCall {void (*action)(void *,void *);void *context;bool pending=false;};
+using thread_call_t=WakeCall *;
+static bool thread_call_enter(thread_call_t call) {bool was=call->pending;call->pending=true;return was;}
+static void runWake(WakeCall &call) {assert(call.pending);call.pending=false;call.action(call.context,nullptr);}
 struct IOLock {bool held=false;};
 static void IOLockLock(IOLock *p) {assert(!p->held);p->held=true;}
 static void IOLockUnlock(IOLock *p) {assert(p->held);p->held=false;}
@@ -273,7 +285,8 @@ static unsigned scanRetries,scanCpuAcquires;
 static int scanCpuAcquire=1;
 static int fuxi_gpu_scanout_double(void) {return scanDouble;}
 static int fuxi_gpu_scanout_pending(void) {return scanBackReady;}
-static int fuxi_gpu_scanout_retry(void) {scanRetries++;return 0;}
+static int scanRetryResult;
+static int fuxi_gpu_scanout_retry(void) {scanRetries++;if(scanRetryResult==1)scanBackReady=false;return scanRetryResult;}
 static int fuxi_gpu_scanout_cpu_acquire(void) {scanCpuAcquires++;return scanCpuAcquire==1?scanAcquire:scanCpuAcquire;}
 static int fuxi_gpu_scanout_owned(void) {return scanOwned;}
 static bool teAvailable;
@@ -285,10 +298,13 @@ static int fuxi_gpu_scanout_te(struct fg_te_observer *te) {
 }
 static unsigned scanPublications;
 static int fuxi_gpu_scanout_acquire(void) {return scanAcquire;}
-static int fuxi_gpu_scanout_publish(void) {scanPublications++;return scanPublish;}
-static char importStatsLog[2048],teStatsLog[2048];
+static int fuxi_gpu_scanout_publish(void) {scanPublications++;if(scanPublish==2)scanBackReady=true;return scanPublish;}
+static char importStatsLog[2048],teStatsLog[2048],frameStatsLog[2048];
 static int IOLog(const char *format,...) {
  logs++;
+ if(strstr(format,"SWEET FB: stats")) {
+  va_list args;va_start(args,format);vsnprintf(frameStatsLog,sizeof(frameStatsLog),format,args);va_end(args);
+ }
  if(strstr(format,"vsync te-locked=")) {
   va_list args;va_start(args,format);vsnprintf(teStatsLog,sizeof(teStatsLog),format,args);va_end(args);
  }
@@ -297,9 +313,7 @@ static int IOLog(const char *format,...) {
  }
  return 0;
 }
-static void *IOMallocData(unsigned n) {return malloc(n);}
-static void IOFreeData(void *p,unsigned) {free(p);}
-struct IOTimerEventSource {uint64_t next=0;void wakeAtTime(int,uint64_t n,int){next=n;arms++;}};
+struct IOTimerEventSource {uint64_t next=0;void wakeAtTime(int,uint64_t n,int){next=n;arms++;}void setTimeoutUS(unsigned n){next=ticks+n*1000;arms++;}};
 struct OSArray {
  std::vector<void *> objects;
  unsigned getCount(){return objects.size();}
@@ -325,7 +339,8 @@ static SweetSurface *inputSurface,*inputSurface2;
 static SweetSurface *sweet_surface_copy(uint32_t id) {assert(id==1 || (id==2 && inputSurface2));refs++;return id==1?inputSurface:inputSurface2;}
 static int sweet_console_muted=1;
 static unsigned surfaceCopies;
-static int sweet_surface_gpu_copy(SweetSurface *,uintptr_t,int,int,int,int,int,int){surfaceCopies++;return gpuMode;}
+static void (*duringCopy)();
+static int sweet_surface_gpu_copy(SweetSurface *,uintptr_t,int,int,int,int,int,int){surfaceCopies++;if(duringCopy)duringCopy();return gpuMode;}
 static int sweet_surface_gpu_poll(uint64_t *elapsed) {*elapsed=42;return pollMode;}
 struct fg_times {uint64_t pin,lookup,map,clean,submit,wait,unmap,cpu;unsigned attempts,hits,misses,sleeps,blocks,groups;};
 static void fuxi_gpu_import_stats(uint64_t *cleaned,uint64_t *skipped,uint64_t *invalidated,
@@ -342,7 +357,14 @@ class IOMobileFramebufferUserClient {
 DISPLAY_PREFIX = DISPLAY_PREFIX.replace('#define FUXI 1', TE_OBSERVER + '\n#define FUXI 1')
 
 DISPLAY_TEST = r'''
+static unsigned recordRefs(const AppleCLCD &fb) {
+ unsigned n=0;for(unsigned i=0;i<fb.fPendingCount;i++)for(auto *s:fb.fPending[i].surfaces)n+=s!=nullptr;
+ if(fb.fLastValid)for(auto *s:fb.fLast.surfaces)n+=s!=nullptr;return n;
+}
 static void put32(uint8_t *r,unsigned offset,uint32_t v){memcpy(r+offset,&v,4);}
+static AppleCLCD *arrivingFB;static uint8_t arrivingRecord[SWEET_FB_SWAP_REC_SIZE];
+static void arrivals() {for(unsigned id=22;id<=24;id++){put32(arrivingRecord,0x50,id);arrivingFB->swap(arrivingRecord);}}
+
 int main(void) {
  AppleCLCD fb={};IOLock lock;OSArray clients;IOTimerEventSource timer;
  uint64_t pixels[128]={},source[128]={},shadow[128]={};Memory memory={sizeof(source)};
@@ -358,7 +380,7 @@ int main(void) {
  sweet_fb_rearm(&fb,&timer);assert(arms==1);
  fb.fUnixnuIdle=true;fb.fTickArmed=true;sweet_fb_rearm(&fb,&timer);assert(!fb.fTickArmed && arms==1);
  fb.swap(rec);assert(fb.fTickArmed && fb.fDirty && arms==2);
- fb.vsyncFired(&fb,&timer);assert(!fb.fTickArmed && !fb.fDirty && fb.fShadowValid && fb.fDiffStored==216 && !refs);
+ fb.vsyncFired(&fb,&timer);assert(!fb.fTickArmed && !fb.fDirty && fb.fShadowValid && fb.fDiffStored==216 && refs==recordRefs(fb));
  fb.swap(rec);fb.vsyncFired(&fb,&timer);assert(fb.fDiffStored==216 && fb.fDiffFull==432);
  // GPU offer invalidates the shadow, polling keeps the timer alive until retirement.
  gpuMode=2;fb.swap(rec);fb.vsyncFired(&fb,&timer);assert(fb.fGpuPending && fb.fTickArmed && !fb.fShadowValid);
@@ -376,15 +398,15 @@ int main(void) {
  fb.vsyncFired(&fb,&timer);assert(fb.fShadowValid && fb.fDiffStored==648);
  // A callback during an armed tick coalesces; rearm sees pending work. A callback after idle explicitly arms.
  fb.fTickArmed=true;fb.swap(rec);before=arms;sweet_fb_rearm(&fb,&timer);assert(arms==before+1);
- fb.fDirty=false;sweet_fb_rearm(&fb,&timer);assert(!fb.fTickArmed);
+ fb.vsyncFired(&fb,&timer);fb.fDirty=false;sweet_fb_rearm(&fb,&timer);assert(!fb.fTickArmed);
  fb.swap(rec);assert(fb.fTickArmed);
  // Enabled notifications keep pacing even without dirty swaps; removing the last subscriber stops it.
  IOMobileFramebufferUserClient client;client.fFunc[5]=1;client.fPort=1;clients.objects.push_back(&client);
- fb.fDirty=false;fb.vsyncFired(&fb,&timer);assert(fb.fTickArmed && client.notifications==1);
+ fb.vsyncFired(&fb,&timer);fb.fDirty=false;client.notifications=0;fb.vsyncFired(&fb,&timer);assert(fb.fTickArmed && client.notifications==1);
  client.fPort=0;fb.vsyncFired(&fb,&timer);assert(!fb.fTickArmed && client.notifications==1);
  // A failed GPU copy replays through CPU and reinitializes the shadow after confirmed retirement.
  fb.fGpuPending=true;fb.fShadowValid=false;pollMode=-1;fb.vsyncFired(&fb,&timer);
- assert(fb.fGpuFailed==1 && !fb.fGpuPending && fb.fShadowValid && !refs);
+ assert(fb.fGpuFailed==1 && !fb.fGpuPending && fb.fShadowValid && refs==recordRefs(fb));
  assert(fuxi_unixnu_next_tick(10,100,50)==110);
  assert(fuxi_unixnu_next_tick(10,100,110)==210);
  for(int off=0;off<2;off++)for(int black=0;black<2;black++)for(int dirty=0;dirty<2;dirty++)
@@ -478,6 +500,102 @@ int main(void) {
  assert(strstr(teStatsLog,"te-locked=0 fallback=600 phase_us 0/0 period_us 0"));
  scanOwned=false;client.fPort=0;
  puts("PASS: TE offset admission, 60/120Hz phase/count/wrap, duplicate/late suppression, logs and fallback/default path");
+ }
+
+ {
+ // Actual production FIFO: order, pending retention, overflow, ready skips and timer wake.
+ unsigned baselineRefs=refs;bool oldOwned=scanOwned;int oldPublish=scanPublish;
+ scanOwned=true;scanAcquire=scanCpuAcquire=1;scanPublish=1;gpuMode=0;pollMode=1;
+ AppleCLCD queued={};IOLock qlock;OSArray qclients;IOTimerEventSource qtimer;IOWorkLoop qloop;
+ WakeCall wake={&AppleCLCD::writerWake,&queued};queued.fWriterWakeCall=&wake;queued.fWorkLoop=&qloop;
+ queued.fLock=&qlock;queued.fClients=&qclients;queued.fVsync=&qtimer;
+ queued.fTickAbs=100000;queued.fNextTick=ticks+queued.fTickAbs;queued.fFlushTicks=1;
+ queued.fWidth=18;queued.fHeight=3;queued.fRowBytes=96;queued.fPixels=(uintptr_t)pixels;
+ queued.fScanout=queued.fUnixnuIdle=queued.fConsolePaused=true;
+ uint8_t frame[SWEET_FB_SWAP_REC_SIZE];memcpy(frame,rec,sizeof(frame));
+ for(unsigned id=1;id<=3;id++){put32(frame,0x50,id);queued.swap(frame);}
+ assert(queued.fPendingCount==3 && !queued.fStatDropped);
+ for(unsigned id=1;id<=3;id++) {
+  queued.vsyncFired(&queued,&qtimer);
+  assert(get32(queued.fLast.bytes,0x50)==id && queued.fPendingCount==3-id);
+  assert(refs==baselineRefs+recordRefs(queued));
+ }
+ unsigned complete=queued.fStatFrames,publications=scanPublications;
+ surface.gpuWriters=2;put32(frame,0x50,4);queued.swap(frame);
+ for(unsigned i=0;i<4;i++)queued.vsyncFired(&queued,&qtimer);
+ assert(queued.fPendingCount==1 && queued.fDirty && !queued.fStatDropped);
+ assert(queued.fStatFrames==complete && scanPublications==publications && queued.fQueuedDefers==4);
+ surface.gpuWriters--;queued.vsyncFired(&queued,&qtimer);
+ assert(queued.fPendingCount==1 && queued.fQueuedDefers==5);
+ // Unlock callback only queues a coalesced call; the gated worker arms the timer.
+ IOMobileFramebufferUserClient subscriber;subscriber.fFunc[5]=1;subscriber.fPort=1;qclients.objects.push_back(&subscriber);
+ queued.fNextTick=ticks+queued.fTickAbs;uint64_t nextTick=queued.fNextTick,count=queued.fVsyncCount;
+ unsigned oldArms=arms;surface.gpuWriters=0;AppleCLCD::writerRetired(&queued);
+ assert(wake.pending && arms==oldArms && queued.fStatFrames==complete && scanPublications==publications);
+ AppleCLCD::writerRetired(&queued);runWake(wake);
+ assert(!wake.pending && arms==oldArms+1 && qtimer.next<nextTick && !qloop.gated);
+ queued.vsyncFired(&queued,&qtimer);
+ assert(get32(queued.fLast.bytes,0x50)==4 && !queued.fDirty && queued.fStatFrames==complete+1);
+ assert(queued.fVsyncCount==count && !subscriber.notifications && queued.fNextTick==nextTick);
+ subscriber.fPort=0;
+ // Four waiting records drop precisely the oldest, even when it is still pending.
+ surface.gpuWriters=1;
+ for(unsigned id=5;id<=8;id++){put32(frame,0x50,id);queued.swap(frame);}
+ assert(queued.fPendingCount==3 && queued.fOverflowDrops==1 && queued.fStatDropped==1);
+ assert(get32(queued.fPending[0].bytes,0x50)==6);
+ queued.vsyncFired(&queued,&qtimer);assert(queued.fPendingCount==3 && queued.fOverflowDrops==1);
+ surface.gpuWriters=0;
+ for(unsigned id=6;id<=8;id++){queued.vsyncFired(&queued,&qtimer);assert(get32(queued.fLast.bytes,0x50)==id);}
+ // A ready newer surface can skip the unready head, but cannot reorder ready heads.
+ SweetSurface newer=surface;SweetSurface *savedSecond=inputSurface2;inputSurface2=&newer;
+ surface.gpuWriters=1;put32(frame,0x50,9);queued.swap(frame);
+ put32(frame,0x54,2);put32(frame,0x50,10);queued.swap(frame);
+ queued.vsyncFired(&queued,&qtimer);
+ assert(!queued.fDirty && get32(queued.fLast.bytes,0x50)==10 && queued.fReadySkips==1 && queued.fStatDropped==2);
+ surface.gpuWriters=0;inputSurface2=savedSecond;put32(frame,0x54,1);
+ // A GPU offer is neither a completed swap nor permission to reuse a ready back buffer.
+ put32(frame,0x50,11);queued.swap(frame);gpuMode=2;complete=queued.fStatFrames;
+ queued.vsyncFired(&queued,&qtimer);assert(queued.fGpuPending && queued.fStatFrames==complete);
+ pollMode=0;queued.vsyncFired(&queued,&qtimer);assert(queued.fStatFrames==complete);
+ pollMode=1;scanPublish=2;queued.vsyncFired(&queued,&qtimer);
+ assert(queued.fPublicationPending && scanBackReady && queued.fStatFrames==complete);
+ put32(frame,0x50,12);queued.swap(frame);unsigned offers=surfaceCopies;
+ queued.vsyncFired(&queued,&qtimer);
+ assert(surfaceCopies==offers && queued.fPendingCount==1 && queued.fStatFrames==complete);
+ scanRetryResult=1;scanPublish=1;queued.vsyncFired(&queued,&qtimer);
+ assert(queued.fStatFrames==complete+1 && queued.fGpuPending && get32(queued.fLast.bytes,0x50)==12);
+ scanRetryResult=0;queued.vsyncFired(&queued,&qtimer);assert(queued.fStatFrames==complete+2);
+ // Failed render-copy replay uses that exact record, ahead of a newer queued swap.
+ put32(frame,0x50,13);queued.swap(frame);queued.vsyncFired(&queued,&qtimer);
+ put32(frame,0x50,14);queued.swap(frame);pollMode=-1;gpuMode=0;complete=queued.fStatFrames;
+ queued.vsyncFired(&queued,&qtimer);
+ assert(queued.fStatFrames==complete+1 && get32(queued.fLast.bytes,0x50)==13 && queued.fPendingCount==1);
+ pollMode=1;queued.vsyncFired(&queued,&qtimer);assert(get32(queued.fLast.bytes,0x50)==14);
+ // An unreadable failed-copy replay also yields to a newer ready record.
+ put32(frame,0x50,15);queued.swap(frame);gpuMode=2;queued.vsyncFired(&queued,&qtimer);
+ inputSurface2=&newer;put32(frame,0x54,2);put32(frame,0x50,16);queued.swap(frame);
+ surface.gpuWriters=1;pollMode=-1;gpuMode=0;queued.vsyncFired(&queued,&qtimer);
+ assert(get32(queued.fLast.bytes,0x50)==16 && !queued.fReplay && !queued.fPendingCount && queued.fReadySkips==2);
+ surface.gpuWriters=0;pollMode=1;inputSurface2=savedSecond;put32(frame,0x54,1);
+ // Swaps during copying do not hold fLock; a deferred older offer is the overflow victim.
+ put32(frame,0x50,21);queued.swap(frame);arrivingFB=&queued;memcpy(arrivingRecord,frame,sizeof(frame));
+ duringCopy=arrivals;gpuMode=3;queued.vsyncFired(&queued,&qtimer);duringCopy=nullptr;
+ assert(queued.fPendingCount==3 && get32(queued.fPending[0].bytes,0x50)==22);
+ assert(queued.fOverflowDrops==2 && queued.fStatDropped==4 && queued.fScanoutDefers);
+ gpuMode=0;
+ for(unsigned id=22;id<=24;id++){queued.vsyncFired(&queued,&qtimer);assert(get32(queued.fLast.bytes,0x50)==id);}
+ queued.fStatFrames=599;put32(frame,0x50,25);queued.swap(frame);queued.vsyncFired(&queued,&qtimer);
+ assert(!queued.fStatFrames && strstr(frameStatsLog,"fifo_overflow=2 ready_skips=2 ownership_defers="));
+ assert(strstr(frameStatsLog,"queued_pending="));
+ // Black/held/idle paths ignore release wakes; no display work or timer churn.
+ for(unsigned mode=0;mode<3;mode++) {
+  queued.fPowerOff=mode==0;queued.fScanoutHeld=mode==1;queued.fDirty=mode!=2;
+  oldArms=arms;AppleCLCD::writerRetired(&queued);runWake(wake);assert(arms==oldArms);
+ }
+ AppleCLCD::releaseRecord(queued.fLast);queued.fLastValid=false;
+ assert(refs==baselineRefs);
+ scanOwned=oldOwned;scanPublish=oldPublish;
+ puts("PASS: production FIFO order, pending/active exclusion, final-retire wake, oldest overflow, ready skip, publication accounting, exact replay and concurrent swaps");
  }
  puts("PASS: actual framebuffer present/tick/swap: demand wake/idle, GPU retirement/fallback, blanking and shadow invalidation");
 }
@@ -581,7 +699,9 @@ def main():
         methods = ''.join(function(display, name) for name in (
             'sweet_fb_te_configure', 'AppleCLCD::teVsyncTick', 'AppleCLCD::teVsyncLog',
             'AppleCLCD::presentWantedLocked', 'AppleCLCD::wakePresentLocked', 'sweet_fb_rearm',
-            'AppleCLCD::vsyncFired', 'AppleCLCD::scanoutLog', 'get32', 'AppleCLCD::swap', 'AppleCLCD::present'))
+            'AppleCLCD::vsyncFired', 'AppleCLCD::scanoutLog', 'get32', 'AppleCLCD::releaseRecord',
+            'AppleCLCD::writerRetired', 'AppleCLCD::writerWake', 'AppleCLCD::writerWakeAction',
+            'AppleCLCD::completePresent', 'AppleCLCD::presentStats', 'AppleCLCD::presentNext', 'AppleCLCD::swap', 'AppleCLCD::present'))
         methods = methods.replace('__asm__ volatile ("dsb sy" ::: "memory");', '(void)0;')
         cpp = tmp / 'display.cpp'
         cpp.write_text(DISPLAY_PREFIX + declaration + methods + DISPLAY_TEST)

@@ -433,6 +433,7 @@ static int fg_scanout_acquire(unsigned publication)
  }
  if (fg_busy) { fg_scanout_wait_ring++; return 0; }
  if (fg_scanout_double_active && !publication) {
+  if (fg_scanout_back_ready) return 0;
   fg_scanout_writable = 1;
   return 1;
  }

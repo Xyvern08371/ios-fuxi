@@ -94,6 +94,8 @@ static SweetSurface *sweet_gpu_inflight; /* strong until fence/drain */
 #define kIOSurfaceLockAvoidSync 0x2
 static SweetSurface *sweet_present_readers[4];
 static unsigned sweet_present_count;
+static void (*sweet_present_wake)(void *);
+static void *sweet_present_context;
 static unsigned sweet_gpu_slot;
 static uint64_t sweet_gpu_begin;
 static bool sweet_gpu_init(void)
@@ -242,6 +244,13 @@ void sweet_surface_present_end(void)
  IOLockWakeup(sweet_gpu_lock, &sweet_gpu_inflight, false);
  IOLockUnlock(sweet_gpu_lock);
 }
+void sweet_surface_present_notify(void (*wake)(void *), void *context)
+{
+ if (!sweet_gpu_init()) return;
+ IOLockLock(sweet_gpu_lock);
+ sweet_present_wake = wake; sweet_present_context = context;
+ IOLockUnlock(sweet_gpu_lock);
+}
 static bool sweet_surface_present_reading(SweetSurface *s)
 {
  for (unsigned i = 0; i < sweet_present_count; i++) if (sweet_present_readers[i] == s) return true;
@@ -257,7 +266,8 @@ static bool sweet_gpu_writer(SweetSurface *s, bool lock, bool pending = false)
   while (!pending && (sweet_gpu_inflight == s || sweet_surface_present_reading(s)))
    IOLockSleep(sweet_gpu_lock, &sweet_gpu_inflight, THREAD_UNINT);
   if (!s->gpuQuarantined) s->gpuWriters++;
- } else if (s->gpuWriters) s->gpuWriters--;
+ } else if (s->gpuWriters && !--s->gpuWriters && !s->gpuQuarantined && sweet_present_wake)
+  sweet_present_wake(sweet_present_context);
  bool ok = !s->gpuQuarantined;
  IOLockUnlock(sweet_gpu_lock);
  return ok;

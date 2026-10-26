@@ -1,16 +1,18 @@
 --- a/iokit/Kernel/arm/SweetSurface.cpp
 +++ b/iokit/Kernel/arm/SweetSurface.cpp
-@@ -91,6 +91,9 @@
+@@ -91,6 +91,11 @@
  static uint64_t sweet_gpu_generation, sweet_gpu_age;
  static struct fg_times sweet_gpu_times;
  static SweetSurface *sweet_gpu_inflight; /* strong until fence/drain */
 +#define kIOSurfaceLockAvoidSync 0x2
 +static SweetSurface *sweet_present_readers[4];
 +static unsigned sweet_present_count;
++static void (*sweet_present_wake)(void *);
++static void *sweet_present_context;
  static unsigned sweet_gpu_slot;
  static uint64_t sweet_gpu_begin;
  static bool sweet_gpu_init(void)
-@@ -134,7 +137,10 @@
+@@ -134,7 +139,10 @@
   uint64_t cpu = thread_get_runtime_self(), start = mach_absolute_time();
   IOLockLock(sweet_gpu_lock);
   if (sweet_gpu_inflight) { IOLockUnlock(sweet_gpu_lock); return 2; }
@@ -22,7 +24,7 @@
   unsigned slot = FG_CACHE_SLOTS, victim = 0, replacement = FG_CACHE_SLOTS;
   uint64_t length = s->memory->getLength()-s->offset;
   uintptr_t source = src+s->offset;
-@@ -186,6 +192,7 @@
+@@ -186,6 +194,7 @@
    s->retain(); /* failed submit/drain: reject writers, preserve until reset */
   }
   out:
@@ -30,7 +32,7 @@
   sweet_gpu_times.cpu += thread_get_runtime_self()-cpu;
   IOLockUnlock(sweet_gpu_lock);
   return result;
-@@ -218,15 +225,36 @@
+@@ -218,18 +227,47 @@
   if (release) release->release(); /* free() takes the cache lock */
   return result;
  }
@@ -55,6 +57,13 @@
 + IOLockWakeup(sweet_gpu_lock, &sweet_gpu_inflight, false);
 + IOLockUnlock(sweet_gpu_lock);
 +}
++void sweet_surface_present_notify(void (*wake)(void *), void *context)
++{
++ if (!sweet_gpu_init()) return;
++ IOLockLock(sweet_gpu_lock);
++ sweet_present_wake = wake; sweet_present_context = context;
++ IOLockUnlock(sweet_gpu_lock);
++}
 +static bool sweet_surface_present_reading(SweetSurface *s)
 +{
 + for (unsigned i = 0; i < sweet_present_count; i++) if (sweet_present_readers[i] == s) return true;
@@ -71,8 +80,13 @@
 +  while (!pending && (sweet_gpu_inflight == s || sweet_surface_present_reading(s)))
     IOLockSleep(sweet_gpu_lock, &sweet_gpu_inflight, THREAD_UNINT);
    if (!s->gpuQuarantined) s->gpuWriters++;
-  } else if (s->gpuWriters) s->gpuWriters--;
-@@ -1001,7 +1029,7 @@
+- } else if (s->gpuWriters) s->gpuWriters--;
++ } else if (s->gpuWriters && !--s->gpuWriters && !s->gpuQuarantined && sweet_present_wake)
++  sweet_present_wake(sweet_present_context);
+  bool ok = !s->gpuQuarantined;
+  IOLockUnlock(sweet_gpu_lock);
+  return ok;
+@@ -1001,7 +1039,7 @@
  		return kIOReturnNotFound;
  	}
  #if defined(FUXI)

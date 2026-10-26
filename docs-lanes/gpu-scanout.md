@@ -24,9 +24,9 @@ from patches 0068, 0079, 0082, 0087, 0093, 0096, 0098 and 0106.
    Imported mappings are prepared/wired. The kernel uses CIVAC over every mapped
    import before submit, then IVAC after CP fence + both-thread idle, before
    returning fence success; watchdog retirement performs the same handoff.
-3. CLCD selector 5 copies the 0x46c-byte swap record into a **latest-frame** slot.
-   Selector 6 SwapWait is still a stub, not a display fence. A nominal 60 Hz
-   workloop tick consumes the newest record; `sweetfb_hz` can reduce this rate.
+3. CLCD selector 5 copies the 0x46c-byte swap record into a **three-record FIFO**
+   (2026-10-27 correction below). Selector 6 SwapWait is still a stub, not a
+   display fence. A nominal 60 Hz workloop tick consumes the oldest ready record; `sweetfb_hz` can reduce this rate.
    It crops logical 1125x2436 to panel 1080x2400, source origin **22,18** for a
    full logical frame. Pitch comes from the surface; no scaling or swizzle.
 4. The existing `sweet_surface_gpu_copy` already supports a one-layer BGRA
@@ -163,9 +163,9 @@ not proof that the panel displayed them. GPU `copy_us` is elapsed wall time
 from doorbell return through observed retirement (including observation delay
 and optional comparison); `prepare_us` is the preceding surface/map/clean/submit
 call. CPU `copy_us` measures the CPU scan copy/diff operation. The guard wait,
-compositor GPU render time, latest-frame queue delay and transfer duration are
+compositor GPU render time, FIFO queue delay and transfer duration are
 not included in copy time. `deferred` counts callback deferrals, not dropped
-frames; consult existing `SWEET FB: stats` for replaced swaps. `check_us` exposes
+frames; consult `SWEET FB: stats` for FIFO overflow drops and ready skips. `check_us` exposes
 the optional slow device-memory readback cost; disable checks for benchmarks.
 
 The ready line labels the programmed GPU vote and uses GPU-CLOCK’s selected
@@ -612,8 +612,8 @@ Ownership and copying:
   The front/back indices change only after successful START. The old front
   can immediately receive the next GPU copy while the new front transfers.
 - CLCD retries publication on timer polls even without another swap; a ready
-  frame keeps the demand timer active. A newer complete copy may replace a
-  ready unstarted frame and increments `back_ready_drops`. Copy-in-flight
+  frame keeps the demand timer active. The FIFO correction below prevents a
+  newer GPU copy from replacing a ready unstarted frame. Copy-in-flight
   exclusion prevents both another copy and START until retirement. The
   existing source retention, cache-clean fence, producer reservation and
   DMA quarantine checks remain in force.
@@ -699,3 +699,49 @@ jitter can still miss TE. Direct clients writing the exported physical
 framebuffer remain outside this ownership contract. Bad address/latch facts
 can blank or corrupt the panel and require a reboot without the option. No
 phone access, deployment, full kernel link, push or CI run was performed.
+
+## FIFO and writer-retirement wake correction
+
+2026-10-27. The [scheduled-wait FIFO correction](metal.md#presentation-fifo-correction)
+replaces the newest-wins CLCD mailbox with three retained waiting swap records.
+The oldest readable record is selected; pending/active writers leave records
+queued, a ready newer record can skip unreadable predecessors, and full-queue
+arrival drops the oldest waiting record. The existing all-source read guard is
+acquired before dequeue, including CPU/multilayer fallback. Final writer release
+queues a coalesced thread call whose workloop-gated action wakes the existing
+timer; the IOSurface unlock trap does no display work. Vsync/poll retries remain.
+
+`fg_scanout_acquire(0)` now refuses a back buffer with a completed image waiting
+for publication. CLCD retries that image's TE/transfer-gated START before
+selecting the next queued record. CPU/black-fill acquire, double re-entry,
+console suppression and fail-closed stop/drain behavior are preserved. A failed
+copy replays its exact retained record, not the newest swap. The waiting FIFO,
+last accepted frame and one active admission/copy use bounded record storage;
+this does not bound Metal's command backlog or promise a device frame rate.
+
+The unchanged 600-frame stats cadence now reports:
+
+```text
+SWEET FB: stats N frames in T ms, copy avg A us max M us, S swaps, D not shown queued_pending=P fifo_overflow=O ready_skips=K ownership_defers=H
+```
+
+`P/O/K/H` are cumulative. `P` counts refused source read admissions (pending or
+active writers, quarantine or failed admission), `O` oldest FIFO overflow drops,
+`K` unreadable records skipped for a ready newer record, and `H` fence/ring,
+ownership/drain or deferred-publication polls. `D` is only overflow plus ready
+skips in that 600-frame reporting interval. Completed frames count successful
+publication START/legacy kick, including retry, rather than GPU submission;
+copy timing includes preparation plus observed GPU copy retirement, excluding
+FIFO and TE wait. The 120-copy `FUXI SCANOUT: summary` cadence is unchanged and
+still counts copies; its `deferred` now excludes source-admission attempts,
+reported separately as `queued_pending`. START is not optical panel completion.
+
+Both production-code sanitizer suites cover FIFO order, pending retention then
+retirement, oldest overflow, ready skip, no read with active writers, wakeup
+coalescing/workloop gating, arrivals during copy, exact failed-copy replay and
+no back-ready overwrite before TE publication. Related host tests and all
+`tools/sync-fuxi-*.py --check` are required. Regenerated patches are **0098**
+(GPU acquisition), **0106** (CLCD FIFO/wake/accounting) and **0108** (surface
+retirement notification). No frontend or external Mesa/translator changes are
+needed. Native frontend execution, kernel link and real panel/cache/latency
+qualification remain unperformed; no phone access or deployment occurred.

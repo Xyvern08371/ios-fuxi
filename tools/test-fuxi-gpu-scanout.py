@@ -337,6 +337,7 @@ static void double_tests(uint8_t *panel) {
  fg_busy=1;assert(!fuxi_gpu_scanout_retry() && fuxi_gpu_scanout_publish()==-1 && starts==1);
  fg_busy=0;assert(fuxi_gpu_scanout_publish()==2 && fuxi_gpu_scanout_pending());
  assert(fuxi_gpu_scanout_retry()==2 && starts==1); // same TE
+ assert(!fuxi_gpu_scanout_acquire() && fuxi_gpu_scanout_pending()); // do not overwrite the ready back
  intf[0x298/4]=(3u<<16)|2500;
  assert(fuxi_gpu_scanout_retry()==2 && starts==1); // START busy
  ctl[0x1c/4]=0;assert(fuxi_gpu_scanout_retry()==2 && starts==1); // write-line busy
@@ -684,7 +685,7 @@ int main(void) {
         funcs = ''.join(cache.submit.function(source.replace('IOReturn\n', 'int '), n) for n in (
             'sweet_gpu_init', 'sweet_gpu_drop', 'sweet_gpu_release', 'sweet_surface_gpu_copy',
             'sweet_surface_gpu_poll', 'sweet_surface_present_begin', 'sweet_surface_present_end',
-            'sweet_surface_present_reading', 'sweet_gpu_writer', 'sweet_surface_gpu_stats',
+            'sweet_surface_present_notify', 'sweet_surface_present_reading', 'sweet_gpu_writer', 'sweet_surface_gpu_stats',
             'IOSurfaceRootUserClient::trapLock', 'IOSurfaceRootUserClient::trapUnlock'))
         stubs = '''
 #define FUXI 1
@@ -700,6 +701,8 @@ struct IOSurfaceRootUserClient {
 static SweetSurface *trapSurface;
 static SweetSurface *sweet_surface_held(IOLock *,void *,uint32_t) {if(trapSurface)trapSurface->retain();return trapSurface;}
 static IOReturn sweet_surface_seed_out(SweetSurface *,void *,bool) {return 0;}
+static unsigned releaseWakes;
+static void released(void *context) {assert(context==&releaseWakes);releaseWakes++;}
 static bool reserved,busy,owned;
 static int fuxi_gpu_scanout_owned() {return owned;}
 static int fuxi_gpu_scanout_reserve() {if(busy)return 0;assert(!reserved);reserved=true;return 1;}
@@ -732,6 +735,17 @@ static void fuxi_gpu_scanout_release() {assert(reserved);reserved=false;}
  assert(sweet_gpu_writer(&pendingSurface,false));
  pendingSurface.gpuQuarantined=true;assert(!sweet_surface_present_begin(surfaces,1));
  pendingSurface.gpuQuarantined=false;assert(!sweet_surface_present_begin(surfaces,5));
+ // Final producer retirement wakes once; pending and active leases both exclude reads.
+ unsigned wakes=releaseWakes;sweet_surface_present_notify(released,&releaseWakes);
+ assert(sweet_gpu_writer(&pendingSurface,true,true) && sweet_gpu_writer(&pendingSurface,true));
+ assert(!sweet_surface_present_begin(surfaces,1));
+ assert(sweet_gpu_writer(&pendingSurface,false) && releaseWakes==wakes);
+ assert(sweet_gpu_writer(&pendingSurface,false) && releaseWakes==wakes+1);
+ assert(sweet_gpu_writer(&pendingSurface,false) && releaseWakes==wakes+1); // unmatched unlock
+ assert(sweet_gpu_writer(&pendingSurface,true,true));pendingSurface.gpuQuarantined=true;
+ assert(!sweet_gpu_writer(&pendingSurface,false) && releaseWakes==wakes+1);
+ pendingSurface.gpuQuarantined=false;sweet_surface_present_notify(nullptr,nullptr);
+ assert(sweet_gpu_writer(&pendingSurface,true) && sweet_gpu_writer(&pendingSurface,false) && releaseWakes==wakes+1);
  // Two queued renders keep the source pending until the final completion.
  assert(sweet_gpu_writer(&pendingSurface,true,true) && sweet_gpu_writer(&pendingSurface,true,true));
  assert(!sweet_surface_present_begin(surfaces,1));assert(sweet_gpu_writer(&pendingSurface,false));
@@ -758,31 +772,33 @@ static void fuxi_gpu_scanout_release() {assert(reserved);reserved=false;}
         methods = ''.join(display.function(source, n) for n in (
             'sweet_fb_te_configure', 'AppleCLCD::teVsyncTick', 'AppleCLCD::teVsyncLog',
             'AppleCLCD::presentWantedLocked', 'AppleCLCD::wakePresentLocked', 'sweet_fb_rearm',
-            'AppleCLCD::vsyncFired', 'AppleCLCD::scanoutLog', 'get32', 'AppleCLCD::swap', 'AppleCLCD::present'))
+            'AppleCLCD::vsyncFired', 'AppleCLCD::scanoutLog', 'get32', 'AppleCLCD::releaseRecord',
+            'AppleCLCD::writerRetired', 'AppleCLCD::writerWake', 'AppleCLCD::writerWakeAction',
+            'AppleCLCD::completePresent', 'AppleCLCD::presentStats', 'AppleCLCD::presentNext', 'AppleCLCD::swap', 'AppleCLCD::present'))
         methods = re.sub(r'__asm__ volatile\s*\([^;]*\);', '(void)0;', methods)
         extra = '''
  // Pending render: retain the exact swap through idle ticks, CPU fallback and failure.
  fb.fScanout=true;fb.fUnixnuIdle=true;scanOwned=true;gpuMode=0;pollMode=1;
  surface.gpuWriters=2;fb.swap(rec);uint64_t pendingPixel=pixels[0];unsigned publications=scanPublications,ends=presentEnds,offers=surfaceCopies;
- for(unsigned i=0;i<4;i++){fb.vsyncFired(&fb,&timer);assert(fb.fDirty && fb.fTickArmed && pixels[0]==pendingPixel && scanPublications==publications && surfaceCopies==offers && !refs);}
+ for(unsigned i=0;i<4;i++){fb.vsyncFired(&fb,&timer);assert(fb.fDirty && fb.fTickArmed && pixels[0]==pendingPixel && scanPublications==publications && surfaceCopies==offers && refs==recordRefs(fb));}
  surface.gpuWriters--;fb.vsyncFired(&fb,&timer);assert(fb.fDirty && presentEnds==ends);
  surface.gpuWriters=0;surface.gpuQuarantined=true;fb.vsyncFired(&fb,&timer);assert(fb.fDirty && pixels[0]==pendingPixel);
  surface.gpuQuarantined=false;gpuMode=2;fb.vsyncFired(&fb,&timer);
- assert(!fb.fDirty && fb.fGpuPending && presentEnds==ends+1 && surfaceCopies==offers+1 && !refs && !presentReading);
+ assert(!fb.fDirty && fb.fGpuPending && presentEnds==ends+1 && surfaceCopies==offers+1 && refs==recordRefs(fb) && !presentReading);
  pollMode=0;fb.vsyncFired(&fb,&timer);assert(scanPublications==publications);
  pollMode=1;fb.vsyncFired(&fb,&timer);assert(!fb.fGpuPending && scanPublications==publications+1);
  // CPU fallback also waits for a producer, then reads the completed contents once.
  surface.gpuWriters=1;gpuMode=0;source[0]=0x12345678;fb.swap(rec);
  fb.vsyncFired(&fb,&timer);assert(fb.fDirty && pixels[0]==pendingPixel);
- surface.gpuWriters=0;fb.vsyncFired(&fb,&timer);assert(!fb.fDirty && pixels[0]==source[0] && !refs);
- // Check the whole record before writing any layer, and retain the newest swap on retry.
+ surface.gpuWriters=0;fb.vsyncFired(&fb,&timer);assert(!fb.fDirty && pixels[0]==source[0] && refs==recordRefs(fb));
+ // Check the whole record before writing any layer; a ready newer record skips it.
  uint64_t source2[128];for(unsigned i=0;i<128;i++)source2[i]=0xdeadbeef;
  SweetSurface secondSurface=surface;secondSurface.address=(uintptr_t)source2;secondSurface.gpuWriters=1;inputSurface2=&secondSurface;
  uint8_t multi[SWEET_FB_SWAP_REC_SIZE];memcpy(multi,rec,sizeof(multi));put32(multi,0x104,3);put32(multi,0x58,2);
  put32(multi,0xc4+16+8,18);put32(multi,0xc4+16+12,3);pendingPixel=pixels[0];publications=scanPublications;
- fb.swap(multi);fb.vsyncFired(&fb,&timer);assert(fb.fDirty && pixels[0]==pendingPixel && scanPublications==publications && !refs);
- fb.swap(rec);fb.vsyncFired(&fb,&timer);assert(!fb.fDirty && scanPublications==publications+1 && !refs);
- secondSurface.gpuWriters=0;fb.swap(multi);fb.vsyncFired(&fb,&timer);assert(!fb.fDirty && pixels[0]==source2[0] && !refs);
+ fb.swap(multi);fb.vsyncFired(&fb,&timer);assert(fb.fDirty && pixels[0]==pendingPixel && scanPublications==publications && refs==recordRefs(fb));
+ fb.swap(rec);fb.vsyncFired(&fb,&timer);assert(!fb.fDirty && scanPublications==publications+1 && refs==recordRefs(fb));
+ secondSurface.gpuWriters=0;fb.swap(multi);fb.vsyncFired(&fb,&timer);assert(!fb.fDirty && pixels[0]==source2[0] && refs==recordRefs(fb));
  inputSurface2=nullptr;
  // Gate deferral preserves dirty swap/pixels; no publication while waiting.
  fb.fScanout=true;fb.fScanoutLog=true;scanOwned=true;scanPublish=1;gpuMode=2;pollMode=1;
@@ -792,7 +808,7 @@ static void fuxi_gpu_scanout_release() {assert(reserved);reserved=false;}
  scanAcquire=1;fb.vsyncFired(&fb,&timer);assert(fb.fGpuPending && scanPublications==prior);
  pollMode=0;fb.vsyncFired(&fb,&timer);assert(scanPublications==prior);
  pollMode=1;fb.vsyncFired(&fb,&timer);assert(!fb.fGpuPending && scanPublications==prior+1);
- // Busy GPU ring keeps newest swap; no CPU copy or premature transfer.
+ // Busy GPU ring keeps the oldest swap; no CPU copy or premature transfer.
  gpuMode=3;fb.swap(rec);prior=scanPublications;fb.vsyncFired(&fb,&timer);
  assert(fb.fDirty && !fb.fGpuPending && scanPublications==prior);
  gpuMode=-1;fb.vsyncFired(&fb,&timer);assert(fb.fDirty && scanPublications==prior);
