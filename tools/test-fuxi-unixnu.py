@@ -268,7 +268,13 @@ static void nanoseconds_to_absolutetime(uint64_t n,uint64_t *out) {*out=n;}
 static void fuxi_perf_swap(void) {}
 static void fuxi_display_kick(void) {kicks++;}
 static int scanAcquire=1,scanPublish=0;
-static bool scanOwned=false;
+static bool scanOwned=false,scanBackReady=false,scanDouble=false;
+static unsigned scanRetries,scanCpuAcquires;
+static int scanCpuAcquire=1;
+static int fuxi_gpu_scanout_double(void) {return scanDouble;}
+static int fuxi_gpu_scanout_pending(void) {return scanBackReady;}
+static int fuxi_gpu_scanout_retry(void) {scanRetries++;return 0;}
+static int fuxi_gpu_scanout_cpu_acquire(void) {scanCpuAcquires++;return scanCpuAcquire==1?scanAcquire:scanCpuAcquire;}
 static int fuxi_gpu_scanout_owned(void) {return scanOwned;}
 static bool teAvailable;
 static uint64_t teEdge,tePeriod=16667000;

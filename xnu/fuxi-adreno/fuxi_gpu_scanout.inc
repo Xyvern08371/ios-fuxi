@@ -6,12 +6,12 @@
  * See LICENSE.NativeMetal.
  */
 /* GPU-SCANOUT: Fuxi command-mode display ownership. Original implementation.
- * No panel/DSI reset, address flip, clock change or firmware dependency.
+ * No panel/DSI reset or firmware dependency; optional reserved-buffer flips.
  * fuxipanel120=1 optionally sends the panel's timing-switch commands once,
  * only after ownership and inherited transfer drain. Default does no DSI IO.
  * Register meanings already used by the board's inherited-display probe:
  * INTF1 AUTOREFRESH_CONFIG +0x2b4 bit31; TEAR_LINE_COUNT +0x2b0 low16
- * write line; CTL START +0x1c bit0. Do not copy while a transfer can read RAM.
+ * write line; CTL START +0x1c bit0. Never copy into a buffer a transfer reads.
  * Tear-check block per the SM8550 SDE driver (sde_hw_intf.c): +0x280
  * MDP_VSYNC_SEL, +0x284 TEAR_CHECK_EN, +0x288 SYNC_CONFIG_VSYNC, +0x28c
  * SYNC_CONFIG_HEIGHT, +0x294 VSYNC_INIT_VAL, +0x298 INT_COUNT_VAL (read
@@ -47,16 +47,28 @@ static unsigned fg_scanout_te_mode, fg_scanout_te_frame, fg_scanout_te_init, fg_
 static unsigned fg_scanout_te_window, fg_scanout_te_frames, fg_scanout_iv[4];
 static uint64_t fg_scanout_started, fg_scanout_last_start, fg_scanout_window_start;
 static int fg_abi_observe(void);
+static unsigned fg_scanout_double_active, fg_scanout_double_initialized, fg_scanout_front;
+static unsigned fg_scanout_back_ready, fg_scanout_flips, fg_scanout_ready_drops, fg_scanout_retries;
+static unsigned fg_scanout_current_match, fg_scanout_current_mismatch;
+static uintptr_t fg_scanout_pixels_b;
+static int fg_scanout_acquire(unsigned publication);
+static int fg_scanout_stop(const char *reason);
 
 void fuxi_gpu_scanout_configure(uintptr_t pixels, unsigned enabled, unsigned check)
 {
  /* AppleCLCD calls once, before fuxi_gpu_start publishes the GPU. */
+ if (fg_scanout_double_initialized || (fg_scanout_double_requested && __atomic_load_n(&fg_scanout_owned, __ATOMIC_ACQUIRE))) {
+  FG_GUARD;
+  (void)fg_scanout_stop(enabled == 1 ? "reconfigure while owned" : "disabled");
+  return;
+ }
  fg_scanout_pixels = pixels;
  fg_scanout_requested = enabled == 1;
  fg_scanout_checks = fg_scanout_requested && check == 1 ? 4 : 0;
  if (fg_scanout_requested)
 {
-  unsigned drain = 0, te = 0, panel120 = 0;
+  unsigned drain = 0, te = 0, panel120 = 0, double_buffer = 0;
+  fg_scanout_double_requested = PE_parse_boot_argn("fuxiscandouble", &double_buffer, sizeof(double_buffer)) && double_buffer == 1;
   fg_scanout_panel120_requested = PE_parse_boot_argn("fuxipanel120", &panel120, sizeof(panel120)) && panel120 == 1;
   fg_scanout_te_mode = PE_parse_boot_argn("fuxiscante", &te, sizeof(te)) && te == 1;
   /* The TE gate needs no floor unless one is given explicitly. */
@@ -89,12 +101,17 @@ static int fg_scanout_write(unsigned pa, unsigned value)
  * Two narrow, consecutive brackets establish a measured period. An IIR (1/8
  * period, 1/4 phase) rejects polling jitter without following the software
  * timer's phase. Never extrapolate an advancing counter through a stall.
- * All estimator writes belong to the caller, so this API needs no FG_GUARD. */
+ * Estimator writes belong to the caller. Only a double-mode MMIO failure
+ * takes FG_GUARD to stop and restore A; healthy observation remains lock-free. */
 int fuxi_gpu_scanout_te(struct fg_te_observer *te)
 {
  unsigned count;
  if (!fuxi_gpu_scanout_owned() || !fg_scanout_read(FG_SCAN_INTF+0x298, &count)) {
   te->initialized = te->samples = 0;
+  if (fg_scanout_double_active && fuxi_gpu_scanout_owned()) {
+   FG_GUARD;
+   (void)fg_scanout_stop("read TE observer");
+  }
   return 0;
  }
  uint64_t now = mach_absolute_time();
@@ -165,10 +182,25 @@ static void fg_scanout_arm(unsigned count)
  fg_scanout_timeout = fg_scanout_after + hz/10;
  fg_scanout_started = now;
 }
+/* Preserve other pending flush bits; VIG0 is CTL_FLUSH bit0. */
+static int fg_scanout_address(unsigned pa)
+{
+ unsigned flush;
+ if (!fg_scanout_read(FG_SCAN_CTL+0x18, &flush) ||
+     !fg_scanout_write(0xae05014, pa) || !fg_scanout_write(FG_SCAN_CTL+0x18, flush | 1u)) return 0;
+ __asm__ volatile("dsb sy" ::: "memory");
+ return 1;
+}
 static int fg_scanout_stop(const char *reason)
 {
  if (!fg_scanout_failed)
   printf("FUXI SCANOUT: stopped reason=%s; panel held, no framebuffer writes\n", reason);
+ /* Restore the fixed-address shadow even on failure; never hand back ownership
+  * or START if restoration/transfer/DMA state is uncertain. */
+ if (!fg_scanout_failed && (fg_scanout_double_initialized || (fg_scanout_double_requested && fuxi_gpu_scanout_owned())) &&
+     !fg_scanout_address(0xb8000000u))
+  printf("FUXI SCANOUT: restore A failed; panel held, reboot required\n");
+ fg_scanout_back_ready = 0;
  fg_scanout_failed = 1;
  fg_scanout_writable = 0;
  return -1;
@@ -354,9 +386,8 @@ uncertain:
  * This deliberately conservative policy is not a TE/vblank interrupt driver;
  * fuxiscante=1 polls the TE frame count instead of the fixed floor.
  */
-int fuxi_gpu_scanout_acquire(void)
+static int fg_scanout_acquire(unsigned publication)
 {
- FG_GUARD;
  if (!fg_scanout_requested) return 1;
  if (fg_scanout_failed) return -1;
  if (!fuxi_gpu_scanout_owned()) {
@@ -368,12 +399,20 @@ int fuxi_gpu_scanout_acquire(void)
   if (!fg_scanout_write(FG_SCAN_INTF+0x2b4, ar & ~0x80000000u))
    return fg_scanout_stop("disable autorefresh");
   __asm__ volatile("dsb sy" ::: "memory");
+  if (fg_scanout_double_requested) {
+   unsigned src;
+   if (!fg_scanout_read(0xae05014, &src) || src != 0xb8000000u)
+    return fg_scanout_stop("double initial SRC0");
+  }
   unsigned rd = 0, wr = 0, st = 0, tc[8] = {0};
-  (void)fg_scanout_read(FG_SCAN_INTF+0x298, &rd);
-  (void)fg_scanout_read(FG_SCAN_INTF+0x2b0, &wr);
-  (void)fg_scanout_read(FG_SCAN_CTL+0x1c, &st);
+  int status = fg_scanout_read(FG_SCAN_INTF+0x298, &rd) &&
+      fg_scanout_read(FG_SCAN_INTF+0x2b0, &wr) && fg_scanout_read(FG_SCAN_CTL+0x1c, &st);
+  if (!status && fg_scanout_double_requested) return fg_scanout_stop("double inherited status");
   static const unsigned tear[8] = {0x280, 0x284, 0x288, 0x28c, 0x294, 0x29c, 0x2a0, 0x2a8};
-  for (unsigned i = 0; i < 8; i++) (void)fg_scanout_read(FG_SCAN_INTF+tear[i], &tc[i]);
+  for (unsigned i = 0; i < 8; i++) {
+   int good = fg_scanout_read(FG_SCAN_INTF+tear[i], &tc[i]);
+   if (!good && fg_scanout_double_requested) return fg_scanout_stop("double tear setup");
+  }
   fg_scanout_te_init = tc[4] & 0xffff;
   fg_scanout_arm(rd);
   fg_scanout_window_start = rsr("cntpct_el0");
@@ -387,7 +426,16 @@ int fuxi_gpu_scanout_acquire(void)
  unsigned ar, line, start;
  if (!fg_scanout_read(FG_SCAN_INTF+0x2b4, &ar) || (ar & 0x80000000u))
   return fg_scanout_stop("autorefresh changed");
+ if (fg_scanout_double_active) {
+  unsigned src;
+  if (!fg_scanout_read(0xae05014, &src) || src != (fg_scanout_front ? 0xb8a00000u : 0xb8000000u))
+   return fg_scanout_stop("double SRC0 changed");
+ }
  if (fg_busy) { fg_scanout_wait_ring++; return 0; }
+ if (fg_scanout_double_active && !publication) {
+  fg_scanout_writable = 1;
+  return 1;
+ }
  if (rsr("cntpct_el0") < fg_scanout_after) { fg_scanout_wait_floor++; return 0; }
  if (fg_scanout_te_mode) {
   unsigned count;
@@ -436,26 +484,76 @@ int fuxi_gpu_scanout_acquire(void)
    return 0;
   }
  }
+ if (fg_scanout_double_requested && !fg_scanout_double_initialized) {
+  fg_scanout_pixels_b = fuxi_gpu_nc_pointer(0xb8a00000u, 4320u*2400);
+  if (!fg_scanout_pixels || !fg_scanout_pixels_b) return fg_scanout_stop("double buffer mapping");
+  for (unsigned i = 0; i < 1080u*2400; i++)
+   ((volatile uint32_t *)fg_scanout_pixels_b)[i] = ((const volatile uint32_t *)fg_scanout_pixels)[i];
+  fg_scanout_double_initialized = fg_scanout_double_active = 1;
+  printf("FUXI SCANOUT: double=1 A=0xb8000000 B=0xb8a00000 full_copy=1 flush=RMW|1\n");
+ }
  __asm__ volatile("dsb sy" ::: "memory");
  fg_scanout_writable = 1;
+ return 1;
+}
+int fuxi_gpu_scanout_acquire(void)
+{
+ FG_GUARD;
+ return fg_scanout_acquire(0);
+}
+int fuxi_gpu_scanout_double(void)
+{
+ return fg_scanout_double_active && !fg_scanout_failed;
+}
+int fuxi_gpu_scanout_pending(void)
+{
+ return fg_scanout_back_ready && !fg_scanout_failed;
+}
+/* CPU writers retain fPixels=A. Drain first, preserve the newest image and
+ * permanently use the existing single-buffer guard for the rest of this boot. */
+int fuxi_gpu_scanout_cpu_acquire(void)
+{
+ FG_GUARD;
+ int writable = fg_scanout_acquire(1);
+ if (writable != 1 || !fg_scanout_double_active) return writable;
+ if (fg_scanout_front ^ fg_scanout_back_ready) {
+  for (unsigned i = 0; i < 1080u*2400; i++)
+   ((volatile uint32_t *)fg_scanout_pixels)[i] = ((const volatile uint32_t *)fg_scanout_pixels_b)[i];
+ }
+ if (!fg_scanout_address(0xb8000000u)) return fg_scanout_stop("CPU restore A");
+ if (fg_scanout_back_ready) fg_scanout_ready_drops++;
+ fg_scanout_back_ready = fg_scanout_double_active = fg_scanout_front = 0;
+ printf("FUXI SCANOUT: double CPU fallback, drained; single buffer A until reboot\n");
  return 1;
 }
 /* The caller has acquired scanout and finished ALL CPU writes or observed the
  * GPU copy's cache-clean fence. Generic console/display kicks are suppressed
  * while owned. Autorefresh stays off; only this function starts transfers.
  */
-int fuxi_gpu_scanout_publish(void)
+static int fg_scanout_publish(void)
 {
- if (!fuxi_gpu_scanout_owned()) return 0;
- FG_GUARD;
  if (fg_scanout_failed || fg_busy || !fg_scanout_writable) return -1;
+ if (fg_scanout_double_active) {
+  int writable = fg_scanout_acquire(1);
+  if (writable != 1) {
+   if (!writable) fg_scanout_retries++;
+   return writable < 0 ? -1 : 2;
+  }
+ }
  unsigned ar, start;
  if (!fg_scanout_read(FG_SCAN_INTF+0x2b4, &ar) || (ar & 0x80000000u) ||
      !fg_scanout_read(FG_SCAN_CTL+0x1c, &start) || (start & 1))
   return fg_scanout_stop("publish transfer status");
  __asm__ volatile("dsb sy" ::: "memory");
  fg_scanout_writable = 0;
+ if (fg_scanout_double_active && !fg_scanout_address(fg_scanout_front ? 0xb8000000u : 0xb8a00000u))
+  return fg_scanout_stop("double SRC0 flush");
  if (!fg_scanout_write(FG_SCAN_CTL+0x1c, 1)) return fg_scanout_stop("start transfer");
+ if (fg_scanout_double_active) {
+  fg_scanout_front ^= 1;
+  fg_scanout_back_ready = 0;
+  fg_scanout_flips++;
+ }
  /* Read pointer after START: the TE gate then waits for a TE that follows
   * this read, so a TE racing the START write only makes it wait longer. */
  unsigned count = 0;
@@ -479,6 +577,15 @@ int fuxi_gpu_scanout_publish(void)
       fg_scanout_wait_ring, fg_scanout_wait_floor, fg_scanout_wait_xfer, fg_scanout_wait_te,
       fg_scanout_drain_us, fg_scanout_te_mode, te_dhz/10, te_dhz%10,
       fg_scanout_iv[0], fg_scanout_iv[1], fg_scanout_iv[2], fg_scanout_iv[3]);
+  if (fg_scanout_double_active) {
+   unsigned current, expected = fg_scanout_front ? 0xb8a00000u : 0xb8000000u;
+   if (!fg_scanout_read(0xae050a4, &current)) return fg_scanout_stop("read current SRC0");
+   if (current == expected) fg_scanout_current_match++; else fg_scanout_current_mismatch++;
+   printf("FUXI SCANOUT: double=1 flips=%u back_ready_drops=%u publish_retries=%u current_src0=%#x expected=%#x match=%u mismatch=%u\n",
+       fg_scanout_flips, fg_scanout_ready_drops, fg_scanout_retries, current, expected,
+       fg_scanout_current_match, fg_scanout_current_mismatch);
+   fg_scanout_flips = fg_scanout_ready_drops = fg_scanout_retries = 0;
+  }
   fg_scanout_wait_ring = fg_scanout_wait_floor = fg_scanout_wait_xfer = fg_scanout_wait_te = 0;
   fg_scanout_iv[0] = fg_scanout_iv[1] = fg_scanout_iv[2] = fg_scanout_iv[3] = 0;
   fg_scanout_window_start = now;
@@ -487,6 +594,21 @@ int fuxi_gpu_scanout_publish(void)
  __asm__ volatile("dsb sy" ::: "memory");
  fg_scanout_arm(count);
  return 1;
+}
+int fuxi_gpu_scanout_publish(void)
+{
+ if (!fuxi_gpu_scanout_owned()) return 0;
+ FG_GUARD;
+ if (fg_scanout_failed || fg_busy || !fg_scanout_writable) return -1;
+ if (fg_scanout_double_active) fg_scanout_back_ready = 1;
+ return fg_scanout_publish();
+}
+int fuxi_gpu_scanout_retry(void)
+{
+ FG_GUARD;
+ if (fg_scanout_failed) return -1;
+ if (!fg_scanout_back_ready || fg_busy) return 0;
+ return fg_scanout_publish();
 }
 /* Reserve the idle ring across the surface-cache transaction. Client submit
  * returns busy until release; map/TLBI/copy cannot race a client TTBR switch.
@@ -522,7 +644,7 @@ static int fg_scanout_verify(void)
  for (unsigned y = 0; y < fg_scanout_h; y++) {
   const uint32_t *src = (const uint32_t *)(fg_scanout_source +
       (uint64_t)(fg_scanout_sy+y)*fg_scanout_pitch + fg_scanout_sx*4);
-  const volatile uint32_t *dst = (const volatile uint32_t *)(fg_scanout_pixels +
+  const volatile uint32_t *dst = (const volatile uint32_t *)((fg_scanout_double_active && !fg_scanout_front ? fg_scanout_pixels_b : fg_scanout_pixels) +
       (uint64_t)(fg_scanout_dy+y)*4320 + fg_scanout_dx*4);
   for (unsigned x = 0; x < fg_scanout_w; x++) if (src[x] != dst[x]) {
    if (!mismatch) { first_x = x; first_y = y; }

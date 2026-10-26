@@ -40,9 +40,9 @@ extern unsigned fuxi_gpu_access(uintptr_t, uint64_t *, unsigned, unsigned);
 #define rsr(r) ({ uint64_t v; __asm__ volatile("mrs %0, " r : "=r"(v)); v; })
 #define delay fg_delay
 static void fg_delay(unsigned us) { delay_for_interval(us, NSEC_PER_USEC); }
-static unsigned fg_scanout_requested, fg_scanout_panel120_requested;
+static unsigned fg_scanout_requested, fg_scanout_panel120_requested, fg_scanout_double_requested;
 struct fg_window { uint64_t pa, size; uintptr_t va; };
-/* Disjoint apertures; the framebuffer is mapped by SweetFramebuffer only.
+/* Disjoint apertures; framebuffer A is mapped by SweetFramebuffer.
  * Stage14 uses scratch, never stage15's panel readback/CPU comparator. */
 static struct fg_window fg_windows[] = {
  {0x100000,0x80000,0}, {0x3d00000,0x40000,0},
@@ -52,6 +52,7 @@ static struct fg_window fg_windows[] = {
  {FG_SCRATCH,FG_SCRATCH_SIZE,0}, {0x9b098000,0x4000,0},
  {0xae04000,0x4000,0},
  {0xae14000,0x4000,0}, {0xae34000,0x4000,0},
+ {0xb8a00000,0x9e4000,0}, /* reserved splash buffer B, fuxiscandouble=1 only */
  {0xae94000,0x4000,0}, /* DSI0 command FIFO, fuxipanel120=1 only */
 };
 static uint64_t fg_mapped_bytes;
@@ -89,6 +90,7 @@ static kern_return_t fg_map_windows(void)
  for (unsigned i = 0; i < sizeof(fg_windows)/sizeof(fg_windows[0]); i++) {
   struct fg_window *w = &fg_windows[i];
   if (!fg_scanout_requested && (w->pa == 0xae14000 || w->pa == 0xae34000)) continue;
+  if (!fg_scanout_double_requested && w->pa == 0xb8a00000) continue;
   if (!fg_scanout_panel120_requested && w->pa == 0xae94000) continue;
   kern_return_t kr = fg_map_window(w);
   if (kr != KERN_SUCCESS) {
@@ -515,9 +517,11 @@ static void fg_thread(thread_call_param_t arg, thread_call_param_t result)
      gpu_extra[13][2], gpu_extra[11][2]);
  fg_clock_log();
  if (fg_limit < 17 || fg_force == 1) { fg_fail("diagnostic stop after self-test", fg_limit); goto out; }
- if (g3_read(0xae05014) != G4_FB_PA || g3_read(0xae05024) != 4320 ||
+ /* Double mode validates SRC0 under display ownership, failing closed there. */
+ if ((!fg_scanout_double_requested && g3_read(0xae05014) != G4_FB_PA) || g3_read(0xae05024) != 4320 ||
      g3_read(0xae05000) != (2400u<<16 | 1080u) || g3_read(0xae05030) != 0x237ff ||
      !g_map_at(G3_PT, &g3_next, G4_FB_VA, G4_FB_PA, (4320*2400+4095)&~4095u, 1u<<6) ||
+     (fg_scanout_double_requested && !g_map_at(G3_PT, &g3_next, G4_FB_VA+0xa00000u, 0xb8a00000u, (4320*2400+4095)&~4095u, 1u<<6)) ||
      !fg_source_tables()) { fg_fail("scanout geometry/mapping", 4); goto out; }
  uint32_t tlb[128] = {0};
  if (g4_tlb(tlb) || fg_access_failed) { fg_fail("initial TLB sync", 5); goto out; }
@@ -642,6 +646,13 @@ int fuxi_gpu_copy(unsigned slot, uint64_t generation, uintptr_t source, uint64_t
      (source & 3) || (pitch & 3) || pitch > 131008 || ((uint64_t)sx+width)*4 > pitch ||
      length+(source&4095) > FG_SOURCE_BYTES ||
      ((uint64_t)sy+height-1)*pitch+((uint64_t)sx+width)*4 > length) return 0;
+ if (fg_scanout_double_active) {
+  /* CA supplies a complete surface; expand damage to the complete panel. */
+  if (sx < dx || sy < dy) return 0;
+  sx -= dx; sy -= dy; dx = dy = 0; width = 1080; height = 2400;
+  if (((uint64_t)sx+width)*4 > pitch ||
+      ((uint64_t)sy+height-1)*pitch+((uint64_t)sx+width)*4 > length) return 0;
+ }
  uint64_t start = mach_absolute_time();
  fg_clean(source, pitch, sx, sy, width, height);
  t->clean += mach_absolute_time()-start;
@@ -658,10 +669,14 @@ int fuxi_gpu_copy(unsigned slot, uint64_t generation, uintptr_t source, uint64_t
  while ((pitch*stride) & 63) stride *= 2;
  /* XML has 15-bit dimensions; coordinates here are <2416 and strided pitch
   * <2^21. At most 16*32+128 <8192 words; the retired ring cannot be lapped. */
+ if (fg_scanout_double_active && fg_scanout_back_ready) {
+  fg_scanout_back_ready = 0;
+  fg_scanout_ready_drops++;
+ }
  g4_setup();
  for (unsigned y = 0; y < stride && y < height; y++)
   fg_rect(FG_SOURCE_VA+slot*FG_SOURCE_BYTES+(source&4095)+(sy+y)*pitch+sx*4,
-      G4_FB_VA+(dy+y)*4320+dx*4, pitch, width, (height-1-y)/stride+1, stride);
+      G4_FB_VA+(fg_scanout_double_active && !fg_scanout_front ? 0xa00000u : 0)+(dy+y)*4320+dx*4, pitch, width, (height-1-y)/stride+1, stride);
  unsigned magic = ++fg_seq;
  if (!magic) magic = ++fg_seq;
  g4_end(G3_FENCE_VA+64, magic);

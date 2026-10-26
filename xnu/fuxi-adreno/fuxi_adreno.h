@@ -16,14 +16,17 @@ int fuxi_gpu_ready(void);
 void fuxi_gpu_import_stats(uint64_t *cleaned, uint64_t *skipped, uint64_t *invalidated,
     uint64_t *mapped, unsigned *imports);
 /* Default-off command-mode handoff. configure is called before GPU startup.
- * acquire: 1 CPU/GPU may write, 0 deferred, -1 held. publish: 1 transferred,
- * 0 old path (caller kicks), -1 held. All calls are nonblocking.
+ * acquire: 1 GPU target writable, 0 deferred, -1 held. CPU writers must use
+ * cpu_acquire, which drains/restores A and permanently ends double mode.
+ * publish: 1 transferred, 2 back ready/deferred, 0 old path (caller kicks), -1 held.
+ * retry: same results, but 0 means no ready frame; never issue a generic kick.
  * reserve/release bracket a SweetSurface cache transaction; 0 means defer.
  */
 void fuxi_gpu_scanout_configure(uintptr_t pixels, unsigned enabled, unsigned check);
 int fuxi_gpu_scanout_owned(void);
 /* Caller-owned, zero-initialized TE observer. Use from one serialized timer;
- * independent observers share no mutable state. No GPU lock, waits or writes.
+ * independent observers share no mutable estimator state. Healthy observation
+ * takes no GPU lock or writes; double-mode MMIO failure stops/restores A.
  * On success frame (low16), edge and period describe the latest observed TE
  * in mach absolute units. On failure these outputs must not be used. */
 struct fg_te_observer {
@@ -33,6 +36,10 @@ struct fg_te_observer {
 int fuxi_gpu_scanout_te(struct fg_te_observer *te);
 int fuxi_gpu_scanout_acquire(void);
 int fuxi_gpu_scanout_publish(void);
+int fuxi_gpu_scanout_retry(void);
+int fuxi_gpu_scanout_pending(void);
+int fuxi_gpu_scanout_double(void);
+int fuxi_gpu_scanout_cpu_acquire(void);
 int fuxi_gpu_scanout_reserve(void);
 void fuxi_gpu_scanout_release(void);
 void fuxi_gpu_start(uint64_t framebuffer, unsigned width, unsigned height, unsigned pitch);

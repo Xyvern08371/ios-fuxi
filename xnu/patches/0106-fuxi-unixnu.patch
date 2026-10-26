@@ -616,7 +616,7 @@
  	fStatStart = mach_absolute_time();
  	fVsync->wakeAtTime(kIOTimeOptionsWithLeeway, fNextTick, 0);
  	IOLog("SWEET FB: present up to %u Hz (every %u ticks)\n", 60 / fFlushTicks, fFlushTicks);
-@@ -239,28 +394,118 @@
+@@ -239,28 +394,121 @@
  	setProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");
  	setProperty("external", false);
  	setProperty("DisplayPipePlaneBaseAlignment", 64ULL, 32);
@@ -667,6 +667,9 @@
 +		    (IOMobileFramebufferUserClient *)fClients->getObject(i);
 +		if (client->fFunc[SWEET_FB_NOTIFY_VSYNC] && client->fPort != MACH_PORT_NULL) notify = true;
 +	}
++#if defined(FUXI)
++ if (fScanout && fuxi_gpu_scanout_pending()) return true;
++#endif
 +	return fuxi_unixnu_tick_wanted(fPowerOff, fFadeStep == 0, fDirty, fGpuPending, notify);
 +}
 +
@@ -700,7 +703,7 @@
 +  if (now >= fb->fNextTick)
 +   fb->fNextTick = fuxi_unixnu_next_tick(fb->fNextTick, fb->fTickAbs, now);
 +  uint64_t deadline = fb->fNextTick;
-+  bool active = fb->fGpuPending || (!fb->fScanoutHeld &&
++  bool active = fb->fGpuPending || fuxi_gpu_scanout_pending() || (!fb->fScanoutHeld &&
 +      (fb->fPowerOff ? fb->fFadeStep == 0 : fb->fDirty));
 +  uint64_t poll = now + fb->fTickAbs/16;
 +  if (fb->fVsyncTE) {
@@ -741,7 +744,7 @@
  #else
  	(void)fb;
  	sender->setTimeoutUS(SWEET_FB_VSYNC_US);
-@@ -272,7 +517,15 @@
+@@ -272,7 +520,15 @@
  {
  	AppleCLCD *fb = (AppleCLCD *)owner;
  	uint64_t now = mach_absolute_time();
@@ -758,7 +761,14 @@
  	uint64_t values[6] = {
  		(uint32_t)count, (uint32_t)(count >> 32),
  		(uint32_t)now, (uint32_t)(now >> 32),
-@@ -289,7 +542,8 @@
+@@ -283,13 +539,15 @@
+  uint64_t elapsed = 0;
+  int completed = sweet_surface_gpu_poll(&elapsed);
+  bool gpuBusy = completed == 0;
++ if (fb->fScanout && !gpuBusy) (void)fuxi_gpu_scanout_retry();
+  if (gpuBusy) fb->fGpuBusyTicks++;
+  if (fb->fGpuPending && completed) {
+   fb->fGpuPending = false;
    if (completed == 1) {
     fb->fGpuFrames++;
     fb->fGpuTime += elapsed;
@@ -768,7 +778,7 @@
    } else {
     fb->fGpuFailed++;
     /* Replay the newest swap through the CPU on this tick. */
-@@ -301,7 +555,7 @@
+@@ -301,7 +559,7 @@
  	for (unsigned int i = 0; i < fb->fClients->getCount(); i++) {
  		IOMobileFramebufferUserClient *client =
  		    (IOMobileFramebufferUserClient *)fb->fClients->getObject(i);
@@ -777,7 +787,7 @@
  	}
  #if defined(FUXI)
   if (gpuBusy) { /* retain latest pending swap; no copy or black clear yet */
-@@ -310,6 +564,20 @@
+@@ -310,6 +568,20 @@
    return;
   }
  #endif
@@ -785,7 +795,7 @@
 + /* All framebuffer writers, including CPU fallback and black clear, share
 +  * the panel ownership guard. Keep the latest swap pending while draining. */
 + if (fb->fScanout && (fb->fDirty || (fb->fPowerOff && fb->fFadeStep == 0))) {
-+  int writable = fuxi_gpu_scanout_acquire();
++  int writable = fb->fPowerOff ? fuxi_gpu_scanout_cpu_acquire() : fuxi_gpu_scanout_acquire();
 +  if (writable != 1) {
 +   fb->fScanoutHeld = writable < 0;
 +   fb->fScanoutDefers++; /* ownership/drain poll, not a dropped frame or scheduler delay */
@@ -798,7 +808,7 @@
  	if (fb->fPowerOff) {
  		/* Fade out: halve every channel each vsync, then black, then idle. */
  		uint32_t step = fb->fFadeStep;
-@@ -319,14 +587,22 @@
+@@ -319,14 +591,22 @@
  		IOLockUnlock(fb->fLock);
  #if defined(FUXI)
  		if (step == 0) {
@@ -826,7 +836,7 @@
  		}
  #else
  		if (step <= 6) {
-@@ -341,7 +617,7 @@
+@@ -341,7 +621,7 @@
  		sweet_fb_rearm(fb, sender);
  		return;
  	}
@@ -835,7 +845,7 @@
  	uint8_t *rec = NULL;
  	if (flush) {
  		rec = (uint8_t *)IOMallocData(SWEET_FB_SWAP_REC_SIZE);
-@@ -408,6 +684,7 @@
+@@ -408,6 +688,7 @@
  		fStatDropped++;         /* the previous frame was never shown */
  	}
  	fDirty = true;
@@ -843,7 +853,7 @@
  	IOLockUnlock(fLock);
  	if ((++sweet_fb_swap_count % 1000) == 0) {
  		IOLog("SWEET FB: %llu swaps\n", sweet_fb_swap_count);
-@@ -420,6 +697,7 @@
+@@ -420,6 +701,7 @@
  	uint32_t mask = get32(rec, 0x104);
  	uint64_t t0 = mach_absolute_time();
  	bool gpuFrame = false, cpuFrame = false;
@@ -851,7 +861,7 @@
  
  	if (!fConsolePaused) {
  		int quiet = 0;
-@@ -451,6 +729,7 @@
+@@ -451,6 +733,7 @@
  			    get32(a, 12), dx, dy, w, h);
  		}
  		if (s == NULL || s == fSurface) {
@@ -859,7 +869,20 @@
  			OSSafeReleaseNULL(s);
  			continue;
  		}
-@@ -505,28 +784,75 @@
+@@ -500,33 +783,98 @@
+ 		if (src != 0 && bpe == 4) {
+ 			int copied = 0;
+ #if defined(FUXI)
++            /* Keep CPU replay complete too if a full composed crop is available. */
++            if (fuxi_gpu_scanout_double() && (mask & (mask-1)) == 0 && sx >= dx && sy >= dy &&
++                (uint64_t)(sx-dx)+fWidth <= s->width && (uint64_t)(sy-dy)+fHeight <= s->height &&
++                ((uint64_t)(sx-dx)+fWidth)*4 <= s->bytesPerRow &&
++                (uint64_t)s->offset + ((uint64_t)(sy-dy)+fHeight-1)*s->bytesPerRow +
++                ((uint64_t)(sx-dx)+fWidth)*4 <= s->memory->getLength()) {
++             sx -= dx; sy -= dy; dx = dy = 0; w = fWidth; h = fHeight;
++            }
+ 			uint64_t copyStart = mach_absolute_time();
+ 			/* CA's composed frame has one layer. Preserve the CPU path for
  			 * multi-layer records rather than submit multiple fences per frame. */
  			if ((mask & (mask-1)) == 0)
  				copied = sweet_surface_gpu_copy(s, src, sx, sy, dx, dy, w, h);
@@ -871,11 +894,21 @@
 +            }
  			if (copied == 2) {
 +             fScanoutPrepare = mach_absolute_time() - copyStart;
-+             fScanoutBytes = (uint64_t)w * h * 4;
++             fScanoutBytes = fuxi_gpu_scanout_double() ? (uint64_t)1080 * 2400 * 4 : (uint64_t)w * h * 4;
 +				fShadowValid = false;
  				gpuFrame = true;
  				fGpuPending = true;
  			}
++            if (copied != 2 && fScanout) {
++             int writable = fuxi_gpu_scanout_cpu_acquire();
++             if (writable != 1) {
++              fScanoutHeld = writable < 0;
++              fScanoutDefers++;
++              IOLockLock(fLock); fDirty = true; IOLockUnlock(fLock);
++              s->release();
++              return;
++             }
++            }
  			copyStart = mach_absolute_time();
  #endif
 -			if (copied != 2) for (int32_t y = 0; y < h; y++) {
@@ -941,7 +974,7 @@
  	fCpuFrames += cpuFrame;
  	uint64_t t1 = mach_absolute_time(), took = t1 - t0;
  	fStatCopy += took;
-@@ -547,6 +873,9 @@
+@@ -547,6 +895,9 @@
  		absolutetime_to_nanoseconds(fGpuTime, &gpu_ns);
  		absolutetime_to_nanoseconds(fCpuTime, &cpu_ns);
  		struct fg_times split;
@@ -951,7 +984,7 @@
  		sweet_surface_gpu_stats(&split);
  		uint64_t ticks[] = {split.pin, split.lookup, split.map, split.clean,
  		    split.submit, split.wait, split.unmap, split.cpu};
-@@ -559,11 +888,13 @@
+@@ -559,11 +910,13 @@
  		}
  		IOLog("FUXI GPU: presents GPU %u CPU %u, GPU retire avg %llu us CPU avg %llu us, "
  		    "split pin %llu lookup %llu map+TLB %llu clean %llu submit %llu wait %llu unmap %llu us, "
@@ -967,7 +1000,7 @@
  		fGpuBusyTicks = fGpuFailed = 0;
  		fGpuFrames = fCpuFrames = 0;
  		fGpuTime = fCpuTime = 0;
-@@ -571,6 +902,29 @@
+@@ -571,6 +924,29 @@
  		fStatCopy = fStatCopyMax = 0;
  		fStatStart = t1;
  	}
@@ -997,7 +1030,7 @@
  #endif
  }
  
-@@ -620,6 +974,7 @@
+@@ -620,6 +996,7 @@
  	IOLockLock(fFB->fLock);
  	old = fPort;
  	fPort = port;
@@ -1005,7 +1038,7 @@
  	IOLockUnlock(fFB->fLock);
  	if (old != MACH_PORT_NULL) {
  		releaseNotificationPort(old);
-@@ -643,6 +998,40 @@
+@@ -643,6 +1020,40 @@
  }
  
  static uint64_t sweet_fb_logged;        /* selectors already logged (< 64) */
@@ -1046,7 +1079,7 @@
  
  IOReturn
  IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *args,
-@@ -698,6 +1087,7 @@
+@@ -698,6 +1109,7 @@
  			IOLockLock(fFB->fLock);
  			fFunc[type] = args->scalarInput[0];
  			fRefcon[type] = args->scalarInput[1];
@@ -1054,7 +1087,7 @@
  			IOLockUnlock(fFB->fLock);
  			char name[32];
  			proc_selfname(name, sizeof(name));
-@@ -707,16 +1097,7 @@
+@@ -707,16 +1119,7 @@
  		break;
  	case kSweetFBRequestPowerChange:
  		if (args->scalarInputCount >= 1) {

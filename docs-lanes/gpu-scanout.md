@@ -558,3 +558,140 @@ count/notification suppression, diagnostics and the unchanged opt-out path.
 The kernel build receives the API/header through generated patch **0098** and
 CLCD through **0106**; regenerate with `tools/sync-fuxi-metal.py` and
 `tools/sync-fuxi-unixnu.py` and keep both `--check` modes passing.
+
+## Opt-in double scanout (`fuxiscandouble=1`, default off)
+
+Supplied device observations, before this change: with `fuxigpuscanout=1
+fuxiscante=1 fuxipanel120=1 fuxivsyncte=1`, panel switching succeeds, TE measures
+120.8 Hz (8274 us), and CLCD notifications follow TE. CA swaps reach 120 Hz,
+but the single-buffer path reports 600 frames in 16187 ms, 798 swaps and 197
+not shown. The supplied 600-START window has `ring=0 floor=0 transfer=5369
+te=2000`, `gaps=0/313/167/120`, GPU `copy_avg_us=626`, maximum 1246 us.
+The same RAM cannot be copied until its approximately 7.3 ms transfer ends;
+copy plus polling then misses the next 8.274 ms period. These are the user's
+observations of the preceding implementation, **not results of double mode**.
+
+Add `fuxiscandouble=1` to that setup, retaining `sweetfb_noconsole=1` and the
+existing GPU/ABI arguments. Only exact value 1 enables it, parsed once during
+CLCD configuration, and only with the scanout handoff enabled. No option means
+no buffer-B mapping, address flips, flush writes or double-mode diagnostics.
+The existing panel120, TE gate, explicit drain floor and heartbeat controls
+remain independent. In particular, leaving the default drain floor enabled
+still prevents one-TE publication at 120 Hz.
+
+A remains PA **0xb8000000**, GPU VA `G4_FB_VA` (0x41000000). B is PA
+**0xb8a00000**, GPU VA `G4_FB_VA+0xa00000` (0x41a00000). Both contain
+4320*2400 = **0x9e3400 bytes**. B ends at 0xb93e3400 exclusive, inside the
+existing splash reservation 0xb8000000..0xbaafffff, outside XNU-managed RAM.
+No allocator RAM or new ADT reservation is used. The GPU maps B with the
+same `1u<<6` attributes as A; the fallible kernel NC window rounds B to
+0x9e4000 bytes (16 KiB pages). CPU initialization/readback uses aligned
+volatile 32-bit accesses, not cached memcpy/DC ZVA into that mapping.
+
+Ownership and copying:
+
+- Claim manual START, disable autorefresh, require initial VIG0 SRC0 (+0x14)
+  equal to A, drain the inherited transfer with the existing floor/TE,
+  CTL_START and write-line checks, and finish the optional panel120 switch.
+  Copy A into B before allowing its first use. Unexpected SRC0/MMIO/mapping
+  state holds writes. Subsequent acquisitions check that SRC0 still matches
+  the tracked front buffer.
+- GPU copies always target the other buffer. Every double-mode GPU copy is
+  **full 1080x2400**, expanding the damage coordinates to their full source
+  crop (usually 22,18). A source that cannot supply the complete panel is
+  refused before submission. CLCD also expands an eligible composed crop
+  before calling the GPU, so a confirmed GPU failure can replay a complete
+  frame on CPU. No damage union/history is maintained. Existing copy-time
+  logs measure the cost; reported GPU bytes reflect the full copy.
+- A retired copy becomes back-ready. Publication retries the existing TE,
+  explicit floor, CTL_START-bit0-clear and write-line-idle checks, without
+  spinning. Then write VIG0 SRC0, write **CTL_FLUSH = read(CTL_FLUSH) | 1**,
+  DSB, and CTL_START=1. This preserves all other pending flush bits and adds
+  only VIG0 bit0, using the supplied DPU register facts, not Linux code.
+  The front/back indices change only after successful START. The old front
+  can immediately receive the next GPU copy while the new front transfers.
+- CLCD retries publication on timer polls even without another swap; a ready
+  frame keeps the demand timer active. A newer complete copy may replace a
+  ready unstarted frame and increments `back_ready_drops`. Copy-in-flight
+  exclusion prevents both another copy and START until retirement. The
+  existing source retention, cache-clean fence, producer reservation and
+  DMA quarantine checks remain in force.
+
+**CPU option: permanent single-buffer fallback to A until reboot.** CPU copy
+and power-off black-fill callers use a distinct acquisition API. It first
+waits for GPU retirement and the same transfer/TE gates. With the display
+idle, it preserves the newest completed image in A (the ready image if one
+exists, otherwise the front), restores SRC0=A with the same flush, discards
+any ready frame, and disables flips. Existing `fPixels` writers, partial CPU
+copies, diff shadow handling and black publication then use the original
+single-buffer guard. The transition logs once. This deliberately sacrifices
+double buffering after a CPU fallback or blank rather than introduce another
+CPU pointer/lifetime contract; waking does not automatically re-enable it.
+
+Every stop after double ownership attempts SRC0=A plus flush before any
+possible fixed-address consumer could regain the display. A restore access
+failure logs separately. The existing stop policy still holds ownership,
+suppresses generic kicks and forbids writes/START until reboot; restoration
+alone is not permission to use RAM while GPU/display ownership is uncertain.
+Healthy TE observation stays lock-free; an observer MMIO failure in double
+mode takes the GPU guard only to run this fail-closed stop/restore path.
+A defensive configure/disable request while double ownership is established
+also stops/restores and keeps the panel held. There is no runtime
+display-release/re-enable operation.
+
+The USB screenshot request **0x4e** now snapshots SRC0 once, accepts A or B,
+and reads `SRC0+offset`, bounded to exactly one framebuffer. Pitch/format
+checks and the 512-byte request cap are unchanged. No monitor protocol/tool
+change is needed. A screenshot assembled from many requests can still span
+flips; this is not an atomic whole-frame capture.
+
+New exact log forms (`N`, `P`, `M` and addresses below are runtime values):
+
+```text
+FUXI SCANOUT: double=1 A=0xb8000000 B=0xb8a00000 full_copy=1 flush=RMW|1
+FUXI SCANOUT: double=1 flips=N back_ready_drops=N publish_retries=N current_src0=P expected=P match=N mismatch=N
+FUXI SCANOUT: double CPU fallback, drained; single buffer A until reboot
+FUXI SCANOUT: restore A failed; panel held, reboot required
+```
+
+The second line accompanies each existing `waits per 600 starts` line while
+double mode remains active. Flips, ready drops and deferred publication polls
+reset per window; match/mismatch are cumulative **sample counts**. One
+read-only **SSPP_CURRENT_SRC0_ADDR (+0xa4)** sample follows that window's
+last START and is compared with the expected new front PA. This register and
+its latch timing remain **unverified on device**; a mismatch is diagnostic,
+not a reason to guess another address or bypass the transfer guard. A failed
+read stops scanout. Existing `copy_avg_us`/`copy_max_us`, `te_hz`, gap buckets
+and SWEET FB swap statistics remain the timing comparison points. Ready drops
+are distinct from swaps replaced before copying; a completed copy alone is
+still not proof of a shown frame.
+
+Host coverage compiles production code with ASan/UBSan and MMIO/PM4 models:
+optional/fallible B mapping and identical GPU attributes, initial contents,
+alternating non-front copy destinations, full crops from small damage,
+refusal of incomplete sources, copy retirement/transfer/TE exclusion,
+SRC0/flush/START ordering and preserved flush bits, ready replacement,
+600-start sampling, CPU/black guards and newest-image preservation, stop
+restoration and faults, ready-only demand polling, and screenshot A/B bounds.
+The modeled 120.8 Hz panel with 7.3 ms transfers and 626..1246 us overlapping
+copies sustains 600 STARTs with one-period gaps. This is a scheduling model,
+**not a device throughput measurement**.
+
+Generated CI inputs: `sync-fuxi-metal.py` regenerates **0098** for the GPU
+source/include/header, and `sync-fuxi-unixnu.py` regenerates **0106** for CLCD.
+Run their `--check` modes, `sync-fuxi-adreno-shared.py --check` (also checks
+0100), and `sync-fuxi-scanout.py --check` (0108 remains unchanged). No H1
+source/0103 change is involved. The loader builds the canonical probe source.
+Run the related test commands above, including
+`python3 tools/test-fuxi-adreno-mapping.py`; the optional saved-XNU syntax
+recipes also check the complete GPU and framebuffer translation units.
+
+**Double-mode device results: not yet observed.** Qualify actual SSPP address
+latching, the DPU's access to B, cache visibility, DSC/image integrity,
+START gaps predominantly one period under animation, dropped-ready counts,
+copy timing, CPU fallback, blank/wake and stop restoration. Full-frame copies
+increase work for small damage; polling, compositor contention and timer
+jitter can still miss TE. Direct clients writing the exported physical
+framebuffer remain outside this ownership contract. Bad address/latch facts
+can blank or corrupt the panel and require a reboot without the option. No
+phone access, deployment, full kernel link, push or CI run was performed.

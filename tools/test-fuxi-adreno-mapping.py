@@ -16,7 +16,7 @@ submit = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(submit)
 
 PREFIX = r'''
-static unsigned fg_scanout_requested, fg_scanout_panel120_requested;
+static unsigned fg_scanout_requested, fg_scanout_panel120_requested, fg_scanout_double_requested;
 #include <assert.h>
 #define FG_GUARD
 static unsigned fg_abi_enabled;
@@ -76,7 +76,7 @@ static unsigned fail_alloc, fail_enter, invalid_reservation;
 static size_t live, cursor, last_size, removed;
 static uintptr_t last_va;
 static uint64_t first_pa, next_pa;
-static unsigned char arena[40*1024*1024] __attribute__((aligned(PAGE_SIZE)));
+static unsigned char arena[64*1024*1024] __attribute__((aligned(PAGE_SIZE)));
 vm_offset_t gPhysBase = FG_RAM_BASE;
 vm_size_t gPhysSize = FG_RAM_SIZE;
 static uint64_t reservation[2] = {FG_SCRATCH,FG_SCRATCH_SIZE};
@@ -142,8 +142,10 @@ static unsigned g3_read(uint64_t a) {
  return 0;
 }
 static unsigned g3_gr(unsigned a) { (void)a; return 0; }
+static unsigned fbMaps,failFbMap;
 static int g_map_at(uint64_t p,unsigned *n,unsigned va,unsigned pa,unsigned size,unsigned attr)
-{ (void)p;(void)n;(void)va;(void)pa;(void)size;(void)attr;return 1; }
+{ (void)p;(void)n;assert(size==((4320*2400+4095)&~4095u) && attr==(1u<<6));
+ assert((va==G4_FB_VA && pa==G4_FB_PA) || (fg_scanout_double_requested && va==G4_FB_VA+0xa00000u && pa==0xb8a00000u));return ++fbMaps!=failFbMap; }
 static int fg_source_tables(void) { return 1; }
 static int g4_tlb(uint32_t *p) { (void)p;return 0; }
 static void clock_interval_to_deadline(unsigned n,unsigned unit,uint64_t *d)
@@ -172,9 +174,9 @@ static void reset(void)
  gpu_calls=alloc_calls=enter_calls=remove_calls=free_calls=enqueued=0;
  fail_alloc=fail_enter=invalid_reservation=0;
  live=cursor=removed=0;
- fg_scanout_requested=fg_scanout_panel120_requested=1;
+ fg_scanout_requested=fg_scanout_panel120_requested=fg_scanout_double_requested=1;
  fg_limit=17; enable_arg=1; gPhysSize=FG_RAM_SIZE;
- valid_handoff=abi_inits=abi_publishes=abi_fail=fg_abi_enabled=0;
+ valid_handoff=abi_inits=abi_publishes=abi_fail=fg_abi_enabled=fbMaps=failFbMap=0;
  level_arg=clock_logs=g_gpu_selected=fg_clock_measure=0;
  ddr_arg=g_gpu_ddr_requested=ddr_present=ddr_parses=0;level_present=1;last_log[0]=0;
 }
@@ -183,10 +185,13 @@ int main(void)
  (void)g_gpu_bw_packet;(void)g_gpu_bw_index;(void)g_gpu_level;
  uint64_t total=0;
  for(unsigned i=0;i<COUNT;i++) total+=fg_windows[i].size;
- assert(total==0x218c000); /* Existing windows + optional DPU and DSI0 windows. */
- reset();fg_scanout_requested=fg_scanout_panel120_requested=0;assert(fg_map_windows()==KERN_SUCCESS);
- assert(live==total-49152 && fg_mapped_bytes==total-49152 && alloc_calls==COUNT-3);
+ assert(total==0x2b70000); /* Existing windows + optional DPU, DSI0 and buffer B windows. */
+ reset();fg_scanout_requested=fg_scanout_panel120_requested=fg_scanout_double_requested=0;assert(fg_map_windows()==KERN_SUCCESS);
+ assert(live==total-49152-0x9e4000 && fg_mapped_bytes==total-49152-0x9e4000 && alloc_calls==COUNT-4);
+ assert(!fuxi_gpu_nc_pointer(0xb8a00000,4320u*2400));
  assert(!fg_pointer(0xae16000) && !fg_pointer(0xae36000) && !fg_pointer(0xae94000));
+ reset();fg_scanout_double_requested=0;assert(fg_map_windows()==KERN_SUCCESS);
+ assert(!fuxi_gpu_nc_pointer(0xb8a00000,4320u*2400) && live==total-0x9e4000);
  reset();fg_scanout_panel120_requested=0;assert(fg_map_windows()==KERN_SUCCESS);
  assert(live==total-16384 && fg_mapped_bytes==total-16384 && alloc_calls==COUNT-1);
  assert(fg_pointer(0xae16000) && fg_pointer(0xae36000) && !fg_pointer(0xae94000));
@@ -264,8 +269,17 @@ int main(void)
   fuxi_gpu_start(G4_FB_PA,1080,2400,4320);fg_thread(NULL,NULL);
   char expected[96];
   snprintf(expected,sizeof(expected),"requested %u kHz GPU vote (not measured)",ready_khz[level]);
-  assert(fg_state==1 && clock_logs==1 && strstr(last_log,expected));
+  assert(fg_state==1 && clock_logs==1 && fbMaps==2 && strstr(last_log,expected));
  }
+ for(unsigned doubleMode=0;doubleMode<2;doubleMode++) {
+  reset();valid_handoff=1;fg_scanout_double_requested=doubleMode;
+  fuxi_gpu_start(G4_FB_PA,1080,2400,4320);fg_thread(NULL,NULL);
+  assert(fg_state==1 && fbMaps==doubleMode+1);
+ }
+ reset();valid_handoff=1;failFbMap=2;
+ fuxi_gpu_start(G4_FB_PA,1080,2400,4320);fg_thread(NULL,NULL);
+ assert(fg_state==2 && fbMaps==2 && !abi_publishes); // B mapping fails closed
+ assert(0xb8a00000u+0x9e4000u<=0xbab00000u && 0xb8000000u+4320u*2400<=0xb8a00000u);
  /* ABI MMIO/table setup must precede publishing ready to the display;
   * service publication must follow it. Failure only withholds the ABI. */
  for(unsigned fail=0;fail<2;fail++) {

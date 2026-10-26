@@ -33,23 +33,29 @@ typedef int boolean_t;
 #define FALSE 0
 static int interruptsOn=1;
 static boolean_t ml_set_interrupts_enabled(boolean_t value) {int old=interruptsOn;interruptsOn=value;return old;}
-static unsigned fg_scanout_requested, fg_scanout_panel120_requested, fg_busy, fg_client_busy;
+static unsigned fg_scanout_requested, fg_scanout_panel120_requested, fg_scanout_double_requested, fg_busy, fg_client_busy;
 static unsigned ready=1,abiLive=1,abiResult,observations,reads,writes,starts,failAddress;
 static uint64_t ticks=1000,machScale=1;
 static uint64_t mach_absolute_time(void) {return ticks*machScale;}
 static void absolutetime_to_nanoseconds(uint64_t t,uint64_t *ns) {*ns=t*1000/machScale;}
 static void nanoseconds_to_absolutetime(uint64_t ns,uint64_t *t) {*t=ns*machScale/1000;}
-static uint32_t ctl[1024],intf[1024],dsi[1024];
-static struct {unsigned pa,value;} trace[1024];
+static uint32_t ctl[1024],intf[1024],dsi[1024],sspp[1024];
+static struct {unsigned pa,value;} trace[8192];
 static unsigned traceCount,dsiReads,dmaStarts,pendingDma,noDone,busyAfterDone,staleDone,frozenClock,failWriteAddress;
 static unsigned errorOnDone,tearReadbackMismatch;
 static volatile uint32_t *fuxi_ctl0=ctl,*fuxi_intf1=intf;
 static int fuxi_gpu_ready(void) {return ready;}
-static unsigned modelDrain,modelTe,modelPanel120;
+static unsigned modelDrain,modelTe,modelPanel120,modelDouble;
+static uint8_t modelB[4320u*2400];
+static unsigned failBMap;
+static uintptr_t fuxi_gpu_nc_pointer(uint64_t pa,uint64_t size) {
+ assert(pa==0xb8a00000u && size==4320u*2400);return failBMap?0:(uintptr_t)modelB;
+}
 static unsigned fg_scanout_owned_for_model(void);
+static unsigned fg_scanout_double_for_model(void);
 static int PE_parse_boot_argn(const char *name,void *value,int size) {
  unsigned v=!strcmp(name,"fuxiscante")?modelTe:!strcmp(name,"fuxiscandrain")?modelDrain:
-     !strcmp(name,"fuxipanel120")?modelPanel120:0;
+     !strcmp(name,"fuxipanel120")?modelPanel120:!strcmp(name,"fuxiscandouble")?modelDouble:0;
  if(!v || size<4)return 0;*(unsigned *)value=v;return 1;
 }
 static int fg_abi_live_for_scanout(void) {return abiLive;}
@@ -61,11 +67,12 @@ static unsigned fg_access(uint64_t pa,uint64_t *value,unsigned wr,unsigned wide)
  assert(!wide);
  if(pa==failAddress || (wr && pa==failWriteAddress))return 1;
  uint32_t *reg;
- if(pa>=0xae16000 && pa<0xae17000)reg=&ctl[(pa-0xae16000)/4];
+ if(pa>=0xae05000 && pa<0xae06000)reg=&sspp[(pa-0xae05000)/4];
+ else if(pa>=0xae16000 && pa<0xae17000)reg=&ctl[(pa-0xae16000)/4];
  else if(pa>=0xae94000 && pa<0xae95000)reg=&dsi[(pa-0xae94000)/4];
  else {assert(pa>=0xae36000 && pa<0xae37000);reg=&intf[(pa-0xae36000)/4];}
  if(wr){
-  writes++;assert(traceCount<1024);trace[traceCount].pa=pa;trace[traceCount++].value=*value;
+  writes++;assert(traceCount<8192);trace[traceCount].pa=pa;trace[traceCount++].value=*value;
   if(pa>=0xae94000 && pa<0xae95000) {
    assert(interruptsOn);
    assert(fg_scanout_owned_for_model());
@@ -79,7 +86,13 @@ static unsigned fg_access(uint64_t pa,uint64_t *value,unsigned wr,unsigned wide)
   } else *reg=(uint32_t)*value;
   if(pa==0xae94090){assert(*value==1 && dsi[0x15c/4]==0x30006 && dsi[0x04c/4]==52);
    dmaStarts++;pendingDma=2;dsi[0x008/4]=3;}
-  if(pa==0xae1601c){assert(!fg_busy && !(intf[0x2b4/4]&0x80000000u));starts++;}
+  if(pa==0xae1601c){
+   if(fg_scanout_double_for_model()) {
+    assert(!intf[0x2b0/4] || intf[0x2b0/4]>=2400);
+    assert(traceCount>=3 && trace[traceCount-2].pa==0xae16018 && trace[traceCount-3].pa==0xae05014);
+    assert(ctl[0x18/4]&1);
+   }
+   assert(!fg_busy && !(intf[0x2b4/4]&0x80000000u));starts++;}
  } else {
   reads++;
   if(pa>=0xae94000 && pa<0xae95000)dsiReads++;
@@ -95,7 +108,12 @@ static unsigned fg_access(uint64_t pa,uint64_t *value,unsigned wr,unsigned wide)
 '''
 TEST = r'''
 static unsigned fg_scanout_owned_for_model(void) {return fg_scanout_owned;}
+static unsigned fg_scanout_double_for_model(void) {return fg_scanout_double_active;}
 static void reset(void) {
+ memset(sspp,0,sizeof(sspp));sspp[0x14/4]=0xb8000000u;
+ fg_scanout_double_requested=fg_scanout_double_active=fg_scanout_double_initialized=fg_scanout_front=0;
+ fg_scanout_back_ready=fg_scanout_flips=fg_scanout_ready_drops=fg_scanout_retries=0;
+ fg_scanout_current_match=fg_scanout_current_mismatch=modelDouble=failBMap=0;
  memset(ctl,0,sizeof(ctl));memset(intf,0,sizeof(intf));memset(dsi,0,sizeof(dsi));intf[0x2b4/4]=0x80000001u;
  fg_scanout_requested=fg_scanout_owned=fg_scanout_failed=fg_scanout_writable=0;
  fg_scanout_reserved=fg_busy=fg_client_busy=0;
@@ -282,6 +300,140 @@ static void te_estimator_tests(void) {
  fg_scanout_period_us=8333;assert(!te_sample(&te,11,2008300) && te.nominal_us==8333 && !te.samples);
  puts("PASS: actual lock-free TE observer: jitter/period filter, mach units, 60/120Hz, wrap, stall/MMIO/ownership/gap/reset fallback");
 }
+static void double_setup(uint8_t *panel) {
+ reset();modelDouble=1;modelTe=1;
+ intf[0x294/4]=2400;intf[0x298/4]=(1u<<16)|2500;intf[0x2b0/4]=2400;
+ memset(panel,0x5a,4320u*2400);memset(modelB,0xcc,sizeof(modelB));
+ fuxi_gpu_scanout_configure((uintptr_t)panel,1,0);
+ assert(!fuxi_gpu_scanout_acquire());
+ intf[0x298/4]=(2u<<16)|2500;
+ assert(fuxi_gpu_scanout_acquire()==1 && fuxi_gpu_scanout_double());
+ assert(!memcmp(panel,modelB,sizeof(modelB)) && !fg_scanout_front);
+}
+static void double_tests(uint8_t *panel) {
+ for(unsigned option=0;option<3;option++) {
+  reset();modelDouble=option;fuxi_gpu_scanout_configure((uintptr_t)panel,1,0);
+  assert(fg_scanout_double_requested==(option==1));
+ }
+ reset();modelDouble=1;fuxi_gpu_scanout_configure((uintptr_t)panel,0,0);
+ assert(!fg_scanout_double_requested && !fuxi_gpu_scanout_double() && !reads && !writes);
+ // The production oracle must read back the GPU's back buffer, never front.
+ double_setup(panel);fg_scanout_checks=4;fg_scanout_source=(uintptr_t)panel;
+ fg_scanout_pitch=4320;fg_scanout_sx=fg_scanout_sy=fg_scanout_dx=fg_scanout_dy=0;
+ fg_scanout_w=1080;fg_scanout_h=2400;
+ assert(fg_scanout_verify());modelB[sizeof(modelB)-1]^=1;assert(!fg_scanout_verify());
+ modelB[sizeof(modelB)-1]^=1;fg_scanout_front=1;fg_scanout_source=(uintptr_t)modelB;
+ assert(fg_scanout_verify());panel[0]^=1;assert(!fg_scanout_verify());
+ double_setup(panel);ctl[0x18/4]=0x80000800u;
+ fg_busy=1;assert(fuxi_gpu_scanout_publish()==-1 && !fuxi_gpu_scanout_pending() && !starts);
+ fg_busy=0;unsigned t=traceCount;
+ assert(fuxi_gpu_scanout_publish()==1 && starts==1 && fg_scanout_front==1);
+ assert(trace[t].pa==0xae05014 && trace[t].value==0xb8a00000u);
+ assert(trace[t+1].pa==0xae16018 && trace[t+1].value==0x80000801u);
+ assert(trace[t+2].pa==0xae1601c && trace[t+2].value==1);
+ // Copy acquisition overlaps an active transfer. Publication waits for BOTH
+ // transfer indicators and a later TE; ring/copy busy can never issue START.
+ intf[0x2b0/4]=100;assert(fuxi_gpu_scanout_acquire()==1);
+ fg_busy=1;assert(!fuxi_gpu_scanout_retry() && fuxi_gpu_scanout_publish()==-1 && starts==1);
+ fg_busy=0;assert(fuxi_gpu_scanout_publish()==2 && fuxi_gpu_scanout_pending());
+ assert(fuxi_gpu_scanout_retry()==2 && starts==1); // same TE
+ intf[0x298/4]=(3u<<16)|2500;
+ assert(fuxi_gpu_scanout_retry()==2 && starts==1); // START busy
+ ctl[0x1c/4]=0;assert(fuxi_gpu_scanout_retry()==2 && starts==1); // write-line busy
+ intf[0x2b0/4]=2400;t=traceCount;
+ assert(fuxi_gpu_scanout_retry()==1 && starts==2 && !fg_scanout_front && !fuxi_gpu_scanout_pending());
+ assert(trace[t].pa==0xae05014 && trace[t].value==0xb8000000u);
+ assert(trace[t+1].pa==0xae16018 && trace[t+2].pa==0xae1601c);
+ // Complete copies may be ready with no dirty swaps/subscribers: timer has
+ // an independent pending query and a retry does not invent another frame.
+ assert(!fuxi_gpu_scanout_retry() && starts==2 && fg_scanout_retries>=4);
+ // Sample CURRENT_SRC0 read-only, at the 600-START cadence. It is unverified:
+ // mismatches count without driving ownership decisions.
+ for(unsigned i=0;i<2;i++) {
+  ctl[0x1c/4]=0;intf[0x298/4]+=1u<<16;
+  assert(fuxi_gpu_scanout_acquire()==1);fg_scanout_starts=599;
+  sspp[0xa4/4]=i?0:0xb8a00000u;
+  assert(fuxi_gpu_scanout_publish()==1);
+ }
+ assert(fg_scanout_current_match==1 && fg_scanout_current_mismatch==1);
+ for(unsigned i=0;i<traceCount;i++)assert(trace[i].pa!=0xae050a4);
+ // CPU fallback and black fill must first drain, keep fPixels=A and restore
+ // its complete image even when front=B. It stays single-buffer thereafter.
+ double_setup(panel);assert(fuxi_gpu_scanout_publish()==1);
+ memset(modelB,0x39,sizeof(modelB));memset(panel,0xcc,4320u*2400);
+ assert(!fuxi_gpu_scanout_cpu_acquire() && panel[0]==0xcc && fg_scanout_double_active);
+ ctl[0x1c/4]=0;intf[0x298/4]+=1u<<16;intf[0x2b0/4]=100;
+ assert(!fuxi_gpu_scanout_cpu_acquire() && panel[0]==0xcc);
+ intf[0x2b0/4]=2400;fg_busy=1;assert(!fuxi_gpu_scanout_cpu_acquire());fg_busy=0;
+ assert(fuxi_gpu_scanout_cpu_acquire()==1 && !fuxi_gpu_scanout_double() && !memcmp(panel,modelB,sizeof(modelB)));
+ assert(sspp[0x14/4]==0xb8000000u && (ctl[0x18/4]&1));
+ memset(panel,0,4320u*2400);assert(fuxi_gpu_scanout_publish()==1);
+ assert(!fuxi_gpu_scanout_acquire());ctl[0x1c/4]=0;intf[0x298/4]+=1u<<16;
+ assert(fuxi_gpu_scanout_acquire()==1 && !fuxi_gpu_scanout_double());
+ // Preserve a newer ready image, whether it is A or B, before a CPU
+ // partial update discards that unstarted frame.
+ for(unsigned front=0;front<2;front++) {
+  double_setup(panel);
+  if(front) {assert(fuxi_gpu_scanout_publish()==1);ctl[0x1c/4]=0;intf[0x298/4]+=1u<<16;}
+  assert(fuxi_gpu_scanout_acquire()==1);
+  memset(panel,front?0x77:0x11,4320u*2400);memset(modelB,front?0x11:0x77,sizeof(modelB));
+  fg_scanout_back_ready=1;
+  assert(fuxi_gpu_scanout_cpu_acquire()==1 && panel[0]==0x77 && panel[4320u*2400-1]==0x77);
+  assert(!fuxi_gpu_scanout_pending() && fg_scanout_ready_drops==1);
+ }
+ // Supplied 120.8Hz/7.3ms transfer: copy 626..1246us into back overlaps
+ // the transfer. Each next TE can START, without waiting to begin the copy.
+ double_setup(panel);fg_scanout_panel120_active=1;fg_scanout_period_us=8333;
+ assert(fuxi_gpu_scanout_publish()==1);
+ for(unsigned frame=1;frame<600;frame++) {
+  uint64_t began=ticks;intf[0x2b0/4]=100;
+  assert(fuxi_gpu_scanout_acquire()==1);
+  fg_busy=1;assert(fuxi_gpu_scanout_publish()==-1 && !fuxi_gpu_scanout_retry());
+  ticks=began+(frame&1?626:1246);fg_busy=0;
+  assert(fuxi_gpu_scanout_publish()==2);
+  ticks=began+7300;ctl[0x1c/4]=0;intf[0x2b0/4]=2400;
+  assert(fuxi_gpu_scanout_retry()==2); // transfer done, still same TE
+  ticks=began+8274;intf[0x298/4]+=1u<<16;
+  sspp[0xa4/4]=fg_scanout_front?0xb8000000u:0xb8a00000u;
+  assert(fuxi_gpu_scanout_retry()==1);
+  if(frame==598)assert(fg_scanout_iv[0]==598 && !fg_scanout_iv[1] && !fg_scanout_iv[2] && !fg_scanout_iv[3]);
+ }
+ assert(starts==600 && fg_scanout_current_match==1 && !fg_scanout_failed);
+ // Every new register access failure holds writes; stop restores A shadow
+ // before any future console handoff, with no speculative START.
+ const unsigned failures[]={0xae05014,0xae16018,0xae050a4};
+ for(unsigned i=0;i<3;i++) {
+  double_setup(panel);assert(fuxi_gpu_scanout_publish()==1);
+  ctl[0x1c/4]=0;intf[0x298/4]+=1u<<16;assert(fuxi_gpu_scanout_acquire()==1);
+  if(i==2)fg_scanout_starts=599;
+  if(i==0)failWriteAddress=failures[i];else failAddress=failures[i];
+  assert(fuxi_gpu_scanout_publish()==-1 && fg_scanout_failed && !fg_scanout_writable && !fuxi_gpu_scanout_pending());
+  if(i==2)assert(sspp[0x14/4]==0xb8000000u && (ctl[0x18/4]&1));
+ }
+ double_setup(panel);assert(fuxi_gpu_scanout_publish()==1);sspp[0x14/4]=0x12340000u;
+ assert(fuxi_gpu_scanout_acquire()==-1 && sspp[0x14/4]==0xb8000000u && starts==1);
+ double_setup(panel);assert(fuxi_gpu_scanout_publish()==1);failAddress=0xae05014;
+ assert(fuxi_gpu_scanout_acquire()==-1 && !fg_scanout_writable);
+ double_setup(panel);assert(fuxi_gpu_scanout_publish()==1);
+ fuxi_gpu_scanout_configure((uintptr_t)panel,0,0);
+ assert(fg_scanout_owned && fg_scanout_failed && sspp[0x14/4]==0xb8000000u && (ctl[0x18/4]&1));
+ assert(fuxi_gpu_scanout_acquire()==-1 && !fuxi_gpu_scanout_pending() && starts==1);
+ double_setup(panel);assert(fuxi_gpu_scanout_publish()==1);t=traceCount;
+ assert(fg_scanout_stop("modeled stop")==-1);
+ assert(trace[t].pa==0xae05014 && trace[t].value==0xb8000000u);
+ assert(trace[t+1].pa==0xae16018 && starts==1 && fuxi_gpu_scanout_acquire()==-1);
+ double_setup(panel);assert(fuxi_gpu_scanout_publish()==1);failAddress=0xae36298;
+ struct fg_te_observer failedTe={0};
+ assert(!fuxi_gpu_scanout_te(&failedTe) && fg_scanout_failed && sspp[0x14/4]==0xb8000000u);
+ reset();modelDouble=1;sspp[0x14/4]=0xb8a00000u;
+ fuxi_gpu_scanout_configure((uintptr_t)panel,1,0);assert(fuxi_gpu_scanout_acquire()==-1 && !starts);
+ assert(fg_scanout_owned && sspp[0x14/4]==0xb8000000u && (ctl[0x18/4]&1));
+ reset();modelDouble=1;failAddress=0xae05014;
+ fuxi_gpu_scanout_configure((uintptr_t)panel,1,0);assert(fuxi_gpu_scanout_acquire()==-1 && !starts);
+ reset();modelDouble=1;failBMap=1;fuxi_gpu_scanout_configure((uintptr_t)panel,1,0);
+ assert(!fuxi_gpu_scanout_acquire());ticks+=20000;assert(fuxi_gpu_scanout_acquire()==-1 && !starts);
+ puts("PASS: actual double ownership, initialization, overlap, deferred publish/TE/retirement, SRC0/flush/START order, sampling, CPU fallback and stop restoration");
+}
 int main(void) {
  te_estimator_tests();
  reset();assert(fuxi_gpu_scanout_acquire()==1 && fuxi_gpu_scanout_publish()==0);
@@ -365,6 +517,7 @@ int main(void) {
  ticks+=16667;intf[0x298/4]=(1200u<<16)|2500;fg_scanout_writable=1;ctl[0x1c/4]=0;
  assert(fuxi_gpu_scanout_publish()==1 && !fg_scanout_iv[0] && !fg_scanout_iv[1] && fg_scanout_starts%600==0);
  panel120_tests(panel);
+ double_tests(panel);
  free(source);free(panel);
  puts("PASS: actual scanout gate, delayed transfer/fence/START ordering, busy reservation, timeout/MMIO/AR fail-close, TE gate/stall fallback/window summary, full crop/alpha/tail pixel oracle");
 }
@@ -479,6 +632,50 @@ def main():
     with tempfile.TemporaryDirectory(prefix='fuxi-scanout-test-') as tmp:
         tmp = Path(tmp)
         compile_run(tmp, 'gate', PREFIX + display.TE_OBSERVER + inc + kick + TEST)
+        # Compile the exact USB screenshot request body; intercept the physical
+        # memcpy to assert its address and bounds without touching device memory.
+        probe = (ROOT / 'shim/fuxi-probe/probe.c').read_text()
+        body = probe.split('} else if (type == 0xc0 && req == 0x4e) {', 1)[1].split(
+            '} else if (type == 0xc0 && req == 0x4f)', 1)[0]
+        compile_run(tmp, 'screenshot', r"""
+#include <assert.h>
+#include <stdint.h>
+#include <stdbool.h>
+#include <stdio.h>
+static uint32_t base,pitch=4320,format=0x237ff;
+static uint64_t copiedFrom;static unsigned copiedBytes;
+static uint32_t usb_rd(unsigned block,unsigned offset) {
+ assert(block==0xae05000);return offset==0x14?base:offset==0x24?pitch:format;
+}
+static void mock_copy(void *dst,const void *src,unsigned n) {
+ (void)dst;copiedFrom=(uintptr_t)src;copiedBytes=n;
+}
+#define memcpy mock_copy
+static bool screenshot(uint64_t requestedOffset,unsigned length) {
+ uint8_t st[6]={0},data[512];unsigned n=0;bool ok=true;
+ uint16_t value=requestedOffset;st[4]=requestedOffset>>16;st[5]=requestedOffset>>24;
+ copiedFrom=copiedBytes=0;
+""" + body + r"""
+ return ok;
+}
+int main(void) {
+ const unsigned size=4320u*2400;
+ for(unsigned b=0;b<2;b++) {
+  base=b?0xb8a00000u:0xb8000000u;
+  assert(screenshot(123,1024) && copiedFrom==(uint64_t)base+123 && copiedBytes==512);
+  assert(screenshot(size-512,512) && copiedFrom==(uint64_t)base+size-512);
+  assert(screenshot(size,0) && !copiedBytes);
+  assert(!screenshot(size,1) && !copiedFrom && !copiedBytes);
+  assert(!screenshot(size-511,512) && !copiedFrom);
+  assert(!screenshot(size+1,0));
+ }
+ base=0xb9400000u;assert(!screenshot(0,512) && !copiedFrom);
+ base=0xb8000000u;pitch=1;assert(!screenshot(0,512));
+ pitch=4320;format=0;assert(!screenshot(0,512));
+ puts("PASS: actual USB screenshot request, current A/B base, one-frame bounds, pitch/format refusals and length cap");
+ return 0;
+}
+""")
         # Compile final production SweetSurface, including the reservation changes.
         source = (ROOT / 'xnu/fuxi-scanout/SweetSurface.cpp').read_text()
         declarations = source[source.index('struct sweet_gpu_backing'):source.index('static bool sweet_gpu_init')]
@@ -523,12 +720,23 @@ static void fuxi_gpu_scanout_release() {assert(reserved);reserved=false;}
  gpuMode=3;fb.swap(rec);prior=scanPublications;fb.vsyncFired(&fb,&timer);
  assert(fb.fDirty && !fb.fGpuPending && scanPublications==prior);
  gpuMode=-1;fb.vsyncFired(&fb,&timer);assert(fb.fDirty && scanPublications==prior);
- // CPU fallback is legal after acquisition and publishes only after stores.
- gpuMode=0;fb.vsyncFired(&fb,&timer);assert(!fb.fDirty && scanPublications==prior+1);
+ // CPU fallback cannot write until its distinct drain/restore guard grants A.
+ gpuMode=0;scanCpuAcquire=0;saved=pixels[0];unsigned cpuGuards=scanCpuAcquires;
+ fb.vsyncFired(&fb,&timer);assert(fb.fDirty && pixels[0]==saved && scanPublications==prior && scanCpuAcquires==cpuGuards+1);
+ scanCpuAcquire=1;fb.vsyncFired(&fb,&timer);assert(!fb.fDirty && scanPublications==prior+1);
  // Power-off is gated too; the completed black frame is explicitly sent once.
  fb.fPowerOff=true;fb.fFadeStep=0;scanAcquire=0;prior=scanPublications;
  pixels[0]=0x55;fb.vsyncFired(&fb,&timer);assert(pixels[0]==0x55 && !fb.fFadeStep && scanPublications==prior);
- scanAcquire=1;fb.vsyncFired(&fb,&timer);assert(!pixels[0] && fb.fFadeStep==1 && scanPublications==prior+1);
+ scanAcquire=1;scanCpuAcquire=0;fb.vsyncFired(&fb,&timer);
+ assert(pixels[0]==0x55 && !fb.fFadeStep && scanPublications==prior);
+ scanCpuAcquire=1;fb.vsyncFired(&fb,&timer);assert(!pixels[0] && fb.fFadeStep==1 && scanPublications==prior+1);
+ // A ready back buffer alone keeps demand polling alive and gets retried,
+ // even with no pending swap, GPU fence, blanking or vsync subscribers.
+ fb.fPowerOff=false;fb.fDirty=false;fb.fGpuPending=false;scanBackReady=true;
+ unsigned retries=scanRetries,beforeArms=arms;
+ assert(fb.presentWantedLocked());sweet_fb_rearm(&fb,&timer);assert(arms==beforeArms+1);
+ fb.vsyncFired(&fb,&timer);assert(scanRetries==retries+1);
+ scanBackReady=false;
  // Fast ownership polls must not produce extra 60 Hz notifications/counts.
  fb.fPowerOff=false;fb.fDirty=false;client.fPort=1;
  uint64_t notifications=client.notifications,count=fb.fVsyncCount;
@@ -550,6 +758,9 @@ static void fuxi_gpu_scanout_release() {assert(reserved);reserved=false;}
         arm = tmp / 'te-arm.c'
         arm.write_text('#include <stdint.h>\n' + display.TE_OBSERVER + '''
 #define FG_SCAN_INTF 0x0ae36000u
+#define FG_GUARD
+static unsigned fg_scanout_double_active;
+static int fg_scanout_stop(const char *reason) {(void)reason;return -1;}
 static unsigned fg_scanout_period_us=16667;
 int fuxi_gpu_scanout_owned(void);
 int fg_scanout_read(unsigned,unsigned *);
@@ -565,6 +776,9 @@ void nanoseconds_to_absolutetime(uint64_t,uint64_t *);
             ' teReads++;if(teUseEstimator)return model_scanout_te(te);te->edge=teEdge;')
         prefix += r'''
 #define FG_SCAN_INTF 0u
+#define FG_GUARD
+static unsigned fg_scanout_double_active;
+static int fg_scanout_stop(const char *reason) {(void)reason;return -1;}
 static unsigned fg_scanout_period_us=16667;
 static uint64_t panelOrigin,panelPeriod;
 static bool panelFrozen;

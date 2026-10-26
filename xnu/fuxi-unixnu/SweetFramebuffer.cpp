@@ -440,6 +440,9 @@ AppleCLCD::presentWantedLocked(void)
 		    (IOMobileFramebufferUserClient *)fClients->getObject(i);
 		if (client->fFunc[SWEET_FB_NOTIFY_VSYNC] && client->fPort != MACH_PORT_NULL) notify = true;
 	}
+#if defined(FUXI)
+ if (fScanout && fuxi_gpu_scanout_pending()) return true;
+#endif
 	return fuxi_unixnu_tick_wanted(fPowerOff, fFadeStep == 0, fDirty, fGpuPending, notify);
 }
 
@@ -472,7 +475,7 @@ sweet_fb_rearm(AppleCLCD *fb, IOTimerEventSource *sender)
   if (now >= fb->fNextTick)
    fb->fNextTick = fuxi_unixnu_next_tick(fb->fNextTick, fb->fTickAbs, now);
   uint64_t deadline = fb->fNextTick;
-  bool active = fb->fGpuPending || (!fb->fScanoutHeld &&
+  bool active = fb->fGpuPending || fuxi_gpu_scanout_pending() || (!fb->fScanoutHeld &&
       (fb->fPowerOff ? fb->fFadeStep == 0 : fb->fDirty));
   uint64_t poll = now + fb->fTickAbs/16;
   if (fb->fVsyncTE) {
@@ -536,6 +539,7 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
  uint64_t elapsed = 0;
  int completed = sweet_surface_gpu_poll(&elapsed);
  bool gpuBusy = completed == 0;
+ if (fb->fScanout && !gpuBusy) (void)fuxi_gpu_scanout_retry();
  if (gpuBusy) fb->fGpuBusyTicks++;
  if (fb->fGpuPending && completed) {
   fb->fGpuPending = false;
@@ -568,7 +572,7 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
  /* All framebuffer writers, including CPU fallback and black clear, share
   * the panel ownership guard. Keep the latest swap pending while draining. */
  if (fb->fScanout && (fb->fDirty || (fb->fPowerOff && fb->fFadeStep == 0))) {
-  int writable = fuxi_gpu_scanout_acquire();
+  int writable = fb->fPowerOff ? fuxi_gpu_scanout_cpu_acquire() : fuxi_gpu_scanout_acquire();
   if (writable != 1) {
    fb->fScanoutHeld = writable < 0;
    fb->fScanoutDefers++; /* ownership/drain poll, not a dropped frame or scheduler delay */
@@ -779,6 +783,14 @@ AppleCLCD::present(const uint8_t *rec)
 		if (src != 0 && bpe == 4) {
 			int copied = 0;
 #if defined(FUXI)
+            /* Keep CPU replay complete too if a full composed crop is available. */
+            if (fuxi_gpu_scanout_double() && (mask & (mask-1)) == 0 && sx >= dx && sy >= dy &&
+                (uint64_t)(sx-dx)+fWidth <= s->width && (uint64_t)(sy-dy)+fHeight <= s->height &&
+                ((uint64_t)(sx-dx)+fWidth)*4 <= s->bytesPerRow &&
+                (uint64_t)s->offset + ((uint64_t)(sy-dy)+fHeight-1)*s->bytesPerRow +
+                ((uint64_t)(sx-dx)+fWidth)*4 <= s->memory->getLength()) {
+             sx -= dx; sy -= dy; dx = dy = 0; w = fWidth; h = fHeight;
+            }
 			uint64_t copyStart = mach_absolute_time();
 			/* CA's composed frame has one layer. Preserve the CPU path for
 			 * multi-layer records rather than submit multiple fences per frame. */
@@ -792,11 +804,21 @@ AppleCLCD::present(const uint8_t *rec)
             }
 			if (copied == 2) {
              fScanoutPrepare = mach_absolute_time() - copyStart;
-             fScanoutBytes = (uint64_t)w * h * 4;
+             fScanoutBytes = fuxi_gpu_scanout_double() ? (uint64_t)1080 * 2400 * 4 : (uint64_t)w * h * 4;
 				fShadowValid = false;
 				gpuFrame = true;
 				fGpuPending = true;
 			}
+            if (copied != 2 && fScanout) {
+             int writable = fuxi_gpu_scanout_cpu_acquire();
+             if (writable != 1) {
+              fScanoutHeld = writable < 0;
+              fScanoutDefers++;
+              IOLockLock(fLock); fDirty = true; IOLockUnlock(fLock);
+              s->release();
+              return;
+             }
+            }
 			copyStart = mach_absolute_time();
 #endif
 			bool diffCopied = false;
