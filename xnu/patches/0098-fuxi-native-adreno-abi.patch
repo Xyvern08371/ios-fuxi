@@ -218,34 +218,36 @@
  #define rsr(r) ({ uint64_t v; __asm__ volatile("mrs %0, " r : "=r"(v)); v; })
  #define delay fg_delay
  static void fg_delay(unsigned us) { delay_for_interval(us, NSEC_PER_USEC); }
-+static unsigned fg_scanout_requested, fg_scanout_panel120_requested, fg_scanout_double_requested;
++static unsigned fg_scanout_requested, fg_scanout_panel120_requested, fg_scanout_double_requested, fg_scanout_triple_requested;
  struct fg_window { uint64_t pa, size; uintptr_t va; };
 -/* Disjoint apertures; the framebuffer is mapped by SweetFramebuffer only.
 +/* Disjoint apertures; framebuffer A is mapped by SweetFramebuffer.
   * Stage14 uses scratch, never stage15's panel readback/CPU comparator. */
  static struct fg_window fg_windows[] = {
   {0x100000,0x80000,0}, {0x3d00000,0x40000,0},
-@@ -47,6 +51,9 @@
+@@ -47,6 +51,10 @@
   {0xb280000,0x8000,0}, {0x81c60000,0x20000,0},
   {FG_SCRATCH,FG_SCRATCH_SIZE,0}, {0x9b098000,0x4000,0},
   {0xae04000,0x4000,0},
 + {0xae14000,0x4000,0}, {0xae34000,0x4000,0},
 + {0xb8a00000,0x9e4000,0}, /* reserved splash buffer B, fuxiscandouble=1 only */
++ {0xb9400000,0x9e4000,0}, /* reserved splash buffer C, fuxiscantriple=1 only */
 + {0xae94000,0x4000,0}, /* DSI0 command FIFO, fuxipanel120=1 only */
  };
  static uint64_t fg_mapped_bytes;
  /* io_map's 8 MiB submap and ALL ml_io_map variants use KMA_NOFAIL.
-@@ -82,6 +89,9 @@
+@@ -82,6 +90,10 @@
  {
   for (unsigned i = 0; i < sizeof(fg_windows)/sizeof(fg_windows[0]); i++) {
    struct fg_window *w = &fg_windows[i];
 +  if (!fg_scanout_requested && (w->pa == 0xae14000 || w->pa == 0xae34000)) continue;
 +  if (!fg_scanout_double_requested && w->pa == 0xb8a00000) continue;
++  if (!fg_scanout_triple_requested && w->pa == 0xb9400000) continue;
 +  if (!fg_scanout_panel120_requested && w->pa == 0xae94000) continue;
    kern_return_t kr = fg_map_window(w);
    if (kr != KERN_SUCCESS) {
     printf("FUXI GPU: map PA %#llx bytes %#llx failed %d, mapped %llu bytes, IO submap 0 bytes\n",
-@@ -95,17 +105,31 @@
+@@ -95,17 +107,31 @@
  static unsigned fg_access_failed;
  uint32_t probe_fault_esr;
  uint64_t probe_fault_far;
@@ -281,7 +283,7 @@
   if (!va || (pa & (wide ? 7 : 3))) return fg_access_failed = 1;
   unsigned bad = fuxi_gpu_access(va, v, wr, wide);
   if (bad) {
-@@ -135,17 +159,109 @@
+@@ -135,17 +161,109 @@
  }
  static const uint8_t *fg_firmware(unsigned which, unsigned *size)
  {
@@ -395,7 +397,7 @@
  /* Retain BOTH physical attempts, independently of the shared logical-call
   * report slot. Static storage only; no allocation or firmware in diagnostics. */
  static volatile struct {
-@@ -200,10 +316,14 @@
+@@ -200,10 +318,14 @@
  static ppnum_t fg_ppns[FG_SOURCE_BYTES/PAGE_SIZE+1];
  static volatile uint64_t *fg_l2(void)
  {
@@ -412,7 +414,7 @@
  static unsigned fg_started, fg_limit, fg_force, fg_seq;
  int fuxi_gpu_ready(void) { return __atomic_load_n(&fg_state, __ATOMIC_ACQUIRE) == 1; }
  static uint64_t fg_deadline, fg_submit_time;
-@@ -211,6 +331,7 @@
+@@ -211,6 +333,7 @@
  static int fg_expired(void) { return rsr("cntpct_el0") >= fg_deadline; }
  static void fg_fail(const char *reason, unsigned code)
  {
@@ -420,7 +422,7 @@
   __atomic_store_n(&fg_state, 2, __ATOMIC_RELEASE);
   printf("FUXI GPU: disabled permanently: %s (%#x), CPU present\n", reason, code);
  }
-@@ -237,7 +358,11 @@
+@@ -237,7 +360,11 @@
     if (fg_access(GPU_REG_BASE + 0x3c45*4, &v, 1, 0)) good = 0;
    }
   }
@@ -433,7 +435,7 @@
   delay(100);
   for (unsigned i = 0; i < 2; i++) {
    v = 2u << 16; (void)fg_access(GPU_SMMU_BASE + SMMU_S2CR(g3_slot[i]), &v, 1, 0);
-@@ -265,6 +390,7 @@
+@@ -265,6 +392,7 @@
   * new generation. No PFN scan or TLB invalidation on a cache hit. */
  int fuxi_gpu_unmap(unsigned slot, struct fg_times *t)
  {
@@ -441,7 +443,7 @@
   if (slot >= FG_CACHE_SLOTS || fg_busy) return 0;
   uint64_t start = mach_absolute_time();
   volatile uint64_t *l2 = fg_l2();
-@@ -285,10 +411,11 @@
+@@ -285,10 +413,11 @@
  int fuxi_gpu_map(unsigned slot, uint64_t generation, uintptr_t source,
      uint64_t length, struct fg_times *t)
  {
@@ -454,7 +456,7 @@
   volatile uint64_t *l2 = fg_l2();
   unsigned first = ((FG_SOURCE_VA >> 21) & 511) + slot*FG_SOURCE_L3;
   unsigned pages = (length+(source&4095)+4095)/4096;
-@@ -341,12 +468,15 @@
+@@ -341,12 +470,15 @@
   t->misses++;
   return 1;
  }
@@ -471,7 +473,7 @@
   if (SecureDTLookupEntry(NULL, "/chosen", &chosen) != kSuccess ||
       SecureDTGetProperty(chosen, "fuxi-gpu-memory", &prop, &bytes) != kSuccess ||
       bytes != 16 || ((uint64_t *)prop)[0] != FG_SCRATCH || ((uint64_t *)prop)[1] != FG_SCRATCH_SIZE) {
-@@ -359,7 +489,7 @@
+@@ -359,7 +491,7 @@
   }
   kern_return_t kr = fg_map_windows();
   if (kr != KERN_SUCCESS) { fg_fail("uncached mapping failed", kr); goto out; }
@@ -480,7 +482,7 @@
   if (h->magic != FG_MAGIC || h->version != 1 || h->bytes != sizeof(*h) || h->reserved ||
       h->base != FG_SCRATCH || h->size != FG_SCRATCH_SIZE) {
    fg_fail("missing/invalid cold firmware handoff", 3); goto out;
-@@ -367,7 +497,7 @@
+@@ -367,7 +499,7 @@
   for (unsigned i = 0; i < 3; i++) {
    unsigned n = h->fw_size[i];
    if (!n || n > FG_FW_SLOT || (n & 3) ||
@@ -489,7 +491,7 @@
     fg_fail("firmware size/checksum", i); goto out;
    }
   }
-@@ -385,15 +515,24 @@
+@@ -385,15 +517,25 @@
       "fence=%#x TRUST=%#x zap=%#x pixels=%#x\n", fg_limit == 13 ? 13 : 16,
       g_bank, g3_bank, g3_asid, g3_read(G3_FENCE_PA), g3_gr(0xf400),
       gpu_extra[13][2], gpu_extra[11][2]);
@@ -501,6 +503,7 @@
       g3_read(0xae05000) != (2400u<<16 | 1080u) || g3_read(0xae05030) != 0x237ff ||
       !g_map_at(G3_PT, &g3_next, G4_FB_VA, G4_FB_PA, (4320*2400+4095)&~4095u, 1u<<6) ||
 +     (fg_scanout_double_requested && !g_map_at(G3_PT, &g3_next, G4_FB_VA+0xa00000u, 0xb8a00000u, (4320*2400+4095)&~4095u, 1u<<6)) ||
++     (fg_scanout_triple_requested && !g_map_at(G3_PT, &g3_next, G4_FB_VA+0x1400000u, 0xb9400000u, (4320*2400+4095)&~4095u, 1u<<6)) ||
       !fg_source_tables()) { fg_fail("scanout geometry/mapping", 4); goto out; }
   uint32_t tlb[128] = {0};
   if (g4_tlb(tlb) || fg_access_failed) { fg_fail("initial TLB sync", 5); goto out; }
@@ -516,7 +519,7 @@
   out: return;
  }
  void fuxi_gpu_start(uint64_t fb, unsigned width, unsigned height, unsigned pitch)
-@@ -402,6 +541,22 @@
+@@ -402,6 +544,22 @@
   (void)PE_parse_boot_argn("fuxigpu", &enable, sizeof(enable));
   if (enable != 1 || fg_started) return;
   fg_started = 1; fg_limit = 17;
@@ -539,7 +542,7 @@
   (void)PE_parse_boot_argn("fuxigpu_stage", &fg_limit, sizeof(fg_limit));
   (void)PE_parse_boot_argn("fuxigpu_fail", &fg_force, sizeof(fg_force));
   if ((fg_limit != 13 && fg_limit != 16 && fg_limit != 17) ||
-@@ -455,12 +610,21 @@
+@@ -455,12 +613,21 @@
   * A completed fence wins over a late timer/deadline. */
  int fuxi_gpu_poll(struct fg_times *t)
  {
@@ -562,7 +565,7 @@
    return 1;
   }
   if (!err && !fg_expired()) return 0;
-@@ -468,6 +632,7 @@
+@@ -468,6 +635,7 @@
   /* Only fault containment has bounded register polling; no scheduler wait. */
   int drained = fg_isolate();
   fg_busy = 0;
@@ -570,7 +573,7 @@
   t->wait += mach_absolute_time()-fg_submit_time;
   return drained ? -1 : -2;
  }
-@@ -475,25 +640,44 @@
+@@ -475,25 +643,44 @@
      unsigned pitch, unsigned sx, unsigned sy, unsigned dx, unsigned dy,
      unsigned width, unsigned height, struct fg_times *t)
  {
@@ -606,19 +609,19 @@
   while ((pitch*stride) & 63) stride *= 2;
   /* XML has 15-bit dimensions; coordinates here are <2416 and strided pitch
    * <2^21. At most 16*32+128 <8192 words; the retired ring cannot be lapped. */
-+ if (fg_scanout_double_active && fg_scanout_back_ready) {
-+  fg_scanout_back_ready = 0;
-+  fg_scanout_ready_drops++;
++ if (fg_scanout_double_active) {
++  if (fg_scanout_back_ready && !fg_scanout_triple_requested) { fg_scanout_back_ready = 0; fg_scanout_ready_drops++; }
++  fg_scanout_copy = fg_scanout_target();
 + }
   g4_setup();
   for (unsigned y = 0; y < stride && y < height; y++)
    fg_rect(FG_SOURCE_VA+slot*FG_SOURCE_BYTES+(source&4095)+(sy+y)*pitch+sx*4,
 -      G4_FB_VA+(dy+y)*4320+dx*4, pitch, width, (height-1-y)/stride+1, stride);
-+      G4_FB_VA+(fg_scanout_double_active && !fg_scanout_front ? 0xa00000u : 0)+(dy+y)*4320+dx*4, pitch, width, (height-1-y)/stride+1, stride);
++      G4_FB_VA+(fg_scanout_double_active ? fg_scanout_copy*0xa00000u : 0)+(dy+y)*4320+dx*4, pitch, width, (height-1-y)/stride+1, stride);
   unsigned magic = ++fg_seq;
   if (!magic) magic = ++fg_seq;
   g4_end(G3_FENCE_VA+64, magic);
-@@ -505,11 +689,20 @@
+@@ -505,11 +692,20 @@
   t->submit += mach_absolute_time()-start;
   if (err || fg_access_failed) {
    fg_fail("present submit", err);
@@ -642,7 +645,7 @@
  #endif
 --- a/bsd/dev/fuxi_adreno.h
 +++ b/bsd/dev/fuxi_adreno.h
-@@ -2,19 +2,56 @@
+@@ -2,19 +2,57 @@
  #define FUXI_ADRENO_H
  #define FG_CACHE_SLOTS 4u
  /* Timings in mach absolute ticks, CPU uses scheduler runtime (excludes sleep).
@@ -687,6 +690,7 @@
 +int fuxi_gpu_scanout_retry(void);
 +int fuxi_gpu_scanout_pending(void);
 +int fuxi_gpu_scanout_double(void);
++int fuxi_gpu_scanout_triple(void);
 +int fuxi_gpu_scanout_cpu_acquire(void);
 +int fuxi_gpu_scanout_reserve(void);
 +void fuxi_gpu_scanout_release(void);
@@ -1216,7 +1220,7 @@
 +#endif
 --- a/bsd/dev/fuxi_gpu_scanout.inc
 +++ b/bsd/dev/fuxi_gpu_scanout.inc
-@@ -0,0 +1,673 @@
+@@ -0,0 +1,707 @@
 +/* SPDX-License-Identifier: MIT
 + * Copyright (c) 2026 NativeMetal contributors
 + * Ported from UniXNU drivers/NativeMetal/GpuScanoutClient.h (MIT).
@@ -1270,7 +1274,16 @@
 +static unsigned fg_scanout_double_active, fg_scanout_double_initialized, fg_scanout_front;
 +static unsigned fg_scanout_back_ready, fg_scanout_flips, fg_scanout_ready_drops, fg_scanout_retries;
 +static unsigned fg_scanout_current_match, fg_scanout_current_mismatch, fg_scanout_reentries;
-+static uintptr_t fg_scanout_pixels_b;
++static uintptr_t fg_scanout_pixels_b, fg_scanout_pixels_c;
++static unsigned fg_scanout_ready, fg_scanout_copy, fg_scanout_buffer_flips[3];
++static unsigned fg_scanout_target(void)
++{
++ for (unsigned i = 0; i < (fg_scanout_triple_requested ? 3u : 2u); i++)
++  if (i != fg_scanout_front && (!fg_scanout_back_ready || i != fg_scanout_ready)) return i;
++ return fg_scanout_front ^ 1u;
++}
++static unsigned fg_scanout_pa(unsigned buffer) { return 0xb8000000u + buffer*0xa00000u; }
++static uintptr_t fg_scanout_pixels_at(unsigned buffer) { return buffer == 2 ? fg_scanout_pixels_c : buffer ? fg_scanout_pixels_b : fg_scanout_pixels; }
 +static int fg_scanout_acquire(unsigned publication);
 +static int fg_scanout_stop(const char *reason);
 +
@@ -1287,8 +1300,10 @@
 + fg_scanout_checks = fg_scanout_requested && check == 1 ? 4 : 0;
 + if (fg_scanout_requested)
 +{
-+  unsigned drain = 0, te = 0, panel120 = 0, double_buffer = 0;
++  unsigned drain = 0, te = 0, panel120 = 0, double_buffer = 0, triple_buffer = 0;
 +  fg_scanout_double_requested = PE_parse_boot_argn("fuxiscandouble", &double_buffer, sizeof(double_buffer)) && double_buffer == 1;
++  unsigned triple = PE_parse_boot_argn("fuxiscantriple", &triple_buffer, sizeof(triple_buffer)) && triple_buffer == 1;
++  fg_scanout_triple_requested = fg_scanout_double_requested && triple;
 +  fg_scanout_panel120_requested = PE_parse_boot_argn("fuxipanel120", &panel120, sizeof(panel120)) && panel120 == 1;
 +  fg_scanout_te_mode = PE_parse_boot_argn("fuxiscante", &te, sizeof(te)) && te == 1;
 +  /* The TE gate needs no floor unless one is given explicitly. */
@@ -1653,12 +1668,13 @@
 +  return fg_scanout_stop("autorefresh changed");
 + if (fg_scanout_double_active) {
 +  unsigned src;
-+  if (!fg_scanout_read(0xae05014, &src) || src != (fg_scanout_front ? 0xb8a00000u : 0xb8000000u))
++  if (!fg_scanout_read(0xae05014, &src) || src != fg_scanout_pa(fg_scanout_front))
 +   return fg_scanout_stop("double SRC0 changed");
 + }
 + if (fg_busy) { fg_scanout_wait_ring++; return 0; }
 + if (fg_scanout_double_active && !publication) {
-+  if (fg_scanout_back_ready) return 0;
++  if (fg_scanout_back_ready && !fg_scanout_triple_requested) return 0;
++  fg_scanout_copy = fg_scanout_target();
 +  fg_scanout_writable = 1;
 +  return 1;
 + }
@@ -1715,10 +1731,18 @@
 +  if (!fg_scanout_pixels || !fg_scanout_pixels_b) return fg_scanout_stop("double buffer mapping");
 +  for (unsigned i = 0; i < 1080u*2400; i++)
 +   ((volatile uint32_t *)fg_scanout_pixels_b)[i] = ((const volatile uint32_t *)fg_scanout_pixels)[i];
++  if (fg_scanout_triple_requested) {
++   fg_scanout_pixels_c = fuxi_gpu_nc_pointer(0xb9400000u, 4320u*2400);
++   if (!fg_scanout_pixels_c) return fg_scanout_stop("triple buffer mapping");
++   for (unsigned i = 0; i < 1080u*2400; i++)
++    ((volatile uint32_t *)fg_scanout_pixels_c)[i] = ((const volatile uint32_t *)fg_scanout_pixels)[i];
++  }
 +  fg_scanout_double_initialized = fg_scanout_double_active = 1;
-+  printf("FUXI SCANOUT: double=1 A=0xb8000000 B=0xb8a00000 full_copy=1 flush=RMW|1\n");
++  printf("FUXI SCANOUT: double=1 A=0xb8000000 B=0xb8a00000 full_copy=1 flush=RMW|1%s\n",
++      fg_scanout_triple_requested ? " triple=1 C=0xb9400000" : "");
 + }
 + __asm__ volatile("dsb sy" ::: "memory");
++ if (!publication && fg_scanout_double_active) fg_scanout_copy = fg_scanout_target();
 + fg_scanout_writable = 1;
 + return 1;
 +}
@@ -1736,6 +1760,10 @@
 +{
 + return fg_scanout_double_active && !fg_scanout_failed;
 +}
++int fuxi_gpu_scanout_triple(void)
++{
++ return fg_scanout_double_active && fg_scanout_triple_requested && !fg_scanout_failed;
++}
 +int fuxi_gpu_scanout_pending(void)
 +{
 + return fg_scanout_back_ready && !fg_scanout_failed;
@@ -1747,9 +1775,10 @@
 + FG_GUARD;
 + int writable = fg_scanout_acquire(1);
 + if (writable != 1 || !fg_scanout_double_active) return writable;
-+ if (fg_scanout_front ^ fg_scanout_back_ready) {
++ unsigned newest = fg_scanout_back_ready ? (fg_scanout_triple_requested ? fg_scanout_ready : fg_scanout_front ^ 1u) : fg_scanout_front;
++ if (newest) {
 +  for (unsigned i = 0; i < 1080u*2400; i++)
-+   ((volatile uint32_t *)fg_scanout_pixels)[i] = ((const volatile uint32_t *)fg_scanout_pixels_b)[i];
++   ((volatile uint32_t *)fg_scanout_pixels)[i] = ((const volatile uint32_t *)fg_scanout_pixels_at(newest))[i];
 + }
 + if (!fg_scanout_address(0xb8000000u)) return fg_scanout_stop("CPU restore A");
 + if (fg_scanout_back_ready) fg_scanout_ready_drops++;
@@ -1777,13 +1806,14 @@
 +  return fg_scanout_stop("publish transfer status");
 + __asm__ volatile("dsb sy" ::: "memory");
 + fg_scanout_writable = 0;
-+ if (fg_scanout_double_active && !fg_scanout_address(fg_scanout_front ? 0xb8000000u : 0xb8a00000u))
++ if (fg_scanout_double_active && !fg_scanout_address(fg_scanout_pa(fg_scanout_triple_requested ? fg_scanout_ready : fg_scanout_front ^ 1u)))
 +  return fg_scanout_stop("double SRC0 flush");
 + if (!fg_scanout_write(FG_SCAN_CTL+0x1c, 1)) return fg_scanout_stop("start transfer");
 + fg_scanout_stamps.previous_start = fg_scanout_stamps.start;
 + fg_scanout_stamps.start = mach_absolute_time();
 + if (fg_scanout_double_active) {
-+  fg_scanout_front ^= 1;
++  fg_scanout_front = fg_scanout_triple_requested ? fg_scanout_ready : fg_scanout_front ^ 1u;
++  fg_scanout_buffer_flips[fg_scanout_front]++;
 +  fg_scanout_back_ready = 0;
 +  fg_scanout_flips++;
 + }
@@ -1811,12 +1841,16 @@
 +      fg_scanout_drain_us, fg_scanout_te_mode, te_dhz/10, te_dhz%10,
 +      fg_scanout_iv[0], fg_scanout_iv[1], fg_scanout_iv[2], fg_scanout_iv[3]);
 +  if (fg_scanout_double_active) {
-+   unsigned current, expected = fg_scanout_front ? 0xb8a00000u : 0xb8000000u;
++   unsigned current, expected = fg_scanout_pa(fg_scanout_front);
 +   if (!fg_scanout_read(0xae050a4, &current)) return fg_scanout_stop("read current SRC0");
 +   if (current == expected) fg_scanout_current_match++; else fg_scanout_current_mismatch++;
-+   printf("FUXI SCANOUT: double=1 flips=%u back_ready_drops=%u publish_retries=%u current_src0=%#x expected=%#x match=%u mismatch=%u\n",
++   char triple[128] = {0};
++   if (fg_scanout_triple_requested) snprintf(triple, sizeof(triple), " triple=1 flips_a=%u flips_b=%u flips_c=%u drops=%u",
++       fg_scanout_buffer_flips[0], fg_scanout_buffer_flips[1], fg_scanout_buffer_flips[2], fg_scanout_ready_drops);
++   printf("FUXI SCANOUT: double=1 flips=%u back_ready_drops=%u publish_retries=%u current_src0=%#x expected=%#x match=%u mismatch=%u%s\n",
 +       fg_scanout_flips, fg_scanout_ready_drops, fg_scanout_retries, current, expected,
-+       fg_scanout_current_match, fg_scanout_current_mismatch);
++       fg_scanout_current_match, fg_scanout_current_mismatch, triple);
++   fg_scanout_buffer_flips[0] = fg_scanout_buffer_flips[1] = fg_scanout_buffer_flips[2] = 0;
 +   fg_scanout_flips = fg_scanout_ready_drops = fg_scanout_retries = 0;
 +  }
 +  fg_scanout_wait_ring = fg_scanout_wait_floor = fg_scanout_wait_xfer = fg_scanout_wait_te = 0;
@@ -1833,7 +1867,11 @@
 + if (!fuxi_gpu_scanout_owned()) return 0;
 + FG_GUARD;
 + if (fg_scanout_failed || fg_busy || !fg_scanout_writable) return -1;
-+ if (fg_scanout_double_active) fg_scanout_back_ready = 1;
++ if (fg_scanout_double_active) {
++  if (fg_scanout_back_ready && fg_scanout_triple_requested) fg_scanout_ready_drops++;
++  fg_scanout_ready = fg_scanout_triple_requested ? fg_scanout_copy : fg_scanout_front ^ 1u;
++  fg_scanout_back_ready = 1;
++ }
 + return fg_scanout_publish();
 +}
 +int fuxi_gpu_scanout_retry(void)
@@ -1877,7 +1915,7 @@
 + for (unsigned y = 0; y < fg_scanout_h; y++) {
 +  const uint32_t *src = (const uint32_t *)(fg_scanout_source +
 +      (uint64_t)(fg_scanout_sy+y)*fg_scanout_pitch + fg_scanout_sx*4);
-+  const volatile uint32_t *dst = (const volatile uint32_t *)((fg_scanout_double_active && !fg_scanout_front ? fg_scanout_pixels_b : fg_scanout_pixels) +
++  const volatile uint32_t *dst = (const volatile uint32_t *)(fg_scanout_pixels_at(fg_scanout_double_active ? (fg_scanout_triple_requested ? fg_scanout_copy : fg_scanout_front ^ 1u) : 0) +
 +      (uint64_t)(fg_scanout_dy+y)*4320 + fg_scanout_dx*4);
 +  for (unsigned x = 0; x < fg_scanout_w; x++) if (src[x] != dst[x]) {
 +   if (!mismatch) { first_x = x; first_y = y; }

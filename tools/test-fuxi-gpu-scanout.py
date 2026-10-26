@@ -27,13 +27,21 @@ PREFIX = r'''
 #include <stdint.h>
 #include <stdlib.h>
 #include <stdio.h>
+#include <stdarg.h>
 #include <string.h>
+static char doubleStats[512];
+static int scanout_printf(const char *format,...) {
+ va_list args;va_start(args,format);
+ if(strstr(format,"double=1 flips="))vsnprintf(doubleStats,sizeof(doubleStats),format,args);
+ va_end(args);return 0;
+}
+#define printf scanout_printf
 #define FG_GUARD
 typedef int boolean_t;
 #define FALSE 0
 static int interruptsOn=1;
 static boolean_t ml_set_interrupts_enabled(boolean_t value) {int old=interruptsOn;interruptsOn=value;return old;}
-static unsigned fg_scanout_requested, fg_scanout_panel120_requested, fg_scanout_double_requested, fg_busy, fg_client_busy;
+static unsigned fg_scanout_requested, fg_scanout_panel120_requested, fg_scanout_double_requested, fg_scanout_triple_requested, fg_busy, fg_client_busy;
 static unsigned ready=1,abiLive=1,abiResult,observations,reads,writes,starts,failAddress;
 static uint64_t ticks=1000,machScale=1;
 static uint64_t mach_absolute_time(void) {return ticks*machScale;}
@@ -45,17 +53,19 @@ static unsigned traceCount,dsiReads,dmaStarts,pendingDma,noDone,busyAfterDone,st
 static unsigned errorOnDone,tearReadbackMismatch;
 static volatile uint32_t *fuxi_ctl0=ctl,*fuxi_intf1=intf;
 static int fuxi_gpu_ready(void) {return ready;}
-static unsigned modelDrain,modelTe,modelPanel120,modelDouble;
-static uint8_t modelB[4320u*2400];
-static unsigned failBMap;
+static unsigned modelDrain,modelTe,modelPanel120,modelDouble,modelTriple,parseDouble,parseTriple;
+static uint8_t modelB[4320u*2400],modelC[4320u*2400];
+static unsigned failBMap,failCMap;
 static uintptr_t fuxi_gpu_nc_pointer(uint64_t pa,uint64_t size) {
- assert(pa==0xb8a00000u && size==4320u*2400);return failBMap?0:(uintptr_t)modelB;
+ assert((pa==0xb8a00000u || pa==0xb9400000u) && size==4320u*2400);
+ return pa==0xb9400000u?(failCMap?0:(uintptr_t)modelC):(failBMap?0:(uintptr_t)modelB);
 }
 static unsigned fg_scanout_owned_for_model(void);
 static unsigned fg_scanout_double_for_model(void);
 static int PE_parse_boot_argn(const char *name,void *value,int size) {
+ if(!strcmp(name,"fuxiscandouble"))parseDouble++;if(!strcmp(name,"fuxiscantriple"))parseTriple++;
  unsigned v=!strcmp(name,"fuxiscante")?modelTe:!strcmp(name,"fuxiscandrain")?modelDrain:
-     !strcmp(name,"fuxipanel120")?modelPanel120:!strcmp(name,"fuxiscandouble")?modelDouble:0;
+     !strcmp(name,"fuxipanel120")?modelPanel120:!strcmp(name,"fuxiscandouble")?modelDouble:!strcmp(name,"fuxiscantriple")?modelTriple:0;
  if(!v || size<4)return 0;*(unsigned *)value=v;return 1;
 }
 static int fg_abi_live_for_scanout(void) {return abiLive;}
@@ -112,6 +122,9 @@ static unsigned fg_scanout_double_for_model(void) {return fg_scanout_double_acti
 static void reset(void) {
  memset(sspp,0,sizeof(sspp));sspp[0x14/4]=0xb8000000u;
  fg_scanout_double_requested=fg_scanout_double_active=fg_scanout_double_initialized=fg_scanout_front=0;
+ parseDouble=parseTriple=0;
+ fg_scanout_triple_requested=modelTriple=failCMap=fg_scanout_ready=fg_scanout_copy=0;
+ memset(fg_scanout_buffer_flips,0,sizeof(fg_scanout_buffer_flips));
  fg_scanout_back_ready=fg_scanout_flips=fg_scanout_ready_drops=fg_scanout_retries=0;
  fg_scanout_current_match=fg_scanout_current_mismatch=modelDouble=failBMap=0;
  memset(ctl,0,sizeof(ctl));memset(intf,0,sizeof(intf));memset(dsi,0,sizeof(dsi));intf[0x2b4/4]=0x80000001u;
@@ -309,6 +322,76 @@ static void double_setup(uint8_t *panel) {
  intf[0x298/4]=(2u<<16)|2500;
  assert(fuxi_gpu_scanout_acquire()==1 && fuxi_gpu_scanout_double());
  assert(!memcmp(panel,modelB,sizeof(modelB)) && !fg_scanout_front);
+}
+static void triple_setup(uint8_t *panel) {
+ reset();modelDouble=modelTriple=modelTe=1;intf[0x2b0/4]=2400;
+ fuxi_gpu_scanout_configure((uintptr_t)panel,1,0);
+ assert(!fuxi_gpu_scanout_acquire());intf[0x298/4]=(1u<<16)|2500;
+ assert(fuxi_gpu_scanout_acquire()==1 && fuxi_gpu_scanout_triple());
+ assert(!memcmp(panel,modelB,sizeof(modelB)) && !memcmp(panel,modelC,sizeof(modelC)));
+}
+static void triple_tests(uint8_t *panel) {
+ for(unsigned d=0;d<3;d++)for(unsigned t=0;t<3;t++) {
+  reset();modelDouble=d;modelTriple=t;fuxi_gpu_scanout_configure((uintptr_t)panel,1,0);
+  assert(fg_scanout_triple_requested==(d==1 && t==1) && parseDouble==1 && parseTriple==1);
+ }
+ reset();modelDouble=modelTriple=1;failCMap=1;fuxi_gpu_scanout_configure((uintptr_t)panel,1,0);
+ assert(!fuxi_gpu_scanout_acquire());ticks+=20000;assert(fuxi_gpu_scanout_acquire()==-1 && !starts);
+ triple_setup(panel);assert(fg_scanout_copy==1 && fuxi_gpu_scanout_publish()==1 && fg_scanout_front==1);
+ // B transfers: ready A, then copy into C without waiting for A's START.
+ ctl[0x1c/4]=1;intf[0x2b0/4]=100;
+ assert(fuxi_gpu_scanout_acquire()==1 && fg_scanout_copy==0);
+ assert(fuxi_gpu_scanout_publish()==2 && fg_scanout_ready==0 && !fg_scanout_ready_drops);
+ assert(fuxi_gpu_scanout_acquire()==1 && fg_scanout_copy==2 && fg_scanout_front==1);
+ fg_busy=1;assert(!fuxi_gpu_scanout_retry() && fuxi_gpu_scanout_publish()==-1 && starts==1);
+ fg_busy=0;assert(fuxi_gpu_scanout_publish()==2 && fg_scanout_ready==2 && fg_scanout_ready_drops==1);
+ assert(fuxi_gpu_scanout_acquire()==1 && fg_scanout_copy==0); // replaced A is free again
+ assert(fuxi_gpu_scanout_retry()==2);intf[0x298/4]+=1u<<16;
+ assert(fuxi_gpu_scanout_retry()==2);ctl[0x1c/4]=0;assert(fuxi_gpu_scanout_retry()==2);
+ intf[0x2b0/4]=2400;unsigned before=traceCount;
+ assert(fuxi_gpu_scanout_retry()==1 && fg_scanout_front==2 && starts==2);
+ assert(trace[before].pa==0xae05014 && trace[before].value==0xb9400000u);
+ assert(trace[before+1].pa==0xae16018 && trace[before+2].pa==0xae1601c);
+ // Exercise every front/ready combination, replacement, and pixel oracle.
+ for(unsigned n=0;n<12;n++) {
+  assert(fuxi_gpu_scanout_acquire()==1);unsigned target=fg_scanout_copy;
+  assert(target!=fg_scanout_front);
+  fg_scanout_source=(uintptr_t)(target ? panel : modelB);fg_scanout_pitch=4320;fg_scanout_sx=fg_scanout_sy=fg_scanout_dx=fg_scanout_dy=0;
+  fg_scanout_w=1080;fg_scanout_h=2400;fg_scanout_checks=4;fg_scanout_checked=0;
+  memset(panel,0x51,sizeof(modelB));memset(modelB,0x51,sizeof(modelB));memset(modelC,0x51,sizeof(modelC));
+  assert(fg_scanout_verify());((uint8_t *)fg_scanout_pixels_at(target))[0]^=1;assert(!fg_scanout_verify());
+  assert(fuxi_gpu_scanout_publish()==2);
+  assert(fuxi_gpu_scanout_acquire()==1 && fg_scanout_copy!=fg_scanout_front && fg_scanout_copy!=target);
+  assert(fuxi_gpu_scanout_publish()==2 && fg_scanout_ready_drops==n+2);
+  ctl[0x1c/4]=0;intf[0x2b0/4]=2400;intf[0x298/4]+=1u<<16;
+  assert(fuxi_gpu_scanout_retry()==1);
+ }
+ assert(fuxi_gpu_scanout_acquire()==1 && fg_scanout_copy==0);assert(fuxi_gpu_scanout_publish()==2);
+ ctl[0x1c/4]=0;intf[0x298/4]+=1u<<16;assert(fuxi_gpu_scanout_retry()==1);
+ assert(fg_scanout_buffer_flips[0] && fg_scanout_buffer_flips[1] && fg_scanout_buffer_flips[2] && parseDouble==1 && parseTriple==1);
+ unsigned flips=fg_scanout_flips,drops=fg_scanout_ready_drops;
+ assert(fuxi_gpu_scanout_acquire()==1);assert(fuxi_gpu_scanout_publish()==2);
+ ctl[0x1c/4]=0;intf[0x298/4]+=1u<<16;fg_scanout_starts=599;
+ sspp[0xa4/4]=fg_scanout_pa(fg_scanout_ready);
+ assert(fuxi_gpu_scanout_retry()==1 && fg_scanout_current_match==1);
+ char expected[80];snprintf(expected,sizeof(expected),"flips=%u back_ready_drops=%u",flips+1,drops);
+ assert(strstr(doubleStats,expected) && strstr(doubleStats," triple=1 flips_a=") && strstr(doubleStats," flips_b=") && strstr(doubleStats," flips_c=") && strstr(doubleStats," drops="));
+ assert(!fg_scanout_flips && !fg_scanout_ready_drops && !fg_scanout_buffer_flips[0] && !fg_scanout_buffer_flips[1] && !fg_scanout_buffer_flips[2]);
+ // CPU preserves the newest ready image, including C, only after transfer drain.
+ for(unsigned front=0;front<3;front++)for(unsigned ready=0;ready<4;ready++)if(front!=ready) {
+  triple_setup(panel);fg_scanout_front=front;sspp[0x14/4]=fg_scanout_pa(front);
+  fg_scanout_ready=ready;fg_scanout_back_ready=ready<3;
+  memset((void *)fg_scanout_pixels_at(ready<3?ready:front),0x73,sizeof(modelB));
+  fg_busy=1;assert(!fuxi_gpu_scanout_cpu_acquire());fg_busy=0;
+  ctl[0x1c/4]=1;assert(!fuxi_gpu_scanout_cpu_acquire());ctl[0x1c/4]=0;
+  assert(fuxi_gpu_scanout_cpu_acquire()==1 && panel[0]==0x73 && panel[sizeof(modelB)-1]==0x73);
+  assert(!fuxi_gpu_scanout_triple() && !fuxi_gpu_scanout_pending() && sspp[0x14/4]==0xb8000000u);
+  assert(fuxi_gpu_scanout_publish()==1);assert(fuxi_gpu_scanout_acquire()==1 && fuxi_gpu_scanout_triple() && !fg_scanout_front);
+ }
+ triple_setup(panel);fg_scanout_front=2;sspp[0x14/4]=0xb9400000u;
+ unsigned saved=starts;assert(fg_scanout_stop("triple stop")==-1);
+ assert(sspp[0x14/4]==0xb8000000u && starts==saved && fuxi_gpu_scanout_acquire()==-1);
+ puts("PASS: triple opt-in, C mapping/init, free/ready/front rotation, newest-ready replacement at retire, fence/TE/transfer/flush/START order, pixel oracle, CPU preservation/re-entry and stop");
 }
 static void double_tests(uint8_t *panel) {
  for(unsigned option=0;option<3;option++) {
@@ -522,6 +605,7 @@ int main(void) {
  ticks+=16667;intf[0x298/4]=(1200u<<16)|2500;fg_scanout_writable=1;ctl[0x1c/4]=0;
  assert(fuxi_gpu_scanout_publish()==1 && !fg_scanout_iv[0] && !fg_scanout_iv[1] && fg_scanout_starts%600==0);
  panel120_tests(panel);
+ triple_tests(panel);
  double_tests(panel);
  free(source);free(panel);
  puts("PASS: actual scanout gate, delayed transfer/fence/START ordering, busy reservation, timeout/MMIO/AR fail-close, TE gate/stall fallback/window summary, full crop/alpha/tail pixel oracle");
@@ -663,8 +747,8 @@ static bool screenshot(uint64_t requestedOffset,unsigned length) {
 }
 int main(void) {
  const unsigned size=4320u*2400;
- for(unsigned b=0;b<2;b++) {
-  base=b?0xb8a00000u:0xb8000000u;
+ for(unsigned b=0;b<3;b++) {
+  base=0xb8000000u+b*0xa00000u;
   assert(screenshot(123,1024) && copiedFrom==(uint64_t)base+123 && copiedBytes==512);
   assert(screenshot(size-512,512) && copiedFrom==(uint64_t)base+size-512);
   assert(screenshot(size,0) && !copiedBytes);
@@ -672,10 +756,10 @@ int main(void) {
   assert(!screenshot(size-511,512) && !copiedFrom);
   assert(!screenshot(size+1,0));
  }
- base=0xb9400000u;assert(!screenshot(0,512) && !copiedFrom);
+ base=0xb9e00000u;assert(!screenshot(0,512) && !copiedFrom);
  base=0xb8000000u;pitch=1;assert(!screenshot(0,512));
  pitch=4320;format=0;assert(!screenshot(0,512));
- puts("PASS: actual USB screenshot request, current A/B base, one-frame bounds, pitch/format refusals and length cap");
+ puts("PASS: actual USB screenshot request, current A/B/C base, one-frame bounds, pitch/format refusals and length cap");
  return 0;
 }
 """)

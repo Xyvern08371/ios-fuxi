@@ -1176,7 +1176,7 @@ ud_setup(void)
         const uint64_t size=1080ULL*2400*4;
         n=length > 512 ? 512 : length;
         uint32_t base=usb_rd(0xae05000,0x14);
-        if (off>size || n>size-off || (base!=0xb8000000 && base!=0xb8a00000) ||
+        if (off>size || n>size-off || (base!=0xb8000000 && base!=0xb8a00000 && base!=0xb9400000) ||
             usb_rd(0xae05000,0x24)!=4320 || usb_rd(0xae05000,0x30)!=0x237ff)
             ok=false;
         else memcpy(data,(const void *)(uintptr_t)((uint64_t)base+off),n);

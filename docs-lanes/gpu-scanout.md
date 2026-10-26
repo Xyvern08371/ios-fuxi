@@ -1087,3 +1087,109 @@ only changed patch; regenerated **0098**/**0108** and checked **0100** are
 unchanged. Native `.mm` queue/lease tests are inspected but cannot compile/run
 on Linux; macOS compilation/execution, full kernel link and device performance
 remain unverified. No device access, deployment, push or workflow run occurred.
+
+## Opt-in triple scanout (`fuxiscantriple=1`, default off)
+
+2026-10-27. **Triple-buffer device results: not yet observed.** The supplied
+HEAD double-buffer run reports TE 120.8 Hz (8.27 ms), approximately 7.3 ms
+command-mode transfers and 650 us full-frame GPU copy retirement. Its stage
+line is `swap_ready_us=16889 ready_present_us=9740/48050
+present_submit_us=663 submit_fence_us=649 fence_start_us=5694
+start_start_us=21368`; pacing reports `blocked_publication=5592 acquire=0
+ring=261` per 600 shown frames. About nine publication refusals per shown
+frame, approximately 43 shown/s with all frames shown, and approximately 25%
+GPU busy describe that preceding kernel. They are not results of this option.
+
+Enable **`fuxiscantriple=1 fuxiscandouble=1`**, retaining the existing
+`fuxigpuscanout=1 sweetfb_noconsole=1` and GPU/ABI setup. Only exact value 1
+is admitted, parsed once at configuration; triple is ineffective without
+exact double opt-in. With triple absent, single/double behavior and log forms
+stay unchanged. TE, panel120, drain floor and notification options keep their
+existing meanings; triple does not bypass any START gate.
+
+C is PA **0xb9400000**, GPU VA **`G4_FB_VA+0x1400000`** (0x42400000).
+Its 0x9e3400-byte image ends at **0xb9de3400** exclusive, within the existing
+44 MiB splash reservation 0xb8000000..0xbaafffff, outside XNU RAM. The
+fallible NC window is 0x9e4000 bytes, and GPU page-table attributes are the
+same `1u<<6` as A/B. C is mapped only for triple; after inherited transfer
+drain it is initialized from A with aligned volatile words like B. All GPU
+copies still expand to complete panel crops.
+
+The last STARTed buffer is front, including throughout its transfer. A
+retired copy is ready until START. The remaining buffer is free. A new GPU
+copy can target free while another image is ready, so copying N+1 no longer
+waits for N's START. The target excludes both front and ready. If the new
+copy retires first, it replaces the older ready image, returns that image's
+buffer to free, and counts one drop. Submission or failed copy retirement
+never replaces the ready image. There remains only one GPU copy in flight;
+START is excluded throughout it. Once retired, publication still requires
+previous-transfer idle, the unchanged TE/floor gate, SRC0 then RMW flush then
+DSB before START. Only successful START changes front. This favors the newest
+completed image and can intentionally drop copied frames under load.
+
+CLCD attempts publication first and, in triple mode with the display on,
+continues to next-copy admission while an image is ready. The existing
+`blocked_publication` counter counts actual admission refusals, so this overlap
+no longer increments it; acquisition/ring refusals keep their existing counters.
+The waiting FIFO remains three records; there can additionally be one active
+copy and one consumed/unshown image. That ready image retains only its swap ID,
+copy duration and stage stamps, independently of the active/redraw record.
+Source display holds and mode 0 complete only after CPU reads or GPU copy/cache
+retirement. Mode 1 completes at START, or returns Aborted for a replaced ready
+swap; previously shown IDs retain their successful status during redraw.
+Drain modes, live history protection, stopped ownership and quarantine remain.
+Pending publication metadata keeps the demand timer active through low-level
+stop cleanup. Shown-stage timing uses the ready image's saved copy stamps even
+if a newer copy has failed; the current GPU's stamps cannot replace them.
+
+CPU fallback and black fill first drain both GPU and display with the existing
+single-buffer gate, preserve the newest retired image (ready, otherwise front)
+in A, restore SRC0=A plus flush, and suspend flips. The next GPU acquisition
+re-enters with A front and B/C available. Stop, disable and MMIO failures keep
+the existing hold-until-reboot policy and attempt A restoration, including when
+C was front. Restoring the address does not permit framebuffer writes while
+DMA/transfer ownership is uncertain. Probe request **0x4e** accepts A/B/C from
+one SRC0 snapshot and retains its pitch/format, 512-byte and one-frame bounds;
+a multi-request screenshot can still span flips.
+
+The initialization line appends `triple=1 C=0xb9400000`. The existing double
+summary, at each 600-START sample while flips are active, appends exactly:
+
+```text
+triple=1 flips_a=N flips_b=N flips_c=N drops=N
+```
+
+`flips_a`, `flips_b`, `flips_c` count successful STARTs targeting each buffer;
+`drops` equals `back_ready_drops` (newest-ready replacement or CPU discard).
+They reset alongside the existing flip/drop/retry counters. There is no new
+per-frame logging. Existing `current_src0`, `expected`, `match`, `mismatch`,
+stage, pacing, copy and TE diagnostics retain their meanings.
+
+Host coverage extends `test-fuxi-gpu-scanout.py`,
+`test-fuxi-adreno-mapping.py`, `test-fuxi-adreno.py` and
+`test-fuxi-unixnu.py`: exact opt-in/dependency, optional/fallible C mappings,
+all front/ready target combinations decoded from actual PM4, full-frame pixels,
+replacement only at retirement, transfer/TE/fence/SRC0/flush/START ordering,
+per-buffer summary/reset, CPU newest-image preservation/re-entry, stop/restore,
+A/B/C screenshot bounds, source holds and SwapWait drop/show/drain semantics,
+failed-copy replay and publication-stage isolation. Generated patches changed
+are **0098** (GPU sources/header/include) and **0106** (framebuffer); regenerated
+**0108** is unchanged. The loader uses the canonical probe source directly.
+
+Risks still require device qualification: C access and SSPP address latching,
+cache visibility and DSC/image integrity, CPU/blank/wake/fault transitions,
+latest-ready drops and mode-1 callers, polling jitter and compositor/ring
+contention. Removing the publication dependency does not guarantee 60 or 120
+shown frames/s. No phone access, deployment, firmware download, external
+Mesa/translator modification, push or workflow run is part of this revision.
+
+Validation: scanout, Adreno mapping/PM4/cache, unixnu, IOSurface, Metal ABI,
+host import, GPU K1, portable Metal frontend, Metal frame trace, software-ICD
+Metal backend, loader GPU probe and unixnu port2 host suites pass, with
+ASan/UBSan where enabled. All twelve `tools/sync-fuxi-*.py --check` commands
+pass. Complete GPU, surface, framebuffer, console, vfs and UFS translation
+units pass syntax checks against saved XNU headers. The additional Metal
+overlap runner cannot start without an installed `glslangValidator`; no shader
+compiler was downloaded. Native Objective-C frontend execution is skipped on
+Linux. Full kernel link, native frontend and device performance remain
+unverified.

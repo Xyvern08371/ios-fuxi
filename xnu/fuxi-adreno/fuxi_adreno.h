@@ -42,6 +42,7 @@ int fuxi_gpu_scanout_publish(void);
 int fuxi_gpu_scanout_retry(void);
 int fuxi_gpu_scanout_pending(void);
 int fuxi_gpu_scanout_double(void);
+int fuxi_gpu_scanout_triple(void);
 int fuxi_gpu_scanout_cpu_acquire(void);
 int fuxi_gpu_scanout_reserve(void);
 void fuxi_gpu_scanout_release(void);

@@ -300,11 +300,12 @@ static void nanoseconds_to_absolutetime(uint64_t n,uint64_t *out) {*out=n;}
 static void fuxi_perf_swap(void) {}
 static void fuxi_display_kick(void) {kicks++;}
 static int scanAcquire=1,scanPublish=0;
-static bool scanOwned=false,scanBackReady=false,scanDouble=false;
+static bool scanOwned=false,scanBackReady=false,scanDouble=false,scanTriple=false;
 static unsigned scanRetries,scanCpuAcquires;
 static fg_present_times scanTimes;
 static void fuxi_gpu_scanout_stamps(fg_present_times *t) {*t=scanTimes;}
 static int scanCpuAcquire=1;
+static int fuxi_gpu_scanout_triple(void) {return scanTriple;}
 static int fuxi_gpu_scanout_double(void) {return scanDouble;}
 static int fuxi_gpu_scanout_pending(void) {return scanBackReady;}
 static int scanRetryResult;
@@ -724,6 +725,61 @@ int main(void) {
  puts("PASS: production reuse counter, stale admission refusal, display use accounting, drop/show/stop/DMA retirement, bounded SwapWait/history, wake/timeout/interrupt");
  }
  {
+ OSArray triClients;AppleCLCD tri={};tri.fClients=&triClients;tri.fLock=&lock;tri.fScanout=true;tri.fConsolePaused=true;tri.fFlushTicks=1;
+ tri.fWidth=18;tri.fHeight=3;tri.fRowBytes=96;tri.fPixels=(uintptr_t)pixels;
+ tri.fSwapID=1000;scanOwned=scanDouble=scanTriple=true;scanAcquire=1;scanPublish=2;scanRetryResult=0;gpuMode=2;pollMode=1;
+ unsigned baseUses=surface.displayUses,baseRefs=refs,blocked=tri.fStageBlocks[0];
+ uint8_t frame[SWEET_FB_SWAP_REC_SIZE];memcpy(frame,rec,sizeof(frame));
+ put32(frame,0x50,20);assert(!tri.swap(frame));tri.presentStep(true);
+ assert(tri.fGpuPending && surface.displayUses==baseUses+1);
+ put32(frame,0x50,21);assert(!tri.swap(frame));pollMode=0;tri.presentStep(true);
+ assert(tri.swapWait(20,0x80000000u,0)==kIOReturnBusy && tri.fPendingCount==1);
+ pollMode=1;tri.presentStep(true); // retire 20, leave it ready, submit 21 in the same step
+ assert(tri.fGpuPending && tri.fPublicationPending && tri.fPublicationID==20 && !tri.fPendingCount);
+ assert(surface.displayUses==baseUses+1 && tri.swapWait(20,0x80000000u,0)==0);
+ assert(tri.swapWait(20,0x80000001u,0)==kIOReturnBusy && tri.swapWait(21,0x80000000u,0)==kIOReturnBusy);
+ pollMode=0;tri.presentStep(true);assert(tri.fPublicationID==20 && !tri.fStatDropped);
+ pollMode=1;tri.presentStep(true); // replace only at 21 retirement
+ assert(tri.fPublicationID==21 && !tri.fGpuPending && tri.fStatDropped==1 && surface.displayUses==baseUses);
+ assert(tri.swapWait(20,0x80000000u,0)==0 && tri.swapWait(20,0x80000001u,0)==kIOReturnAborted);
+ assert(tri.swapWait(21,0x80000000u,0)==0 && tri.swapWait(21,0x80000001u,0)==kIOReturnBusy);
+ assert(tri.swapWait(0,0x80000002u,0)==0 && tri.swapWait(0,0x80000003u,0)==kIOReturnBusy);
+ // A failed newer copy preserves the ready swap and its original stage stamps.
+ uint64_t savedStage[6];memcpy(savedStage,tri.fPublicationStage,sizeof(savedStage));
+ put32(frame,0x50,22);assert(!tri.swap(frame));tri.presentStep(true);assert(tri.fGpuPending);
+ pollMode=-1;tri.presentStep(false);assert(tri.fReplay && tri.fPublicationID==21);
+ assert(tri.swapWait(22,0x80000000u,0)==kIOReturnBusy && surface.displayUses==baseUses+1);
+ pollMode=1;scanRetryResult=1;tri.presentStep(false);scanRetryResult=0;
+ assert(!tri.fPublicationPending && tri.fStatFrames==1 && tri.swapWait(21,0x80000001u,0)==0);
+ for(unsigned i=0;i<4;i++)assert(tri.fStageSum[i]==savedStage[i+1]-savedStage[i]);
+ assert(tri.fStageBlocks[0]==blocked && tri.swapWait(22,0x80000000u,0)==kIOReturnBusy);
+ scanDouble=scanTriple=false;gpuMode=0;scanPublish=1;tri.presentStep(true); // exact CPU replay
+ assert(tri.swapWait(22,0x80000001u,0)==0 && surface.displayUses==baseUses);
+ // Redrawing a previously shown ID must not revoke its successful mode-1 status.
+ scanDouble=scanTriple=true;gpuMode=2;scanPublish=2;tri.fReplay=tri.fDirty=true;
+ tri.presentStep(true);assert(tri.fGpuPending && surface.displayUses==baseUses+1);
+ tri.presentStep(true);assert(tri.fPublicationID==22 && tri.swapWait(22,0x80000001u,0)==0);
+ put32(frame,0x50,25);assert(!tri.swap(frame));tri.presentStep(true);tri.presentStep(true);
+ assert(tri.fPublicationID==25 && tri.swapWait(22,0x80000001u,0)==0);
+ IOLockLock(tri.fLock);tri.stopRecords();IOLockUnlock(tri.fLock);assert(refs==baseRefs);
+ assert(tri.swapWait(25,0x80000000u,0)==0 && tri.swapWait(25,0x80000001u,0)==kIOReturnAborted);
+ // Stopping with a ready image and a newer live DMA retains source quarantine.
+ scanDouble=scanTriple=true;gpuMode=2;scanPublish=2;
+ put32(frame,0x50,23);assert(!tri.swap(frame));tri.presentStep(true);
+ put32(frame,0x50,24);assert(!tri.swap(frame));tri.presentStep(true);
+ assert(tri.fPublicationID==23 && tri.fGpuPending && surface.displayUses==baseUses+1);
+ tri.fScanoutHeld=true;pollMode=0;tri.presentStep(true);assert(tri.fPublicationPending);
+ pollMode=1;tri.presentStep(true);assert(!tri.fPublicationPending && surface.displayUses==baseUses && refs==baseRefs);
+ assert(tri.fSwapStatus[23%SWEET_FB_SWAP_HISTORY].state==AppleCLCD::SwapDropped);
+ // Low-level stop can clear ready first; pending metadata must still wake cleanup.
+ tri.fScanoutHeld=false;tri.fPublicationPending=true;tri.fPublicationID=23;scanBackReady=false;
+ IOLockLock(tri.fLock);assert(tri.presentWantedLocked());IOLockUnlock(tri.fLock);
+ scanRetryResult=-1;tri.presentStep(true);scanRetryResult=0;
+ assert(tri.fScanoutHeld && !tri.fPublicationPending);
+ scanDouble=scanTriple=scanOwned=scanBackReady=false;scanPublish=0;gpuMode=0;
+ puts("PASS: triple same-step copy admission, source holds/mode0 at retire, newest-ready mode1 drop, failed-copy replay, saved publication stages, CPU and stop");
+ }
+ {
  // Exact production stage aggregation, mach-to-us conversion, 600-frame cadence and reset.
  AppleCLCD staged={};staged.fLock=&lock;staged.fScanout=true;staged.fStageGpu=true;
  bool previousOwned=scanOwned;scanOwned=true;
@@ -732,6 +788,7 @@ int main(void) {
   uint64_t b=100000000ull+i*100000;
   staged.fStage[0]=b;staged.fStage[1]=b+(i==599?3000:1000);staged.fStage[2]=staged.fStage[1]+2000;
   scanTimes.submitted=staged.fStage[2]+3000;scanTimes.fence=scanTimes.submitted+4000;scanTimes.previous_start=i?scanTimes.start:0;scanTimes.start=scanTimes.fence+5000;
+  staged.fStage[3]=scanTimes.submitted;staged.fStage[4]=scanTimes.fence;
   staged.fWakeSum[0]+=6000;staged.fWakeMax[0]=6000;staged.fWakeN[0]++;
   staged.fWakeSum[1]+=2000;staged.fWakeMax[1]=2000;staged.fWakeN[1]++;
   staged.fStageBlocks[0]++;staged.fStageBlocks[1]+=2;staged.fStageBlocks[2]+=3;

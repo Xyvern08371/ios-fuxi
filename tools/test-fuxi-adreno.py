@@ -31,7 +31,7 @@ PREFIX = r'''
 #define FG_GUARD
 #include <stdint.h>
 static unsigned fg_client_busy, fg_scanout_owned, fg_scanout_writable, fg_scanout_requested;
-static unsigned fg_scanout_double_active,fg_scanout_front,fg_scanout_back_ready,fg_scanout_ready_drops;
+static unsigned fg_scanout_double_active,fg_scanout_front,fg_scanout_back_ready,fg_scanout_ready_drops,fg_scanout_triple_requested,fg_scanout_ready,fg_scanout_copy;
 static uintptr_t fg_scanout_source;
 static unsigned fg_scanout_pitch,fg_scanout_sx,fg_scanout_sy,fg_scanout_dx,fg_scanout_dy,fg_scanout_w,fg_scanout_h;
 static unsigned scanoutStops,verifyBad;
@@ -199,8 +199,9 @@ static int g3_gw(unsigned reg,unsigned value)
     for(unsigned y=0;y<h;y++) for(unsigned x=0;x<=bx-dx;x++) {
      assert(pending<2400*1080);
      unsigned dst=regs[0x8c18]+y*dp+(dx+x)*4-G4_FB_VA;
-     unsigned buffer=dst>=0xa00000u;
-     if(buffer)dst-=0xa00000u;
+     unsigned buffer=dst/0xa00000u;
+     dst-=buffer*0xa00000u;
+     assert(buffer<3 && (!fg_scanout_triple_requested || !fg_scanout_back_ready || buffer!=fg_scanout_ready));
      assert(dst<4320*2400 && (!fg_scanout_double_active || buffer!=fg_scanout_front));
      dst+=buffer*4320*2400;
      pdst[pending]=dst; pdata[pending++]=translated_pixel(regs[0xb2c2]+y*sp+(sx+x)*4);
@@ -222,11 +223,12 @@ static int g3_gw(unsigned reg,unsigned value)
 static void reset(void)
 {
  fg_scanout_owned=fg_scanout_writable=fg_scanout_requested=scanoutStops=verifyBad=0;
+ fg_scanout_triple_requested=fg_scanout_ready=fg_scanout_copy=0;
  fg_scanout_double_active=fg_scanout_front=fg_scanout_back_ready=fg_scanout_ready_drops=0;
  fg_faults=fg_suspends=fg_reset_held=0;
  fg_state=1; fg_force=fg_seq=fg_access_failed=mode=fail_tlb=tlbs=isolated=doorbells=0;
  g3_wptr=rptr=wptr=8190; fence=cache_clean=pending=gbif=reset_held=faulted_sids=paddr_missing=0;
- fg_busy=fg_magic=0; ticks=lookups=contiguous_pa=0; clean_bytes=0; memset(&times,0,sizeof(times)); memset(fg_generation,0,sizeof(fg_generation)); memset(model_l2,0,sizeof(model_l2)); memset(model_leaves,0,sizeof model_leaves); memset(panel,0x6b,2*4320*2400+64);
+ fg_busy=fg_magic=0; ticks=lookups=contiguous_pa=0; clean_bytes=0; memset(&times,0,sizeof(times)); memset(fg_generation,0,sizeof(fg_generation)); memset(model_l2,0,sizeof(model_l2)); memset(model_leaves,0,sizeof model_leaves); memset(panel,0x6b,3*4320*2400+64);
 }
 static void page_fixture(unsigned off,unsigned pitch,unsigned sx,unsigned sy,unsigned w,unsigned h)
 {
@@ -258,7 +260,7 @@ static void copy_case(unsigned off,unsigned pitch,unsigned sx,unsigned sy,unsign
 }
 int main(void)
 {
- source_buf=aligned_alloc(16384,FG_SOURCE_BYTES); panel=malloc(2*4320*2400+64);
+ source_buf=aligned_alloc(16384,FG_SOURCE_BYTES); panel=malloc(3*4320*2400+64);
  assert(source_buf && panel);
  for(unsigned i=0;i<FG_SOURCE_BYTES;i++) source_buf[i]=(i*13u+(i>>12)*17u)&255;
  reset(); copy_case(0,4320,0,0,0,0,1080,2400); /* one submission, two strided rects */
@@ -275,7 +277,7 @@ int main(void)
  /* More than 600 frames with a continuously reused ring, changing phases. */
  reset();
  for(unsigned i=0;i<1000;i++) {
-  memset(panel,0x6b,2*4320*2400+64);
+  memset(panel,0x6b,3*4320*2400+64);
   copy_case((i%16)*4,4320,3,2,7,6,65,70);
  }
  /* Contiguous physical backing exercises real 2M blocks and 64K hints. */
@@ -362,13 +364,26 @@ int main(void)
   }
   source_buf[18*4544+22*4]^=0xff; // outside the next damage rect
  }
+ fg_scanout_triple_requested=1;
+ for(unsigned front=0;front<3;front++)for(unsigned ready=0;ready<3;ready++)if(front!=ready) {
+  fg_scanout_front=front;fg_scanout_ready=ready;fg_scanout_back_ready=1;
+  unsigned before=fg_scanout_ready_drops,freeBuffer=3-front-ready;
+  memset(panel,0x6b,3*4320*2400+64);
+  assert(model_copy(0,1,(uintptr_t)source_buf,4544u*2436,4544,122,218,100,200,17,3,&times)==1);
+  assert(fg_scanout_copy==freeBuffer && fg_scanout_back_ready && fg_scanout_ready==ready && fg_scanout_ready_drops==before);
+  for(unsigned y=0;y<2400;y++)for(unsigned x=0;x<1080;x++) {
+   uint32_t got,expected;memcpy(&got,panel+freeBuffer*4320*2400+y*4320+x*4,4);
+   memcpy(&expected,source_buf+(y+18)*4544+(x+22)*4,4);assert(got==expected);
+   assert(panel[front*4320*2400+y*4320+x*4]==0x6b && panel[ready*4320*2400+y*4320+x*4]==0x6b);
+  }
+ }
  // A partial source that cannot supply a complete panel must fall back
  // before touching the ready buffer, cache or doorbell.
  unsigned before=doorbells,drops=fg_scanout_ready_drops;fg_scanout_back_ready=1;
  assert(!fuxi_gpu_copy(0,1,(uintptr_t)source_buf,4544u*2436,4544,0,0,10,10,17,3,&times));
  assert(!fuxi_gpu_copy(0,1,(uintptr_t)source_buf,4544u*100,4544,22,18,0,0,17,3,&times));
  assert(doorbells==before && fg_scanout_ready_drops==drops && fg_scanout_back_ready);
- puts("PASS: actual PM4 double-buffer targets, alternating full crops from damage, ready replacement and incomplete-source refusal");
+ puts("PASS: actual PM4 double/triple targets, full crops from damage, front/ready exclusion, submit preserves triple ready, incomplete-source refusal");
  /* Independent windows and generations; unmapping one preserves the others. */
  reset();
  for(unsigned slot=0;slot<4;slot++) {
@@ -410,6 +425,7 @@ def main():
         for b, m in windows[i+1:]:
             assert a + n <= b or b + m <= a, 'overlapping platform mappings'
     functions = ''.join(function(probe, n) for n in ('g3_parity', 'g3_pkt7', 'g4_pkt4', 'g4_reg', 'g4_event', 'g4_wfi', 'g4_setup', 'g4_end'))
+    functions += function((ROOT / 'xnu/fuxi-adreno/fuxi_gpu_scanout.inc').read_text(), 'fg_scanout_target')
     functions += ''.join(function(adapter, n) for n in ('fg_fail', 'fg_isolate', 'fuxi_gpu_unmap', 'fuxi_gpu_map', 'fg_rect', 'fg_clean', 'fuxi_gpu_poll', 'fuxi_gpu_copy'))
     functions = re.sub(r'__asm__ volatile\([^;]*\);', ';', functions)
     constants = '\n'.join(line for line in sync.added_file('gpu-a740.h').splitlines() if line.startswith('#define G4_'))

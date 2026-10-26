@@ -51,7 +51,16 @@ static int fg_abi_observe(void);
 static unsigned fg_scanout_double_active, fg_scanout_double_initialized, fg_scanout_front;
 static unsigned fg_scanout_back_ready, fg_scanout_flips, fg_scanout_ready_drops, fg_scanout_retries;
 static unsigned fg_scanout_current_match, fg_scanout_current_mismatch, fg_scanout_reentries;
-static uintptr_t fg_scanout_pixels_b;
+static uintptr_t fg_scanout_pixels_b, fg_scanout_pixels_c;
+static unsigned fg_scanout_ready, fg_scanout_copy, fg_scanout_buffer_flips[3];
+static unsigned fg_scanout_target(void)
+{
+ for (unsigned i = 0; i < (fg_scanout_triple_requested ? 3u : 2u); i++)
+  if (i != fg_scanout_front && (!fg_scanout_back_ready || i != fg_scanout_ready)) return i;
+ return fg_scanout_front ^ 1u;
+}
+static unsigned fg_scanout_pa(unsigned buffer) { return 0xb8000000u + buffer*0xa00000u; }
+static uintptr_t fg_scanout_pixels_at(unsigned buffer) { return buffer == 2 ? fg_scanout_pixels_c : buffer ? fg_scanout_pixels_b : fg_scanout_pixels; }
 static int fg_scanout_acquire(unsigned publication);
 static int fg_scanout_stop(const char *reason);
 
@@ -68,8 +77,10 @@ void fuxi_gpu_scanout_configure(uintptr_t pixels, unsigned enabled, unsigned che
  fg_scanout_checks = fg_scanout_requested && check == 1 ? 4 : 0;
  if (fg_scanout_requested)
 {
-  unsigned drain = 0, te = 0, panel120 = 0, double_buffer = 0;
+  unsigned drain = 0, te = 0, panel120 = 0, double_buffer = 0, triple_buffer = 0;
   fg_scanout_double_requested = PE_parse_boot_argn("fuxiscandouble", &double_buffer, sizeof(double_buffer)) && double_buffer == 1;
+  unsigned triple = PE_parse_boot_argn("fuxiscantriple", &triple_buffer, sizeof(triple_buffer)) && triple_buffer == 1;
+  fg_scanout_triple_requested = fg_scanout_double_requested && triple;
   fg_scanout_panel120_requested = PE_parse_boot_argn("fuxipanel120", &panel120, sizeof(panel120)) && panel120 == 1;
   fg_scanout_te_mode = PE_parse_boot_argn("fuxiscante", &te, sizeof(te)) && te == 1;
   /* The TE gate needs no floor unless one is given explicitly. */
@@ -434,12 +445,13 @@ static int fg_scanout_acquire(unsigned publication)
   return fg_scanout_stop("autorefresh changed");
  if (fg_scanout_double_active) {
   unsigned src;
-  if (!fg_scanout_read(0xae05014, &src) || src != (fg_scanout_front ? 0xb8a00000u : 0xb8000000u))
+  if (!fg_scanout_read(0xae05014, &src) || src != fg_scanout_pa(fg_scanout_front))
    return fg_scanout_stop("double SRC0 changed");
  }
  if (fg_busy) { fg_scanout_wait_ring++; return 0; }
  if (fg_scanout_double_active && !publication) {
-  if (fg_scanout_back_ready) return 0;
+  if (fg_scanout_back_ready && !fg_scanout_triple_requested) return 0;
+  fg_scanout_copy = fg_scanout_target();
   fg_scanout_writable = 1;
   return 1;
  }
@@ -496,10 +508,18 @@ static int fg_scanout_acquire(unsigned publication)
   if (!fg_scanout_pixels || !fg_scanout_pixels_b) return fg_scanout_stop("double buffer mapping");
   for (unsigned i = 0; i < 1080u*2400; i++)
    ((volatile uint32_t *)fg_scanout_pixels_b)[i] = ((const volatile uint32_t *)fg_scanout_pixels)[i];
+  if (fg_scanout_triple_requested) {
+   fg_scanout_pixels_c = fuxi_gpu_nc_pointer(0xb9400000u, 4320u*2400);
+   if (!fg_scanout_pixels_c) return fg_scanout_stop("triple buffer mapping");
+   for (unsigned i = 0; i < 1080u*2400; i++)
+    ((volatile uint32_t *)fg_scanout_pixels_c)[i] = ((const volatile uint32_t *)fg_scanout_pixels)[i];
+  }
   fg_scanout_double_initialized = fg_scanout_double_active = 1;
-  printf("FUXI SCANOUT: double=1 A=0xb8000000 B=0xb8a00000 full_copy=1 flush=RMW|1\n");
+  printf("FUXI SCANOUT: double=1 A=0xb8000000 B=0xb8a00000 full_copy=1 flush=RMW|1%s\n",
+      fg_scanout_triple_requested ? " triple=1 C=0xb9400000" : "");
  }
  __asm__ volatile("dsb sy" ::: "memory");
+ if (!publication && fg_scanout_double_active) fg_scanout_copy = fg_scanout_target();
  fg_scanout_writable = 1;
  return 1;
 }
@@ -517,6 +537,10 @@ int fuxi_gpu_scanout_double(void)
 {
  return fg_scanout_double_active && !fg_scanout_failed;
 }
+int fuxi_gpu_scanout_triple(void)
+{
+ return fg_scanout_double_active && fg_scanout_triple_requested && !fg_scanout_failed;
+}
 int fuxi_gpu_scanout_pending(void)
 {
  return fg_scanout_back_ready && !fg_scanout_failed;
@@ -528,9 +552,10 @@ int fuxi_gpu_scanout_cpu_acquire(void)
  FG_GUARD;
  int writable = fg_scanout_acquire(1);
  if (writable != 1 || !fg_scanout_double_active) return writable;
- if (fg_scanout_front ^ fg_scanout_back_ready) {
+ unsigned newest = fg_scanout_back_ready ? (fg_scanout_triple_requested ? fg_scanout_ready : fg_scanout_front ^ 1u) : fg_scanout_front;
+ if (newest) {
   for (unsigned i = 0; i < 1080u*2400; i++)
-   ((volatile uint32_t *)fg_scanout_pixels)[i] = ((const volatile uint32_t *)fg_scanout_pixels_b)[i];
+   ((volatile uint32_t *)fg_scanout_pixels)[i] = ((const volatile uint32_t *)fg_scanout_pixels_at(newest))[i];
  }
  if (!fg_scanout_address(0xb8000000u)) return fg_scanout_stop("CPU restore A");
  if (fg_scanout_back_ready) fg_scanout_ready_drops++;
@@ -558,13 +583,14 @@ static int fg_scanout_publish(void)
   return fg_scanout_stop("publish transfer status");
  __asm__ volatile("dsb sy" ::: "memory");
  fg_scanout_writable = 0;
- if (fg_scanout_double_active && !fg_scanout_address(fg_scanout_front ? 0xb8000000u : 0xb8a00000u))
+ if (fg_scanout_double_active && !fg_scanout_address(fg_scanout_pa(fg_scanout_triple_requested ? fg_scanout_ready : fg_scanout_front ^ 1u)))
   return fg_scanout_stop("double SRC0 flush");
  if (!fg_scanout_write(FG_SCAN_CTL+0x1c, 1)) return fg_scanout_stop("start transfer");
  fg_scanout_stamps.previous_start = fg_scanout_stamps.start;
  fg_scanout_stamps.start = mach_absolute_time();
  if (fg_scanout_double_active) {
-  fg_scanout_front ^= 1;
+  fg_scanout_front = fg_scanout_triple_requested ? fg_scanout_ready : fg_scanout_front ^ 1u;
+  fg_scanout_buffer_flips[fg_scanout_front]++;
   fg_scanout_back_ready = 0;
   fg_scanout_flips++;
  }
@@ -592,12 +618,16 @@ static int fg_scanout_publish(void)
       fg_scanout_drain_us, fg_scanout_te_mode, te_dhz/10, te_dhz%10,
       fg_scanout_iv[0], fg_scanout_iv[1], fg_scanout_iv[2], fg_scanout_iv[3]);
   if (fg_scanout_double_active) {
-   unsigned current, expected = fg_scanout_front ? 0xb8a00000u : 0xb8000000u;
+   unsigned current, expected = fg_scanout_pa(fg_scanout_front);
    if (!fg_scanout_read(0xae050a4, &current)) return fg_scanout_stop("read current SRC0");
    if (current == expected) fg_scanout_current_match++; else fg_scanout_current_mismatch++;
-   printf("FUXI SCANOUT: double=1 flips=%u back_ready_drops=%u publish_retries=%u current_src0=%#x expected=%#x match=%u mismatch=%u\n",
+   char triple[128] = {0};
+   if (fg_scanout_triple_requested) snprintf(triple, sizeof(triple), " triple=1 flips_a=%u flips_b=%u flips_c=%u drops=%u",
+       fg_scanout_buffer_flips[0], fg_scanout_buffer_flips[1], fg_scanout_buffer_flips[2], fg_scanout_ready_drops);
+   printf("FUXI SCANOUT: double=1 flips=%u back_ready_drops=%u publish_retries=%u current_src0=%#x expected=%#x match=%u mismatch=%u%s\n",
        fg_scanout_flips, fg_scanout_ready_drops, fg_scanout_retries, current, expected,
-       fg_scanout_current_match, fg_scanout_current_mismatch);
+       fg_scanout_current_match, fg_scanout_current_mismatch, triple);
+   fg_scanout_buffer_flips[0] = fg_scanout_buffer_flips[1] = fg_scanout_buffer_flips[2] = 0;
    fg_scanout_flips = fg_scanout_ready_drops = fg_scanout_retries = 0;
   }
   fg_scanout_wait_ring = fg_scanout_wait_floor = fg_scanout_wait_xfer = fg_scanout_wait_te = 0;
@@ -614,7 +644,11 @@ int fuxi_gpu_scanout_publish(void)
  if (!fuxi_gpu_scanout_owned()) return 0;
  FG_GUARD;
  if (fg_scanout_failed || fg_busy || !fg_scanout_writable) return -1;
- if (fg_scanout_double_active) fg_scanout_back_ready = 1;
+ if (fg_scanout_double_active) {
+  if (fg_scanout_back_ready && fg_scanout_triple_requested) fg_scanout_ready_drops++;
+  fg_scanout_ready = fg_scanout_triple_requested ? fg_scanout_copy : fg_scanout_front ^ 1u;
+  fg_scanout_back_ready = 1;
+ }
  return fg_scanout_publish();
 }
 int fuxi_gpu_scanout_retry(void)
@@ -658,7 +692,7 @@ static int fg_scanout_verify(void)
  for (unsigned y = 0; y < fg_scanout_h; y++) {
   const uint32_t *src = (const uint32_t *)(fg_scanout_source +
       (uint64_t)(fg_scanout_sy+y)*fg_scanout_pitch + fg_scanout_sx*4);
-  const volatile uint32_t *dst = (const volatile uint32_t *)((fg_scanout_double_active && !fg_scanout_front ? fg_scanout_pixels_b : fg_scanout_pixels) +
+  const volatile uint32_t *dst = (const volatile uint32_t *)(fg_scanout_pixels_at(fg_scanout_double_active ? (fg_scanout_triple_requested ? fg_scanout_copy : fg_scanout_front ^ 1u) : 0) +
       (uint64_t)(fg_scanout_dy+y)*4320 + fg_scanout_dx*4);
   for (unsigned x = 0; x < fg_scanout_w; x++) if (src[x] != dst[x]) {
    if (!mismatch) { first_x = x; first_y = y; }
