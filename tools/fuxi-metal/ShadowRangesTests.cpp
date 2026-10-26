@@ -21,6 +21,25 @@ int main(){
  ShadowRanges vertices(4096);vertices.vertex(256,2,6,false,32,8,29);assert(vertices.bytes()==168);vertices.each([](auto r){assert(r.offset==328);});
  vertices.vertex(0,0,3,true,32,0,29);assert(vertices.isFull());
  ShadowRanges badVertex(1024);badVertex.vertex(0,UINT32_MAX,3,false,32,0,29);assert(badVertex.isFull());
+ // Scans read frozen bytes, include restart only for strips, and never cross commits.
+ for(uint32_t width:{2u,4u}){
+  std::array<uint8_t,64> bytes{};uint32_t values[]={3,1,2,width==2?UINT16_MAX:UINT32_MAX,4,4};for(unsigned i=0;i<6;++i)memcpy(bytes.data()+8+i*width,&values[i],width);
+  assert(shadowIndexBytes(bytes.size(),8,6,width) && !shadowIndexBytes(bytes.size(),9,6,width) && !shadowIndexBytes(16,8,6,width) && !shadowIndexBytes(UINT64_MAX,UINT64_MAX-1,6,width));
+  ShadowIndexCache cache;uint64_t scanned=0;auto r=cache.scan(bytes.data(),bytes.data()+8,8,6,width,true,scanned);assert(r.valid && !r.empty && r.first==1 && r.last==4 && scanned==6);
+  ShadowRanges bounded(4096);bounded.vertexSpan(256,r,32,8,29);assert(bounded.bytes()==104);bounded.each([](auto i){assert(i.offset==296);});
+  auto base=shadowVertexIndices(r,5);assert(base.first==6 && base.last==9);ShadowRanges shifted(4096);shifted.vertexSpan(256,base,32,8,29);shifted.each([](auto i){assert(i.offset==456 && i.size==104);});
+  base=shadowVertexIndices(r,-1);assert(base.valid && base.first==0 && base.last==3);assert(!shadowVertexIndices(r,-2).valid && !shadowVertexIndices(r,INT64_MIN).valid && !shadowVertexIndices(r,UINT32_MAX).valid);
+  assert(cache.scan(bytes.data(),bytes.data()+8,8,6,width,true,scanned).last==4 && scanned==6);
+  auto list=cache.scan(bytes.data(),bytes.data()+8,8,6,width,false,scanned);assert(list.last==values[3] && scanned==12);ShadowRanges out(4096);out.vertexSpan(0,list,32,0,31);assert(out.isFull() && out.fullReason(ShadowFullReason::bounds));
+  auto changed=cache.scan(bytes.data(),bytes.data()+8,8,3,width,false,scanned);assert(changed.first==1 && changed.last==3 && scanned==15);
+  for(unsigned i=0;i<6;++i)memcpy(bytes.data()+8+i*width,&values[3],width);ShadowIndexCache next;auto empty=next.scan(bytes.data(),bytes.data()+8,8,6,width,true,scanned);assert(empty.valid && empty.empty);ShadowRanges none(1024);none.vertexSpan(0,empty,32,0,31);assert(!none.bytes());
+  auto sentinel=next.scan(bytes.data(),bytes.data()+8,8,6,width,false,scanned);assert(!sentinel.empty && sentinel.last==values[3]);
+  assert(!next.scan(bytes.data(),bytes.data()+8,0,ShadowIndexCache::drawLimit+1,width,true,scanned).valid);
+  scanned=ShadowIndexCache::frameLimit;assert(!next.scan(bytes.data(),bytes.data()+8,16,3,width,true,scanned).valid);
+  ShadowRanges unstable(4096);unstable.vertexSpan(0,next.scan(bytes.data(),nullptr,0,3,width,true,scanned),32,0,31);assert(unstable.isFull() && unstable.fullReason(ShadowFullReason::indexed));
+ }
+ ShadowRanges reasons(1024);reasons.binding({},0);reasons.full(ShadowFullReason::useResource);reasons.full(ShadowFullReason::blit);reasons.full(ShadowFullReason::other);reasons.vertex(0,0,3,true,32,0,31);reasons.vertex(0,UINT32_MAX,3,false,32,0,31);
+ for(size_t i=0;i<size_t(ShadowFullReason::count);++i)assert(reasons.fullReason(ShadowFullReason(i)));
  ShadowPool pool;auto storage=pool.take(1024);auto *address=storage.data.get();pool.put(std::move(storage));storage=pool.take(512);assert(storage.data.get()==address);pool.put(std::move(storage));
  constexpr size_t ringBytes=4*1024*1024,draws=130,needed=draws*256;
  std::vector<uint8_t> cpu(ringBytes),gpu(ringBytes,0);ShadowSnapshot first,second;
@@ -39,5 +58,21 @@ int main(){
  // Return/take from separate commit and submit threads uses the pool lock.
  std::thread worker([&]{for(unsigned i=0;i<100;++i){auto s=pool.take(2048);assert(s.data && s.capacity>=2048);pool.put(std::move(s));}});
  for(unsigned i=0;i<100;++i){auto s=pool.take(1024);assert(s.data && s.capacity>=1024);pool.put(std::move(s));}worker.join();
+ // Indexed CA-like quads share the ring with their indices and fragment constants.
+ constexpr size_t indexedNeeded=draws*(128+64+12);ShadowRanges indexRanges(ringBytes),indexedRanges(ringBytes);std::vector<bool> touched(ringBytes);
+ for(unsigned i=0;i<draws;++i){uint64_t offset=65536+i*256;uint16_t quad[]={0,1,2,2,1,3};memcpy(cpu.data()+offset+192,quad,sizeof(quad));indexRanges.add(offset+192,sizeof(quad));}
+ first.add(gpu.data(),cpu.data(),indexRanges);first.capture(pool);ShadowIndexCache cache;uint64_t scanned=0;
+ for(unsigned i=0;i<draws;++i){uint64_t offset=65536+i*256;auto indices=cache.scan(gpu.data(),first.view(gpu.data(),offset+192,12),offset+192,6,2,false,scanned);assert(indices.valid && indices.last==3);
+  indexedRanges.vertexSpan(offset,indices,32,0,31);indexedRanges.vertexSpan(offset,indices,32,16,31);indexedRanges.binding({1,0,0,64},offset+128);indexedRanges.add(offset+192,12);
+ }
+ assert(scanned==draws*6 && indexedRanges.bytes()==indexedNeeded);std::fill(cpu.begin(),cpu.end(),55);first.add(gpu.data(),cpu.data(),indexedRanges);first.capture(pool);assert(first.bytes()==indexedNeeded);
+ std::fill(cpu.begin(),cpu.end(),77);std::fill(gpu.begin(),gpu.end(),3);assert(first.apply(pool)==indexedNeeded);
+ for(unsigned i=0;i<draws;++i){uint64_t offset=65536+i*256;for(unsigned j=0;j<192;++j)assert(gpu[offset+j]==55);uint16_t quad[]={0,1,2,2,1,3};assert(!memcmp(gpu.data()+offset+192,quad,12));for(unsigned j=0;j<204;++j)touched[offset+j]=true;}
+ for(size_t i=0;i<ringBytes;++i)if(!touched[i])assert(gpu[i]==3);
+ // Direct synchronous refresh also uses the frozen indices, including full fallback.
+ std::array<uint16_t,8> indexCPU{0,1,2,2,1,3,7,8},indexGPU{};ShadowRanges ir(sizeof(indexCPU));ir.add(0,12);first.add(indexGPU.data(),indexCPU.data(),ir);first.capture(pool);indexCPU.fill(99);ir.full();assert(first.refresh(indexGPU.data(),indexCPU.data(),ir)==sizeof(indexCPU));first.release(pool);assert(indexGPU[0]==0 && indexGPU[5]==3 && indexGPU[6]==99);
+ std::array<uint8_t,128> stagedCPU{},stagedGPU{};stagedCPU.fill(11);ShadowRanges frozen(128);frozen.add(16,8);frozen.add(64,8);first.add(stagedGPU.data(),stagedCPU.data(),frozen);first.capture(pool);assert(!first.view(stagedGPU.data(),16,9));stagedCPU.fill(22);ShadowRanges expanded(128);expanded.full();first.add(stagedGPU.data(),stagedCPU.data(),expanded);first.capture(pool);assert(first.bytes()==128);stagedCPU.fill(33);assert(first.apply(pool)==128);
+ for(unsigned i=0;i<128;++i)assert(stagedGPU[i]==((i>=16 && i<24) || (i>=64 && i<72)?11:22));
+ printf("PASS: indexed u16/u32, base vertex, restart/list sentinels, bounds/reasons, frozen scans/cache/budgets; indexed CA-like ring bytes/frame before=%zu after=%zu (snapshot and backend copy each)\n",ringBytes,indexedNeeded);
  printf("PASS: shadow ranges, immutable commits, full fallback, two flights, pool reuse; CA-like ring bytes/frame before=%zu after=%zu (snapshot and backend copy each)\n",ringBytes,needed);
 }

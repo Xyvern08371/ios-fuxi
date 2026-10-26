@@ -10,11 +10,12 @@ int main(){
  assert(frameCPUFromRegister(0xabc000ULL|0xfff)==4095);
  assert(frameCPU()==4096); // host has no Darwin register convention
  FrameTraceWindow window;assert(window.percentile(&FrameSample::wall,50)==0);
- for(unsigned i=1;i<=100;++i){FrameSample s;s.backendCPU=i*10000;s.frontendCPU=i*20000;s.frontendWall=i*30000;s.pipe=i*40000;s.desc=i*50000;s.record=i*60000;s.kernelIO=i*70000;s.pipeCPU=i*8000;s.commitCall=i*1000;s.commitGap=i*2000;s.snapshotBytes=33280;s.shadowCopyBytes=33280;s.planHits=119;s.planMisses=1;s.queueSubmits=2;s.imageBarriers=7;s.readBarriersSkipped=3;s.crossEncoderMerges=1;s.drainWaits=1;s.wall=i*1000000ULL;s.completionLatency=s.wall;s.inflight=i%2+1;s.cpu=i%7;s.draws=2;s.passes=1;s.mergedDraws=1;s.mergeSplits[size_t(MergeSplit::encoder)]=2;s.counts={1,2,3};window.add(s);}
+ for(unsigned i=1;i<=100;++i){FrameSample s;s.backendCPU=i*10000;s.frontendCPU=i*20000;s.frontendWall=i*30000;s.pipe=i*40000;s.desc=i*50000;s.record=i*60000;s.kernelIO=i*70000;s.pipeCPU=i*8000;s.commitCall=i*1000;s.commitGap=i*2000;s.shadowScannedIndices=780;for(size_t j=0;j<s.shadowFullReasons.size();++j)s.shadowFullReasons[j]=j+1;s.snapshotBytes=33280;s.shadowCopyBytes=33280;s.planHits=119;s.planMisses=1;s.queueSubmits=2;s.imageBarriers=7;s.readBarriersSkipped=3;s.crossEncoderMerges=1;s.drainWaits=1;s.wall=i*1000000ULL;s.completionLatency=s.wall;s.inflight=i%2+1;s.cpu=i%7;s.draws=2;s.passes=1;s.mergedDraws=1;s.mergeSplits[size_t(MergeSplit::encoder)]=2;s.counts={1,2,3};window.add(s);}
  assert(window.size()==100 && window.percentile(&FrameSample::wall,50)==50000000 && window.percentile(&FrameSample::wall,90)==90000000);
  FILE *out=tmpfile();assert(out);window.report(out);rewind(out);char line[4096];assert(fgets(line,sizeof(line),out));
  assert(strstr(line,"frame trace n=100 samples=100 wall=50.000/90.000/100.000 ms"));
  assert(strstr(line,"snapshot_bytes/frame=33280.00 shadow_copy_bytes/frame=33280.00"));
+ assert(strstr(line,"shadow_scanned_indices/frame=780.00 shadow_full_reasons=indexed:1.00,whole_window:2.00,use_resource:3.00,blit:4.00,bounds:5.00,other:6.00"));
  assert(strstr(line,"plan_hits/frame=119.00 plan_misses/frame=1.00"));
  assert(strstr(line,"draws/frame=2.00 render_passes/frame=1.00 pipelines/frame=1.00 descriptors/frame=2.00 allocations/frame=3.00"));
  if(systemTranslationPolicy().overlap)assert(strstr(line,"overlap_depth=1/2 completion_ms=50.000/90.000"));else assert(!strstr(line,"overlap_depth="));
@@ -30,6 +31,7 @@ int main(){
  assert(window.size()==2049 && window.percentile(&FrameSample::wall,90)==1000000);
  out=tmpfile();assert(out);window.report(out);rewind(out);assert(fgets(line,sizeof(line),out));fclose(out);
  assert(strstr(line,"snapshot_bytes/frame=0.00 shadow_copy_bytes/frame=0.00"));
+ assert(strstr(line,"shadow_scanned_indices/frame=0.00 shadow_full_reasons=indexed:0.00,whole_window:0.00,use_resource:0.00,blit:0.00,bounds:0.00,other:0.00"));
  assert(strstr(line,"plan_hits/frame=0.00 plan_misses/frame=0.00"));
  assert(strstr(line,"n=2049 samples=1024 wall=1.000/1.000/10000.000"));
  assert(strstr(line,"submits/frame=0.00 image_barriers/frame=0.00"));

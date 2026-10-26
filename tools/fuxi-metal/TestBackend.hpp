@@ -34,7 +34,7 @@ struct Operation {
  Texture *texture{};Pipeline *pipeline{};uint64_t encoderID{};float clear[4]{};bool renderDraw=false;
  Texture *sourceTexture{};Sampler *sampler{};uint32_t vertices=3;bool upload=false,clearOnly=false;
  uint32_t srcX{},srcY{},dstX{},dstY{},width{},height{};size_t rowBytes{};
- Texture *samples[resourceSlots]{};Sampler *samplers[resourceSlots]{};BufferBind buffers[2][resourceSlots]{};Buffer *indices{};uint64_t indexOffset{};uint32_t first{},load=2,store=1;Topology topology=Topology::Triangle;
+ Texture *samples[resourceSlots]{};Sampler *samplers[resourceSlots]{};BufferBind buffers[2][resourceSlots]{};Buffer *indices{};uint64_t indexOffset{};uint32_t first{},load=2,store=1,indexWidth=2;Topology topology=Topology::Triangle;
  Viewport viewport{0,256,256,-256,0,1};Rect scissor{{0,0},{256,256}};
  uint32_t areaWidth{},areaHeight{};
  uint32_t srcLevel{},dstLevel{},sampleBase[resourceSlots]{},sampleCount[resourceSlots]{};bool generateMips=false;uint32_t mipBase{},mipCount{};

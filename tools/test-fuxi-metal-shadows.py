@@ -31,7 +31,8 @@ def main():
             print('SKIP: lavapipe pixels require --icd and --glslang')
             return
         vertex = '''#version 450
-void main(){vec2 p[6]=vec2[](vec2(-1,-1),vec2(1,-1),vec2(-1,1),vec2(-1,1),vec2(1,-1),vec2(1,1));gl_Position=vec4(p[gl_VertexIndex],0,1);}
+layout(location=0) in vec2 position;
+void main(){gl_Position=vec4(position,0,1);}
 '''
         fragment = '''#version 450
 layout(set=0,binding=0) uniform Color {vec4 value;} c;
