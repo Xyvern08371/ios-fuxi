@@ -263,10 +263,12 @@ typedef void OSObject;
 typedef int IOReturn;
 struct IOService {};
 struct IOMemoryMap {};
+static void advanceGate(uint64_t);
 struct IOWorkLoop {
  bool gated=false;
- IOReturn runAction(IOReturn (*action)(OSObject *,void *,void *,void *,void *),OSObject *owner) {
-  assert(!gated);gated=true;auto r=action(owner,nullptr,nullptr,nullptr,nullptr);gated=false;return r;
+ uint64_t gateDelay=0;
+ IOReturn runAction(IOReturn (*action)(OSObject *,void *,void *,void *,void *),OSObject *owner,void *arg=nullptr) {
+  assert(!gated);advanceGate(gateDelay);gated=true;auto r=action(owner,arg,nullptr,nullptr,nullptr);gated=false;return r;
  }
 };
 using thread_call_param_t=void *;
@@ -278,6 +280,7 @@ struct IOLock {bool held=false;};
 static void IOLockLock(IOLock *p) {assert(!p->held);p->held=true;}
 static void IOLockUnlock(IOLock *p) {assert(p->held);p->held=false;}
 static uint64_t ticks=1000;
+static void advanceGate(uint64_t delay) {ticks+=delay;}
 static unsigned waitSleeps;static bool interruptWait;static void (*waitHook)();
 static void IOLockWakeup(IOLock *p,void *,bool) {assert(p->held);}
 static int IOLockSleepDeadline(IOLock *p,void *,uint64_t deadline,int) {
@@ -318,9 +321,12 @@ static int fuxi_gpu_scanout_te(struct fg_te_observer *te) {
 static unsigned scanPublications;
 static int fuxi_gpu_scanout_acquire(void) {return scanAcquire;}
 static int fuxi_gpu_scanout_publish(void) {scanPublications++;if(scanPublish==1){scanTimes.previous_start=scanTimes.start;scanTimes.start=mach_absolute_time();}if(scanPublish==2)scanBackReady=true;return scanPublish;}
-static char importStatsLog[2048],teStatsLog[2048],frameStatsLog[2048],stageStatsLog[2048];
+static char importStatsLog[2048],teStatsLog[2048],frameStatsLog[2048],stageStatsLog[2048],pacingStatsLog[2048];
 static int IOLog(const char *format,...) {
  logs++;
+ if(strstr(format,"SWEET FB: pacing")) {
+  va_list args;va_start(args,format);vsnprintf(pacingStatsLog,sizeof(pacingStatsLog),format,args);va_end(args);
+ }
  if(strstr(format,"SWEET FB: stages")) {
   va_list args;va_start(args,format);vsnprintf(stageStatsLog,sizeof(stageStatsLog),format,args);va_end(args);
  }
@@ -567,7 +573,11 @@ int main(void) {
  queued.fNextTick=ticks+queued.fTickAbs;uint64_t nextTick=queued.fNextTick,count=queued.fVsyncCount;
  unsigned oldArms=arms;surface.gpuWriters=0;surface.gpuReadyTime=mach_absolute_time();AppleCLCD::writerRetired(&queued);
  assert(wake.pending && arms==oldArms && queued.fStatFrames==complete && scanPublications==publications);
- AppleCLCD::writerRetired(&queued);runWake(wake);
+ uint64_t wakeQueued=queued.fWriterWakeQueued;
+ ticks+=3000;AppleCLCD::writerRetired(&queued);assert(queued.fWriterWakeQueued==wakeQueued);
+ uint64_t dispatchDelay=ticks-wakeQueued;qloop.gateDelay=2000;runWake(wake);qloop.gateDelay=0;
+ assert(queued.fWakeN[0]==1 && queued.fWakeN[1]==1 && queued.fWakeSum[0]==dispatchDelay && queued.fWakeSum[1]>=2000);
+ assert(!queued.fWriterWakeQueued);
  assert(!wake.pending && arms==oldArms+1 && qtimer.next==nextTick && !qloop.gated);
  assert(queued.fStage[1]==surface.gpuReadyTime && queued.fStage[2]>=surface.gpuReadyTime);
  assert(get32(queued.fLast.bytes,0x50)==4 && !queued.fDirty && queued.fStatFrames==complete+1);
@@ -664,12 +674,24 @@ int main(void) {
  assert(held.fReuseBeforeShow==2 && held.fOverflowDrops==1 && surface.displayUses==baseUses+3);
  assert(held.swapWait(3,0x80000000u,0)==0 && held.swapWait(3,0x80000001u,0)==kIOReturnAborted);
  for(unsigned i=0;i<3;i++)held.presentNext();assert(surface.displayUses==baseUses);
- // No completion or release on GPU submit, busy fence, or deferred publication.
+ // Source consumption precedes START only after successful copy retirement.
  put32(frame,0x50,7);assert(held.swap(frame)==0);gpuMode=2;held.presentNext();
  pollMode=0;held.presentStep(true);assert(surface.displayUses==baseUses+1 && held.swapWait(7,0x80000000u,0)==kIOReturnBusy);
- pollMode=1;scanPublish=2;held.presentStep(true);
- assert(held.fPublicationPending && surface.displayUses==baseUses+1 && held.swapWait(7,0x80000001u,0)==kIOReturnBusy);
+ unsigned beforePublication=held.fStatFrames;pollMode=1;scanPublish=2;held.presentStep(true);
+ assert(held.fPublicationPending && surface.displayUses==baseUses && held.swapWait(7,0x80000001u,0)==kIOReturnBusy);
+ assert(held.swapWait(7,0x80000000u,0)==0 && held.swapWait(0,0x80000000u,0)==0);
+ assert(held.fWaitEarly==2 && held.fWaitLatest==1 && held.fWaitPoll[0] && held.fWaitPoll[1] && held.fOutstandingMax==3);
+ assert(held.swapWait(0,0x80000002u,0)==0 && held.swapWait(0,0x80000003u,0)==kIOReturnBusy);
+ // Reuse the consumed page and queue another frame while the captured image waits for TE.
+ surface.gpuWriterSerial++;surface.gpuWriterEpoch++;surface.gpuWriters=1;
+ put32(frame,0x50,15);assert(held.swap(frame)==0 && held.fPendingCount==1);
+ put32(frame,0x50,71);assert(held.swap(frame)!=0); // consumed/unshown history cannot be evicted
+ assert(held.swapWait(0,0x80000000u,0)==kIOReturnBusy && held.swapWait(7,0x80000000u,0)==0);
+ held.presentStep(true);assert(held.fPublicationPending && held.fPendingCount==1 && held.fStatFrames==beforePublication);
  scanPublish=1;scanRetryResult=1;held.presentStep(true);scanRetryResult=0;
+ assert(held.fLast.shown && !held.fLast.stale && held.fPendingCount==1);
+ assert(held.swapWait(7,0x80000001u,0)==0 && held.swapWait(15,0x80000000u,0)==kIOReturnBusy);
+ surface.gpuWriters=0;IOLockLock(held.fLock);held.releaseRecord(held.fPending[0]);held.fPendingCount=0;held.fDirty=false;IOLockUnlock(held.fLock);
  assert(surface.displayUses==baseUses && held.swapWait(7,0x80000001u,0)==0);
  // Later writers on a shown record do not increment reuse_before_show.
  surface.gpuWriterSerial++;held.fStatFrames=599;held.presentStats(1);
@@ -710,12 +732,18 @@ int main(void) {
   uint64_t b=100000000ull+i*100000;
   staged.fStage[0]=b;staged.fStage[1]=b+(i==599?3000:1000);staged.fStage[2]=staged.fStage[1]+2000;
   scanTimes.submitted=staged.fStage[2]+3000;scanTimes.fence=scanTimes.submitted+4000;scanTimes.previous_start=i?scanTimes.start:0;scanTimes.start=scanTimes.fence+5000;
+  staged.fWakeSum[0]+=6000;staged.fWakeMax[0]=6000;staged.fWakeN[0]++;
+  staged.fWakeSum[1]+=2000;staged.fWakeMax[1]=2000;staged.fWakeN[1]++;
+  staged.fStageBlocks[0]++;staged.fStageBlocks[1]+=2;staged.fStageBlocks[2]+=3;
   staged.fStageCallbacks[0]+=2;staged.fStageCallbacks[1]+=3;staged.fStageCallbacks[2]++;
   staged.presentStats(12000);
   if(i==598)assert(logs==beforeLogs);
   if(i==599) {
    assert(strstr(stageStatsLog,"swap_ready_us=1/3 ready_present_us=2/2 present_submit_us=3/3 submit_fence_us=4/4 fence_start_us=5/5 start_start_us=100/102"));
    assert(strstr(stageStatsLog,"samples=600/600/600/600/600/599 callbacks_vsync=1200 poll=1800 wake=600 callbacks_per_shown_x1000=2000/3000/1000"));
+   assert(strstr(pacingStatsLog,"wake_dispatch_us=6/6 wake_gate_us=2/2 wake_samples=600/600 blocked_publication=600 acquire=1200 ring=1800"));
+   for(unsigned j=0;j<2;j++)assert(!staged.fWakeN[j] && !staged.fWakeSum[j] && !staged.fWakeMax[j]);
+   for(unsigned j=0;j<3;j++)assert(!staged.fStageBlocks[j]);
    for(unsigned j=0;j<6;j++)assert(!staged.fStageN[j] && !staged.fStageSum[j] && !staged.fStageMax[j]);
    assert(!staged.fStatFrames && !staged.fStageCallbacks[0] && !staged.fStageCallbacks[1] && !staged.fStageCallbacks[2]);
   }
@@ -824,7 +852,7 @@ def main():
         methods = ''.join(function(display, name) for name in (
             'sweet_fb_te_configure', 'AppleCLCD::teVsyncTick', 'AppleCLCD::teVsyncLog',
             'AppleCLCD::presentWantedLocked', 'AppleCLCD::wakePresentLocked', 'sweet_fb_rearm',
-            'AppleCLCD::vsyncFired', 'AppleCLCD::scanoutLog', 'get32', 'AppleCLCD::observeRecord', 'AppleCLCD::recordDone', 'AppleCLCD::releaseRecord',
+            'AppleCLCD::vsyncFired', 'AppleCLCD::scanoutLog', 'get32', 'AppleCLCD::observeRecord', 'AppleCLCD::recordDone', 'AppleCLCD::consumeRecord', 'AppleCLCD::releaseRecord',
             'AppleCLCD::swapWait', 'AppleCLCD::stopRecords',
             'AppleCLCD::writerRetired', 'AppleCLCD::writerWake', 'AppleCLCD::writerWakeAction',
             'AppleCLCD::presentStep', 'AppleCLCD::stageStats', 'AppleCLCD::completePresent', 'AppleCLCD::presentStats', 'AppleCLCD::presentNext', 'AppleCLCD::swap', 'AppleCLCD::present'))

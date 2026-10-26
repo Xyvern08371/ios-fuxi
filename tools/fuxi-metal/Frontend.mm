@@ -905,7 +905,7 @@ static id surveyPipeline(id refused,NSError **error,id device){
 struct FuxiEventPoint {size_t operation;FuxiEvent *event;uint64_t value;bool signal;};
 @class FuxiCommandBuffer;
 static thread_local FuxiCommandBuffer *completionCommand;
-@interface FuxiQueue : FuxiLabeledObject { @public fuxi::ShadowPool _shadowPool;id _device;dispatch_queue_t _completionQueue,_submitQueue,_retireQueue,_deliveryQueue;dispatch_semaphore_t _inflight;std::atomic<unsigned> _depth;std::atomic<uint64_t> _traceReturn,_traceDelivery,_traceHandlers,_traceWaitCompleted,_traceWaitScheduled; }
+@interface FuxiQueue : FuxiLabeledObject { @public fuxi::ShadowPool _shadowPool;id _device;dispatch_queue_t _completionQueue,_submitQueue,_retireQueue,_finishQueue,_deliveryQueue;dispatch_semaphore_t _inflight;std::atomic<unsigned> _depth;std::atomic<uint64_t> _traceReturn,_traceDelivery,_traceHandlers,_traceWaitCompleted,_traceWaitScheduled; }
 @end
 @interface FuxiCommandBuffer : FuxiLabeledObject {
  @public FuxiQueue *_queue; NSMutableArray *_resources,*_handlers,*_scheduledHandlers; NSError *_error;dispatch_group_t _completionGroup;
@@ -1161,7 +1161,7 @@ static NSString *renderPassText(MTLRenderPassDescriptor *d){
  [text appendFormat:@"] depth={%@ clear=%.17g} stencil={%@ clear=%u}",passAttachmentText(d.depthAttachment),d.depthAttachment.clearDepth,passAttachmentText(d.stencilAttachment),d.stencilAttachment.clearStencil];return text;
 }
 @implementation FuxiQueue
-- (void)dealloc {for(auto q:{_completionQueue,_submitQueue,_retireQueue,_deliveryQueue})if(q)dispatch_release(q);if(_inflight)dispatch_release(_inflight);[_device release];[super dealloc];}
+- (void)dealloc {for(auto q:{_completionQueue,_submitQueue,_retireQueue,_finishQueue,_deliveryQueue})if(q)dispatch_release(q);if(_inflight)dispatch_release(_inflight);[_device release];[super dealloc];}
 - (id)device {CENSUS();return _device;}
 - (id)commandBuffer {CENSUS();
  FuxiCommandBuffer *b=[FuxiCommandBuffer new];b->_queue=[self retain];
@@ -1443,7 +1443,8 @@ static NSString *renderPassText(MTLRenderPassDescriptor *d){
  if(_overlap){
   // Start the fence wait before user scheduled handlers. Retirement can free a
   // flight slot even if a handler enqueues another command on this queue.
-  dispatch_async(_queue->_retireQueue,^{@autoreleasepool{[self retireCommitted];}});
+  auto queued=_frameTrace?fuxi::FrameClock::now():fuxi::FrameClock::time_point{};
+  dispatch_async(_queue->_retireQueue,^{@autoreleasepool{if(_frameTrace)_flightTrace.retireQueue=fuxi::frameNanos(queued);[self retireCommitted];}});
   auto start=_frameTrace?fuxi::FrameClock::now():fuxi::FrameClock::time_point{};[self publishScheduled];if(_frameTrace)_flightTrace.scheduledHandlers=fuxi::frameNanos(start);dispatch_group_leave(_scheduledGroup);
  }
  else [self retireCommitted];
@@ -1463,9 +1464,15 @@ static NSString *renderPassText(MTLRenderPassDescriptor *d){
  _flightTrace.wall=fuxi::frameNanos(_commitStart);
  if(!_overlap && _surfaceFrame && _status!=MTLCommandBufferStatusError)fuxi::backboardGate.completed((_frameTrace || _overlap)?_flightTrace.gpuExec:fuxi::Backend::gpuNanos.load()-_gpuBefore,_flightTrace.wall/1e6,_frameTrace?&_flightTrace:nullptr);
  }
+ if(_overlap){
+  --_queue->_depth;dispatch_semaphore_signal(_queue->_inflight);
+  dispatch_async(_queue->_finishQueue,^{@autoreleasepool{[self finishCommitted];}});
+ }else [self finishCommitted];
+}
+- (void)finishCommitted {
  if(!_overlap)[self publishScheduled];
  if(_overlap){
-  --_queue->_depth;dispatch_semaphore_signal(_queue->_inflight);dispatch_group_wait(_scheduledGroup,DISPATCH_TIME_FOREVER);
+  dispatch_group_wait(_scheduledGroup,DISPATCH_TIME_FOREVER);
   _flightTrace.completionLatency=fuxi::frameNanos(_commitStart);
   if(_surfaceFrame && _status!=MTLCommandBufferStatusError)fuxi::backboardGate.completed(_flightTrace.gpuExec,_flightTrace.wall/1e6,_frameTrace?&_flightTrace:nullptr);
  }
@@ -1735,7 +1742,8 @@ static NSString *surfaceDescriptorText(IOSurfaceRef surface,NSUInteger plane){
  // The compositor's submit/retire/handler work is on the frame path; at default
  // QoS it competes with background daemons (UniXNU AdrenoMetal c6d29ca does the same).
  dispatch_queue_attr_t attr=dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL,compositorQoS(),0);
- q->_submitQueue=dispatch_queue_create("fuxi.metal.submit",attr);q->_retireQueue=dispatch_queue_create("fuxi.metal.retire",attr);q->_deliveryQueue=dispatch_queue_create("fuxi.metal.handlers",attr);q->_inflight=dispatch_semaphore_create(2);
+ q->_submitQueue=dispatch_queue_create("fuxi.metal.submit",attr);q->_retireQueue=dispatch_queue_create("fuxi.metal.retire",attr);q->_finishQueue=dispatch_queue_create("fuxi.metal.finish",attr);q->_deliveryQueue=dispatch_queue_create("fuxi.metal.handlers",attr);q->_inflight=dispatch_semaphore_create(2);
+ if(!q->_submitQueue || !q->_retireQueue || !q->_finishQueue || !q->_deliveryQueue || !q->_inflight){[q release];return nil;}
  }return q;}
 - (id)newHeapWithDescriptor:(MTLHeapDescriptor *)d {CENSUS();
  if(!d || d.type!=MTLHeapTypeAutomatic || !d.size || d.size>fuxi::Backend::maxBufferLength || (d.storageMode!=MTLStorageModeShared && d.storageMode!=MTLStorageModePrivate) || (d.cpuCacheMode!=MTLCPUCacheModeDefaultCache && d.cpuCacheMode!=MTLCPUCacheModeWriteCombined) ||

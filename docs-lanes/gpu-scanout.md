@@ -957,3 +957,133 @@ surface and GPU translation units passed syntax checks against saved XNU headers
 Native Objective-C frontend execution requires macOS and was skipped. The two
 optional external Turnip harnesses did not start without their required external
 patch/tree arguments; no external Mesa tree was patched or modified.
+
+## Source consumption before START and retirement queue isolation
+
+2026-10-27. **New device results: not yet observed.** The supplied HEAD run
+shows 600/600 swaps in 13,740 ms (43.7 shown/s), zero overflow/not-shown,
+copy average 1,294 us, TE 120.8 Hz and approximately 7.3 ms transfers. Stage
+averages/maxima in us are swap-ready 16098/56362, ready-present 5073/31859,
+present-submit 647/1656, submit-fence 646/1213, fence-START 5194/18660 and
+START-START 22901/476934. The supplied Metal p50s are wall 16.18 ms,
+cpu-before-commit 6.04, backend-submit 3.09, pipeline 0.14, GPU execution 6.40,
+commit-gap 15.38 and scheduled-wait zero; GPU busy is 22–30%. These describe
+the preceding implementation, not this revision. Averages, medians, different
+sampling windows and idle gaps must not be subtracted as an exact latency budget.
+
+Short factual conclusions from a read-only iOS 16.7 shared-cache audit:
+
+- Ordinary `can_update_` at 0x1882beb2c..0x1882beb40 loads the candidate
+  **page's nonzero swap ID**, passes mode 0 (blocking or bit-31 poll depending
+  on caller/configuration), and clears that page ID only on success. It does
+  not replace that ID with zero or unconditionally wait on the newest swap.
+  `finish_update` at 0x1882d1120..0x1882d1138 polls individual page IDs with
+  0x80000000. The displayed-frame checks use 0x80000001, including
+  0x1882bed04..0x1882bed10; an optional global gate uses mode 1 as well.
+- Pages are 0x30 bytes apart. `finish_update_` at
+  0x1882ed374..0x1882ed388 advances the current/next indices modulo the page
+  count; `can_update_` scans at most two candidates per invocation. Thus this
+  is per-page reuse, not inherently a single global outstanding-swap gate.
+  The cache does not establish this device's runtime page count/configuration.
+- `kern_SwapWait` forwards the supplied ID/flags unchanged to selector 6 and
+  supplies timeout zero. The cache contains the userspace caller, not Apple's
+  kernel implementation: it does **not** prove that mere queue acceptance is
+  sufficient, nor Apple's special handling of ID zero. Our existing ID-zero
+  behavior snapshots the latest accepted ID at wait entry (except drain modes).
+  No Apple implementation or binary is included here.
+
+The compatibility conclusion is to distinguish the ordinary source-reuse gate
+from the displayed-frame test. `AppleCLCD::consumeRecord` now completes mode 0
+only when the **entire source copy has retired**, including cache handoff, or
+when the record is dropped. It never completes on queue admission or GPU
+submission. `completePresent` calls it before attempting START. CPU/multilayer
+copies first finish all reads and release their reader guard; GPU copies first
+pass `sweet_surface_gpu_poll`. At that point the self-contained A/B image can
+wait for TE without retaining an IOSurface display use. Mode 1 still requires
+successful START; dropped records still abort it. Modes 2/3 retain the respective
+source/display drain distinction. Unknown IDs, live history collisions, failed
+DMA/quarantine, stopped ownership and bounded interruptible waits stay closed.
+This supersedes the preceding section's mode-0-until-START timing.
+
+CA can now reuse a consumed page and submit another frame while the preceding
+captured image waits for publication. The implementation still bounds storage
+to **three waiting records plus one active/unpublished record**, and protects
+both queued and consumed/unshown history entries. It grants no unretired-source
+reuse. Actual CA depth depends on its page pool and flags; `outstanding_max`
+measures live queued plus consumed/unshown swaps on the next run. The new
+production test advances the source writer epoch, queues another render before
+START, verifies that mode 0 succeeds only for the consumed ID, ID zero selects
+the newer ID, mode 1 remains busy, and START publishes the captured older image.
+Post-consumption source writes no longer count as stale/reuse-before-show;
+redraw reacquires display holds, writer epochs and reader admission.
+
+Latency explanations and changes, from code rather than new device timing:
+
+- `swap_ready` ends at the last `sweet_gpu_writer` decrement, not the hardware
+  render fence. It includes commit/worker admission, queueing, exclusive leases,
+  backend recording/submission, Vulkan fence observation, backend retirement
+  mutex/cache cleanup and frontend lease destruction. Metal's overlap `wall`
+  likewise runs from commit through lease release; `cpu_before_commit` is a
+  separate earlier interval. The approximately 3 ms submit plus 6.4 ms GPU
+  execution do not include those other waits. There is no evidence identifying
+  the missing approximately 6 ms as one specific scheduler or fence-poll delay.
+- `FuxiCommandBuffer::retireCommitted` previously kept the serial retire queue
+  through scheduled-group waits, gate/trace reporting and command-resource
+  cleanup. Later fences/lease unlocks could wait behind that tail. It now keeps
+  fence/cache retirement, poison handling, lease release and flight-slot release
+  on that queue, then dispatches `finishCommitted` to a separate serial queue.
+  Scheduled-before-completed and completed-handler ordering remain; GPU slots
+  remain bounded. Completed command resources can remain retained behind slow
+  finish work. The backend's safety drains and external fence poll are unchanged.
+- `ready_present` includes waiting for the previous ready image's START,
+  back-buffer acquisition, busy client/ring reservations and wake dispatch.
+  `presentStep` already proceeds from successful START to next-copy admission
+  in the same workloop action. `fg_scanout_acquire(0)` already permits a copy
+  into the old front while the new front transfers. Its back-ready refusal is
+  necessary: both A/B images are occupied until publication. Removing it would
+  overwrite an unshown frame. The TE/transfer checks remain unchanged.
+- Completing mode 0 and dropping display holds at copy retirement removes the
+  preceding frame's **fence-to-START wait (about 5.2 ms in the supplied run)**
+  from the source-reuse dependency. The next render may overlap that wait and
+  be ready sooner when START frees the back buffer. Copy summary logging now
+  follows `completePresent`, so it cannot delay source release or the first
+  publication attempt. No extra copy, fence spin, DPU write or timer hop is added.
+
+New cheap aggregated diagnostics, with no per-frame logging:
+
+- The existing stats line appends cumulative `wait_mode0`, `wait_mode1`
+  (query counts, including drain modes by low bit), `wait_early` (successful
+  ordinary consumed/unshown queries, not frames), `wait_id0` (all zero-ID
+  queries, including drains), and lifetime `outstanding_max`.
+- One `SWEET FB: pacing` line accompanies each 600-shown window:
+  `wake_dispatch_us=A/M wake_gate_us=A/M wake_samples=N/N
+  blocked_publication=P acquire=A ring=R`. Wake timings measure the earliest
+  coalesced request to thread-call entry, then entry to workloop action. Both
+  swap and writer-release requests use this call. P/A/R count blocked attempts
+  at pending publication, scanout acquisition and copy/ring admission; these
+  are not frame drops or disjoint time budgets. Timing totals/maxima/sample
+  counts and blocked counts reset with each 600-frame window.
+- `fuxigpuframetrace` adds `retire_queue=p50/p90` ms, from retirement dispatch
+  to execution. Compare it with existing `submit_queue`, `admission_wait`,
+  `gpu_wait`, `gpu_exec`, `retire_lock`, `invalidate`, `retire_host` and
+  `surface_release`. It can overlap GPU execution; it is not additive GPU time.
+
+Expected effect: overlap the next CA render with deferred TE publication and
+remove completion bookkeeping from subsequent lease retirement. Stable 60/s
+is the qualification target, **not an observed result or guaranteed bound**;
+120/s still requires the complete render/copy path to sustain an 8.27 ms period.
+Qualify matching kernel/FuxiMetal builds with the existing overlap, early-wait,
+TE, double-buffer and panel120 options. Compare shown/swaps, START gaps,
+stage averages/maxima, new counters, image integrity, blank/wake and quarantine.
+No firmware, boot defaults, external Mesa/translator code or GPU vote changes.
+
+Validation: 13 host suites pass: unixnu, GPU scanout, IOSurface, portable Metal
+frontend, Metal backend, Metal overlap, Metal frame trace, Adreno, host import,
+GPU K1, Metal ABI, Adreno mapping and Adreno cache. Sanitizers/software-ICD
+checks pass where enabled. Complete framebuffer, surface, Adreno, console,
+vfs and UFS translation units pass syntax with saved XNU headers. All twelve
+`tools/sync-fuxi-*.py --check` commands pass. Regenerated patch **0106** is the
+only changed patch; regenerated **0098**/**0108** and checked **0100** are
+unchanged. Native `.mm` queue/lease tests are inspected but cannot compile/run
+on Linux; macOS compilation/execution, full kernel link and device performance
+remain unverified. No device access, deployment, push or workflow run occurred.

@@ -102,6 +102,18 @@ int main(){@autoreleasepool{
  fuxi::Backend::beforeSubmit=[&]{recording.set_value();proceed.wait();};a=earlyCommand();
  assert([a commitAndWaitUntilSubmitted]);recording.get_future().wait();assert(!a->_scheduled && heldLocks==2);
  releaseRecording.set_value();[a waitUntilCompleted];fuxi::Backend::beforeSubmit={};assert(!heldLocks);[a release];
+ // Completion bookkeeping cannot hold the next source lease or flight slot.
+ dispatch_suspend(earlyQueue->_finishQueue);a=earlyCommand();b=earlyCommand();third=earlyCommand();
+ __block unsigned finishedOrder=0;
+ [a addCompletedHandler:^(id<MTLCommandBuffer> c){(void)c;assert(finishedOrder++==0);}];
+ [b addCompletedHandler:^(id<MTLCommandBuffer> c){(void)c;assert(finishedOrder++==1);}];
+ [third addCompletedHandler:^(id<MTLCommandBuffer> c){(void)c;assert(finishedOrder++==2);}];
+ for(auto *command:{a,b,third})assert([command commitAndWaitUntilSubmitted]);
+ dispatch_sync(earlyQueue->_submitQueue,^{});dispatch_sync(earlyQueue->_retireQueue,^{});
+ assert(!heldLocks && !earlyQueue->_depth && !finishedOrder && !a->_finished && !b->_finished && !third->_finished);
+ assert(a->_flightTrace.retireQueue && b->_flightTrace.retireQueue && third->_flightTrace.retireQueue);
+ dispatch_resume(earlyQueue->_finishQueue);[third waitUntilCompleted];assert(finishedOrder==3);
+ [a release];[b release];[third release];
  // A reservation failure rejects commit; a later submission failure keeps its reservation closed.
  failPending=true;a=earlyCommand();assert(![a commitAndWaitUntilSubmitted]);[a waitUntilCompleted];assert(a.error && !heldLocks);[a release];failPending=false;
  fuxi::Backend::beforeSubmit=[]{throw std::runtime_error("modeled recording failure");};a=earlyCommand();

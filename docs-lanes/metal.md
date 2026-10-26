@@ -2279,3 +2279,33 @@ Validation passed: 14 related host suites (including production scanout/unixnu,
 frontend lease models, lavapipe overlap and external KMD submit), all 12 sync
 checks, and complete framebuffer/surface/Adreno/console/vfs/UFS syntax with saved
 XNU headers. Native Objective-C tests are skipped on Linux.
+
+### Retirement queue and source-reuse pacing
+
+2026-10-27. **Device results for this revision: not yet observed.** See
+[the scanout pacing audit](gpu-scanout.md#source-consumption-before-start-and-retirement-queue-isolation)
+for the supplied 43.7 shown/s baseline, short shared-cache conclusions,
+SwapWait/source-hold contract, latency accounting and qualification criteria.
+CA's ordinary reuse waits pass individual page IDs and mode 0; displayed-frame
+checks use mode 1. The cache does not prove queue-acceptance retirement or the
+runtime CA page count. Source consumption after clean-copy retirement now
+releases mode 0 and display holds before TE/START, while mode 1 remains tied
+to START. Writer/read/cache/unknown-DMA guards remain mandatory.
+
+The overlap retire queue now ends after backend fence/cache retirement,
+producer-lease destruction and flight-slot release. A separate serial finish
+queue handles scheduled-group waits, gate/trace reporting, completion delivery
+and command-resource cleanup. This prevents a slow finish tail from delaying
+the next lease retirement. Submit ordering, actual scheduled status, handler
+order, completion waits, backend conflict/index/shadow drains and poison
+retention remain. Slow completion work can retain completed command resources;
+the two GPU slots do not bound the early-submit command backlog.
+
+`retire_queue=p50/p90` ms measures dispatch-to-retirement entry in the existing
+frame trace; other retirement, submit and fence fields retain their meaning.
+`wall` starts at commit and ends after lease release; it excludes the separate
+`cpu_before_commit`. No comparison of p50 wall/submit/GPU time isolates a single
+extra delay. The new native paused-finish test requires that three same-surface
+commands retire and release every lease/flight while completion work is paused,
+then deliver their completion handlers in order. Native `.mm` compilation and
+execution still require macOS; Linux portable tests cannot establish that result.

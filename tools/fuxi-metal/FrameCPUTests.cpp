@@ -9,6 +9,8 @@ static uint64_t testCPU(){++reads;return fakeCPU;}
 #include "FrameTrace.hpp"
 #include <cassert>
 #include <thread>
+#include <memory>
+#include <string>
 int main(){
  using namespace fuxi;
  FrameSample sample;FrontendTimes frontend;
@@ -43,5 +45,10 @@ int main(){
   auto value=frameKernelCall([]{return 7;});assert(value==7 && reads==before && !sample.kernelIOCPU);
   assert(bool(sample.kernelIO)==systemTranslationPolicy().frameTrace);
  }
+ auto trace=std::make_unique<FrameTraceWindow>();
+ for(unsigned i=1;i<=10;++i){FrameSample s;s.retireQueue=i*1000000;trace->add(s);}
+ assert(trace->percentile(&FrameSample::retireQueue,50)==5000000 && trace->percentile(&FrameSample::retireQueue,90)==9000000);
+ FILE *report=tmpfile();assert(report);trace->report(report);rewind(report);char line[16384]{};assert(fgets(line,sizeof(line),report));fclose(report);
+ assert(std::string(line).find("retire_queue=5.000/9.000")!=std::string::npos && !trace->size());
  puts("PASS: bounded CPU reads, level 0/1 disabled, 120 nested methods, gaps, migration, stop/exception/failure");
 }

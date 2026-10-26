@@ -142,13 +142,15 @@ public:
 	OSArray      *fClients;
 	uint32_t      fSwapID;
 	bool          fConsolePaused;
- struct SwapRecord { uint8_t bytes[SWEET_FB_SWAP_REC_SIZE]; SweetSurface *surfaces[SWEET_FB_LAYERS]; uint64_t swapped, ready, writers[SWEET_FB_LAYERS], epochs[SWEET_FB_LAYERS]; bool shown, reused, stale; unsigned uses; };
+ struct SwapRecord { uint8_t bytes[SWEET_FB_SWAP_REC_SIZE]; SweetSurface *surfaces[SWEET_FB_LAYERS]; uint64_t swapped, ready, writers[SWEET_FB_LAYERS], epochs[SWEET_FB_LAYERS]; bool shown, consumed, reused, stale; unsigned uses; };
  SwapRecord    fPending[SWEET_FB_QUEUE_DEPTH], fLast;
  SwapRecord   *fPresentRecord;
  uint64_t      fReuseBeforeShow;
  struct SwapStatus { uint32_t id; unsigned state; } fSwapStatus[SWEET_FB_SWAP_HISTORY];
  uint32_t      fLatestSwap;
- enum { SwapQueued = 1, SwapShown, SwapDropped };
+ enum { SwapQueued = 1, SwapConsumed, SwapShown, SwapDropped };
+ uint64_t      fWaitPoll[2], fWaitEarly, fWaitLatest;
+ unsigned      fOutstandingMax, fStageBlocks[3];
  unsigned      fPendingCount;
  bool          fLastValid, fReplay;
  uint32_t      fQueuedDefers, fOverflowDrops, fReadySkips;
@@ -188,6 +190,8 @@ public:
  uint64_t      fPublicationTime;
  uint64_t      fStage[6], fStageSum[6], fStageMax[6], fLastStart;
  unsigned      fStageN[6], fStageCallbacks[3];
+ uint64_t      fWriterWakeQueued, fWakeSum[2], fWakeMax[2];
+ unsigned      fWakeN[2];
  bool          fStageGpu;
  bool presentStep(bool flush);
  void stageStats(uint64_t now);
@@ -205,6 +209,7 @@ public:
 	IOReturn swap(const uint8_t *rec);
  IOReturn swapWait(uint32_t id, uint32_t flags, uint64_t timeout);
  void recordDone(SwapRecord &record, bool shown);
+ void consumeRecord(SwapRecord &record);
  void stopRecords(void);
 	bool present(const SwapRecord &record);
  void presentNext(void);
@@ -679,7 +684,7 @@ static uint64_t sweet_fb_swap_count;
 void AppleCLCD::observeRecord(SwapRecord &record, bool shown)
 {
 #if defined(FUXI)
- if (!record.shown) for (unsigned i = 0; i < SWEET_FB_LAYERS; i++) if (record.surfaces[i]) {
+ if (!record.shown && !record.consumed) for (unsigned i = 0; i < SWEET_FB_LAYERS; i++) if (record.surfaces[i]) {
   uint64_t epoch = 0, serial = sweet_surface_writer_serial(record.surfaces[i], &epoch);
   if (epoch != record.epochs[i]) record.stale = true;
   if (!record.reused && serial != record.writers[i]) {
@@ -690,11 +695,19 @@ void AppleCLCD::observeRecord(SwapRecord &record, bool shown)
  record.shown |= shown;
 }
 
-void AppleCLCD::recordDone(SwapRecord &record, bool shown)
+void AppleCLCD::consumeRecord(SwapRecord &record)
 {
- observeRecord(record, shown);
+ observeRecord(record, false); record.consumed = true;
  for (unsigned i = 0; i < SWEET_FB_LAYERS; i++) if (record.uses & (1u << i)) sweet_surface_display_drop(record.surfaces[i]);
  record.uses = 0;
+ uint32_t id = get32(record.bytes, 0x50);
+ SwapStatus &status = fSwapStatus[id % SWEET_FB_SWAP_HISTORY];
+ if (id && status.id == id && status.state == SwapQueued) { status.state = SwapConsumed; IOLockWakeup(fLock, fSwapStatus, false); }
+}
+
+void AppleCLCD::recordDone(SwapRecord &record, bool shown)
+{
+ consumeRecord(record); record.shown |= shown;
  uint32_t id = get32(record.bytes, 0x50);
  SwapStatus &status = fSwapStatus[id % SWEET_FB_SWAP_HISTORY];
  if (id && status.id == id) { status.state = record.shown ? SwapShown : SwapDropped; IOLockWakeup(fLock, fSwapStatus, false); }
@@ -709,7 +722,10 @@ void AppleCLCD::releaseRecord(SwapRecord &record)
 void AppleCLCD::writerRetired(void *context)
 {
  #if defined(FUXI)
- (void)thread_call_enter(((AppleCLCD *)context)->fWriterWakeCall);
+ AppleCLCD *fb = (AppleCLCD *)context;
+ uint64_t empty = 0, now = mach_absolute_time();
+ (void)__atomic_compare_exchange_n(&fb->fWriterWakeQueued, &empty, now, false, __ATOMIC_RELAXED, __ATOMIC_RELAXED);
+ (void)thread_call_enter(fb->fWriterWakeCall);
 #else
  (void)context;
 #endif
@@ -719,11 +735,20 @@ void AppleCLCD::writerRetired(void *context)
 void AppleCLCD::writerWake(thread_call_param_t context, thread_call_param_t)
 {
  AppleCLCD *fb = (AppleCLCD *)context;
- fb->fWorkLoop->runAction(&AppleCLCD::writerWakeAction, fb);
+ uint64_t stamps[2] = { __atomic_exchange_n(&fb->fWriterWakeQueued, 0, __ATOMIC_RELAXED), mach_absolute_time() };
+ fb->fWorkLoop->runAction(&AppleCLCD::writerWakeAction, fb, stamps);
 }
-IOReturn AppleCLCD::writerWakeAction(OSObject *owner, void *, void *, void *, void *)
+IOReturn AppleCLCD::writerWakeAction(OSObject *owner, void *arg, void *, void *, void *)
 {
  AppleCLCD *fb = (AppleCLCD *)owner;
+ if (arg) {
+  uint64_t *stamps = (uint64_t *)arg, now = mach_absolute_time();
+  for (unsigned i = 0; i < 2; i++) {
+   uint64_t a = stamps[i], b = i ? now : stamps[1];
+   if (!a || b < a) continue;
+   uint64_t d = b-a; fb->fWakeSum[i] += d; if (d > fb->fWakeMax[i]) fb->fWakeMax[i] = d; fb->fWakeN[i]++;
+  }
+ }
  fb->fStageCallbacks[2]++;
  IOLockLock(fb->fLock);
  bool wanted = !fb->fPowerOff && !fb->fScanoutHeld && (fb->fDirty || fb->fGpuPending || fb->fPublicationPending);
@@ -749,8 +774,8 @@ bool AppleCLCD::presentStep(bool flush)
    struct fg_present_times times; fuxi_gpu_scanout_stamps(&times);
    fStage[4] = times.fence;
    fGpuFrames++; fGpuTime += elapsed;
-   scanoutLog(true, fScanoutBytes, elapsed, fScanoutPrepare);
    completePresent(elapsed + fScanoutPrepare);
+   scanoutLog(true, fScanoutBytes, elapsed, fScanoutPrepare);
   } else {
    fGpuFailed++;
    IOLockLock(fLock); fReplay = fDirty = true; IOLockUnlock(fLock);
@@ -761,14 +786,14 @@ bool AppleCLCD::presentStep(bool flush)
   else if (published < 0) fScanoutHeld = true;
  }
  if (fScanoutHeld) { IOLockLock(fLock); stopRecords(); IOLockUnlock(fLock); return false; }
- if (fScanout && fuxi_gpu_scanout_pending()) { fScanoutDefers++; return false; }
+ if (fScanout && fuxi_gpu_scanout_pending()) { fStageBlocks[0]++; fScanoutDefers++; return false; }
  IOLockLock(fLock);
  bool off = fPowerOff, wanted = !fScanoutHeld && (off ? fFadeStep == 0 : fDirty && flush);
  IOLockUnlock(fLock);
  if (!wanted) return off && !fScanoutHeld;
  if (fScanout) {
   int writable = off ? fuxi_gpu_scanout_cpu_acquire() : fuxi_gpu_scanout_acquire();
-  if (writable != 1) { fScanoutHeld = writable < 0; fScanoutDefers++; if (fScanoutHeld) { IOLockLock(fLock); stopRecords(); IOLockUnlock(fLock); } return false; }
+  if (writable != 1) { fStageBlocks[1]++; fScanoutHeld = writable < 0; fScanoutDefers++; if (fScanoutHeld) { IOLockLock(fLock); stopRecords(); IOLockUnlock(fLock); } return false; }
  }
  if (off) return true;
  presentNext();
@@ -811,6 +836,7 @@ void AppleCLCD::presentNext(void)
   candidate.ready = ready;
 #endif
   if (replay && candidate.shown) {
+   candidate.consumed = false;
    bool held = true;
    for (unsigned i = 0; i < SWEET_FB_LAYERS; i++) if (candidate.surfaces[i]) {
     if (sweet_surface_display_hold(candidate.surfaces[i])) candidate.uses |= 1u << i; else held = false;
@@ -866,7 +892,7 @@ AppleCLCD::swap(const uint8_t *rec)
  IOLockLock(fLock);
  uint32_t id = get32(rec, 0x50);
  SwapStatus &status = fSwapStatus[id % SWEET_FB_SWAP_HISTORY];
- if (!id || id > fSwapID || status.id == id || status.state == SwapQueued || fScanoutHeld) {
+ if (!id || id > fSwapID || status.id == id || status.state == SwapQueued || status.state == SwapConsumed || fScanoutHeld) {
   IOLockUnlock(fLock); return kIOReturnNotReady;
  }
  SwapRecord record = {};
@@ -892,6 +918,9 @@ AppleCLCD::swap(const uint8_t *rec)
   fPendingCount--; fOverflowDrops++; fStatDropped++;
  }
  status.id = id; status.state = SwapQueued; fLatestSwap = id;
+ unsigned outstanding = 0;
+ for (unsigned i = 0; i < SWEET_FB_SWAP_HISTORY; i++) if (fSwapStatus[i].state == SwapQueued || fSwapStatus[i].state == SwapConsumed) outstanding++;
+ if (outstanding > fOutstandingMax) fOutstandingMax = outstanding;
  fPending[fPendingCount++] = record;
  fStatSwaps++; fDirty = true; wakePresentLocked();
  IOLockUnlock(fLock);
@@ -909,6 +938,8 @@ IOReturn AppleCLCD::swapWait(uint32_t id, uint32_t flags, uint64_t timeout)
  nanoseconds_to_absolutetime(timeout && timeout < 100000000ull ? timeout : 100000000ull, &duration);
  uint64_t deadline = mach_absolute_time() + duration;
  IOLockLock(fLock);
+ fWaitPoll[flags & 1]++;
+ if (!id) fWaitLatest++;
  if (!id && !(flags & 2)) id = fLatestSwap;
  IOReturn result;
  for (;;) {
@@ -916,12 +947,13 @@ IOReturn AppleCLCD::swapWait(uint32_t id, uint32_t flags, uint64_t timeout)
   if (fScanoutHeld) result = kIOReturnNotReady;
   else if (flags & 2) {
    bool pending = fPresentRecord != NULL;
-   for (unsigned i = 0; i < SWEET_FB_SWAP_HISTORY; i++) if (fSwapStatus[i].state == SwapQueued) pending = true;
+   for (unsigned i = 0; i < SWEET_FB_SWAP_HISTORY; i++) if (fSwapStatus[i].state == SwapQueued || ((flags & 1) && fSwapStatus[i].state == SwapConsumed)) pending = true;
    if (!pending) result = kIOReturnSuccess;
   } else {
    SwapStatus &status = fSwapStatus[id % SWEET_FB_SWAP_HISTORY];
    if (!id || status.id != id) result = kIOReturnNotFound;
    else if (status.state == SwapShown) result = kIOReturnSuccess;
+   else if (status.state == SwapConsumed && !(flags & 1)) { result = kIOReturnSuccess; fWaitEarly++; }
    else if (status.state == SwapDropped) result = flags & 1 ? kIOReturnAborted : kIOReturnSuccess;
   }
   if (result != kIOReturnBusy || (flags & 0x80000000u)) break;
@@ -1050,6 +1082,7 @@ AppleCLCD::present(const SwapRecord &record)
 			if ((mask & (mask-1)) == 0)
 				copied = sweet_surface_gpu_copy(s, src, sx, sy, dx, dy, w, h);
             if (copied == 3 || (copied < 0 && fScanout)) {
+             fStageBlocks[2]++;
              fScanoutDefers++;
              s->release();
              return false; /* busy ring: keep the record for retry */
@@ -1129,8 +1162,8 @@ AppleCLCD::present(const SwapRecord &record)
  if (!gpuFrame) {
   fStage[3] = fStage[4] = mach_absolute_time();
   if (read.held) { sweet_surface_present_end(); read.held = false; }
-  if (cpuFrame) scanoutLog(false, cpuBytes, cpuTicks, 0);
   completePresent(mach_absolute_time() - t0);
+  if (cpuFrame) scanoutLog(false, cpuBytes, cpuTicks, 0);
  }
 #endif
  return true;
@@ -1139,6 +1172,7 @@ AppleCLCD::present(const SwapRecord &record)
 void AppleCLCD::completePresent(uint64_t took)
 {
 #if defined(FUXI)
+ IOLockLock(fLock); consumeRecord(fPresentRecord ? *fPresentRecord : fLast); IOLockUnlock(fLock);
  int published = fuxi_gpu_scanout_publish();
  if (!published) fuxi_display_kick();
  if (published == 2) { fPublicationPending = true; fPublicationTime = took; }
@@ -1176,6 +1210,14 @@ void AppleCLCD::stageStats(uint64_t now)
      fStageN[0], fStageN[1], fStageN[2], fStageN[3], fStageN[4], fStageN[5], fStageCallbacks[0], fStageCallbacks[1], fStageCallbacks[2],
      (uint64_t)fStageCallbacks[0]*1000/600, (uint64_t)fStageCallbacks[1]*1000/600, (uint64_t)fStageCallbacks[2]*1000/600);
  bzero(fStageSum, sizeof(fStageSum)); bzero(fStageMax, sizeof(fStageMax)); bzero(fStageN, sizeof(fStageN)); bzero(fStageCallbacks, sizeof(fStageCallbacks));
+ uint64_t wakeAvg[2], wakeMax[2];
+ for (unsigned i = 0; i < 2; i++) {
+  absolutetime_to_nanoseconds(fWakeN[i] ? fWakeSum[i]/fWakeN[i] : 0, &wakeAvg[i]); wakeAvg[i] /= 1000;
+  absolutetime_to_nanoseconds(fWakeMax[i], &wakeMax[i]); wakeMax[i] /= 1000;
+ }
+ IOLog("SWEET FB: pacing wake_dispatch_us=%llu/%llu wake_gate_us=%llu/%llu wake_samples=%u/%u blocked_publication=%u acquire=%u ring=%u\n",
+     wakeAvg[0], wakeMax[0], wakeAvg[1], wakeMax[1], fWakeN[0], fWakeN[1], fStageBlocks[0], fStageBlocks[1], fStageBlocks[2]);
+ bzero(fWakeSum, sizeof(fWakeSum)); bzero(fWakeMax, sizeof(fWakeMax)); bzero(fWakeN, sizeof(fWakeN)); bzero(fStageBlocks, sizeof(fStageBlocks));
 #else
  (void)now;
 #endif
@@ -1198,11 +1240,13 @@ void AppleCLCD::presentStats(uint64_t took)
 		uint32_t swaps = fStatSwaps, dropped = fStatDropped;
   uint32_t pending = fQueuedDefers, overflow = fOverflowDrops, skips = fReadySkips;
   uint64_t reuse = fReuseBeforeShow;
+  uint64_t waits[2] = { fWaitPoll[0], fWaitPoll[1] }, early = fWaitEarly, latest = fWaitLatest;
+  unsigned outstanding = fOutstandingMax;
 		fStatSwaps = fStatDropped = 0;
 		IOLockUnlock(fLock);
 		IOLog("SWEET FB: stats %u frames in %llu ms, copy avg %llu us max %llu us, "
-		    "%u swaps, %u not shown queued_pending=%u fifo_overflow=%u ready_skips=%u ownership_defers=%u reuse_before_show=%llu\n", fStatFrames, span_ns / 1000000, avg_ns / 1000,
-		    max_ns / 1000, swaps, dropped, pending, overflow, skips, fScanoutDefers, reuse);
+		    "%u swaps, %u not shown queued_pending=%u fifo_overflow=%u ready_skips=%u ownership_defers=%u reuse_before_show=%llu wait_mode0=%llu wait_mode1=%llu wait_early=%llu wait_id0=%llu outstanding_max=%u\n", fStatFrames, span_ns / 1000000, avg_ns / 1000,
+		    max_ns / 1000, swaps, dropped, pending, overflow, skips, fScanoutDefers, reuse, waits[0], waits[1], early, latest, outstanding);
 		uint64_t gpu_ns, cpu_ns;
 		absolutetime_to_nanoseconds(fGpuTime, &gpu_ns);
 		absolutetime_to_nanoseconds(fCpuTime, &cpu_ns);
