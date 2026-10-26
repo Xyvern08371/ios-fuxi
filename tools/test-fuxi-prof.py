@@ -20,7 +20,9 @@ MOCK = r'''
 #include <stdarg.h>
 #include <setjmp.h>
 #define FUXI 1
+#ifndef __unused
 #define __unused __attribute__((unused))
+#endif
 #define TASK_NULL NULL
 #define PROC_ALLPROCLIST 1
 #define PROC_RETURNED 0
