@@ -847,7 +847,8 @@ public:
   }
   auto conflicts=[&]{for(auto &pending:slots)if(pending.busy)for(auto old:pending.hostUses)for(auto use:hostUses)if(old.memory==use.memory || hostRangesOverlap(old.address,old.bytes,use.address,use.bytes))return true;return false;};
   // Noncoherent whole-allocation flush/invalidate cannot race another flight on
-  // the same host range. CPU index inspection and shadow refresh also drain.
+  // the same host range. Coherent ranges are absent from hostUses, so CPU index
+  // inspection and opaque shadow prepare callbacks still require a full drain.
   bool drain=bool(prepare) || (retirement && std::any_of(ops.begin(),ops.end(),[](const auto &op){return op.indices!=nullptr;}));
   auto slotStart=FrameClock::now();
   if(currentFrame){currentFrame->drainWaits+=drain && (slots[0].busy || slots[1].busy);currentFrame->conflictWaits+=conflicts();currentFrame->slotWaits+=slots[0].busy && (!retirement || slots[1].busy);}

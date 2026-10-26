@@ -53,6 +53,7 @@ public:
  static inline std::atomic<uint64_t> pipelineCacheLoadResult{0},pipelineCacheLoadBytes{0},pipelineCacheSaveResult{0},pipelineCacheSaveBytes{0},pipelineCacheSaveCount{0},pipelineCacheSaveFailures{0};
  static inline std::atomic<uint64_t> submitObjectsNanos{0},submitDescriptorsNanos{0},submitRecordNanos{0},shadowCopyNanos{0},submitFlushNanos{0},submitInvalidateNanos{0},flushCalls{0},invalidateCalls{0},emptySubmits{0},submitObjectCreates{0},submitPoolCreates{0},submitFrameCreates{0},submitViewCreates{0};
  static inline std::atomic<uint64_t> submits{0},submitPrepareNanos{0},submitWaitNanos{0},submitRetireNanos{0};
+ static inline std::function<void()> beforeSubmit;
  static inline bool modelPipelines=false;static inline std::function<void(const Operation &)> modelDraw;
  void requireLive(){if(poisoned || backboardGate.refusesResources())throw std::runtime_error("device poisoned or backboardd failure latched");}
  uint32_t maxTextureDimension() const{return limits.dimension;}
@@ -102,6 +103,7 @@ public:
  void destroy(Pipeline *p) {if(p && !--p->references)delete p;}
  bool requiresSampling(const Pipeline *p) const {return p->sampled;}
  void submit(const std::vector<Operation>& ops,const std::function<void()> &scheduled={},std::function<void()> *retirement=nullptr,const std::function<void()> &prepare={}) {
+  if(retirement && beforeSubmit)beforeSubmit();
   if(prepare)prepare();
   if(retirement){auto copy=ops;submit(copy,scheduled);*retirement=[this]{requireLive();};return;}
   if(getenv("FUXI_TEST_LOST")) {poisoned=true;throw std::runtime_error("modeled device loss");}

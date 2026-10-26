@@ -30,6 +30,12 @@ int main() {
  try {fuxi::SurfaceLease lease(true,lock,unlock,&poisoned);for(uintptr_t i=1;i<=257;i++)lease.add(i);assert(false);}
  catch(const std::runtime_error &){}
  for(auto pair:held)assert(!pair.second);
+ // Commit reservations count concurrent producers without waiting for the prior writer.
+ {fuxi::SurfaceLease first(true,lock,unlock,&poisoned),next(true,lock,unlock,&poisoned);
+  first.add(900);next.add(900);assert(held[900]==2);}
+ assert(!held[900]);
+ {fuxi::SurfaceLease failed(true,lock,unlock,&poisoned);failed.add(901);failed.quarantine();}
+ assert(held[901]==1);held[901]=0;
  std::atomic<bool> poison{false};
  auto first=std::make_unique<fuxi::SurfaceLease>(true,lock,unlock,&poison,true);first->add(1000);
  std::promise<void> started;auto second=std::async(std::launch::async,[&]{started.set_value();fuxi::SurfaceLease next(true,lock,unlock,&poison,true);next.add(1000);});

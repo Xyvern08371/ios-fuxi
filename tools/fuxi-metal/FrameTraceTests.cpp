@@ -10,7 +10,7 @@ int main(){
  assert(frameCPUFromRegister(0xabc000ULL|0xfff)==4095);
  assert(frameCPU()==4096); // host has no Darwin register convention
  FrameTraceWindow window;assert(window.percentile(&FrameSample::wall,50)==0);
- for(unsigned i=1;i<=100;++i){FrameSample s;s.frontendDraw=i*100;s.frontendDrawSamples=10;s.backendCPU=i*10000;s.frontendCPU=i*20000;s.frontendWall=i*30000;s.pipe=i*40000;s.desc=i*50000;s.record=i*60000;s.kernelIO=i*70000;s.pipeCPU=i*8000;s.commitCall=i*1000;s.commitGap=i*2000;s.shadowScannedIndices=780;for(size_t j=0;j<s.shadowFullReasons.size();++j)s.shadowFullReasons[j]=j+1;s.textureShadowBytes=2048;s.textureRepitchedBytes=1024;s.textureShadowUses={25,2,1};s.snapshotBytes=33280;s.shadowCopyBytes=33280;s.planHits=119;s.planMisses=1;s.queueSubmits=2;s.imageBarriers=7;s.readBarriersSkipped=3;s.crossEncoderMerges=1;s.drainWaits=1;s.wall=i*1000000ULL;s.completionLatency=s.wall;s.inflight=i%2+1;s.cpu=i%7;s.draws=2;s.passes=1;s.mergedDraws=1;s.mergeSplits[size_t(MergeSplit::encoder)]=2;s.counts={1,2,3};window.add(s);}
+ for(unsigned i=1;i<=100;++i){FrameSample s;s.frontendDraw=i*100;s.frontendDrawSamples=10;s.backendCPU=i*10000;s.frontendCPU=i*20000;s.frontendWall=i*30000;s.pipe=i*40000;s.desc=i*50000;s.record=i*60000;s.kernelIO=i*70000;s.pipeCPU=i*8000;s.schedWait=i*3000;s.commitCall=i*1000;s.commitGap=i*2000;s.shadowScannedIndices=780;for(size_t j=0;j<s.shadowFullReasons.size();++j)s.shadowFullReasons[j]=j+1;s.textureShadowBytes=2048;s.textureRepitchedBytes=1024;s.textureShadowUses={25,2,1};s.snapshotBytes=33280;s.shadowCopyBytes=33280;s.planHits=119;s.planMisses=1;s.queueSubmits=2;s.imageBarriers=7;s.readBarriersSkipped=3;s.crossEncoderMerges=1;s.drainWaits=1;s.wall=i*1000000ULL;s.completionLatency=s.wall;s.inflight=i%2+1;s.cpu=i%7;s.draws=2;s.passes=1;s.mergedDraws=1;s.mergeSplits[size_t(MergeSplit::encoder)]=2;s.counts={1,2,3};window.add(s);}
  assert(window.size()==100 && window.percentile(&FrameSample::wall,50)==50000000 && window.percentile(&FrameSample::wall,90)==90000000);
  FILE *out=tmpfile();assert(out);window.report(out);rewind(out);char line[4096];assert(fgets(line,sizeof(line),out));
  assert(strstr(line,"frame trace n=100 samples=100 wall=50.000/90.000/100.000 ms"));
@@ -22,6 +22,7 @@ int main(){
  if(systemTranslationPolicy().overlap)assert(strstr(line,"overlap_depth=1/2 completion_ms=50.000/90.000"));else assert(!strstr(line,"overlap_depth="));
  if(systemTranslationPolicy().merge)assert(strstr(line,"merged_draws/frame=1.00 merged_splits=encoder:200,attachments:0"));else assert(!strstr(line,"merged_draws/frame="));
  assert(strstr(line,"submits/frame=2.00 image_barriers/frame=7.00 read_barriers_skipped/frame=3.00 cross_encoder_merges/frame=1.00 wait_reasons=drain:100,conflict:0,slots:0"));
+ assert(strstr(line,"sched_wait=0.150/0.270"));
  assert(strstr(line,"commit_call=0.050/0.090 commit_gap=0.100/0.180"));
  assert(strstr(line,"frontend_draw_ns/frame=5000/9000 frontend_draw_samples/frame=10.00"));
  assert(strstr(line,"prior_wait_completed=0.000/0.000 backend_cpu=0.500/0.900 frontend_cpu=1.000/1.800 frontend_wall=1.500/2.700 frontend_draw_ns/frame=5000/9000 frontend_draw_samples/frame=10.00 pipe=2.000/3.600 desc=2.500/4.500 record=3.000/5.400 kernel_io=3.500/6.300"));

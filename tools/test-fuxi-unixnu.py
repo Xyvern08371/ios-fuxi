@@ -309,14 +309,23 @@ struct Memory {uint64_t size;uint64_t getLength(){return size;}};
 struct SweetSurface {
  uint32_t id=1,width=18,height=3,pixelFormat=SWEET_FB_FORMAT_BGRA,bytesPerRow=104;
  uint32_t bytesPerElement=4,elementWidth=1,elementHeight=1,offset=0;
+ unsigned gpuWriters=0;bool gpuQuarantined=false;
  uintptr_t address;Memory *memory;
  uintptr_t kernelAddress(){return address;}
+ void retain(){refs++;}
  void release(){assert(refs);refs--;}
 };
-static SweetSurface *inputSurface;
-static SweetSurface *sweet_surface_copy(uint32_t id) {assert(id==1);refs++;return inputSurface;}
+static unsigned presentBegins,presentEnds;static bool presentReading;
+static bool sweet_surface_present_begin(SweetSurface **surfaces,unsigned count) {
+ presentBegins++;assert(!presentReading);for(unsigned i=0;i<count;i++)if(surfaces[i]->gpuWriters || surfaces[i]->gpuQuarantined)return false;
+ presentReading=true;return true;
+}
+static void sweet_surface_present_end() {assert(presentReading);presentReading=false;presentEnds++;}
+static SweetSurface *inputSurface,*inputSurface2;
+static SweetSurface *sweet_surface_copy(uint32_t id) {assert(id==1 || (id==2 && inputSurface2));refs++;return id==1?inputSurface:inputSurface2;}
 static int sweet_console_muted=1;
-static int sweet_surface_gpu_copy(SweetSurface *,uintptr_t,int,int,int,int,int,int){return gpuMode;}
+static unsigned surfaceCopies;
+static int sweet_surface_gpu_copy(SweetSurface *,uintptr_t,int,int,int,int,int,int){surfaceCopies++;return gpuMode;}
 static int sweet_surface_gpu_poll(uint64_t *elapsed) {*elapsed=42;return pollMode;}
 struct fg_times {uint64_t pin,lookup,map,clean,submit,wait,unmap,cpu;unsigned attempts,hits,misses,sleeps,blocks,groups;};
 static void fuxi_gpu_import_stats(uint64_t *cleaned,uint64_t *skipped,uint64_t *invalidated,

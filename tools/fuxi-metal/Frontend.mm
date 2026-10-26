@@ -47,7 +47,7 @@ extern "C" void _objc_msgForward(void);
 #endif
 static fuxi::ClientMode clientMode=fuxi::ClientMode::deny;
 static char clientProcess[64]="unknown";
-static bool gpuScanout=false;
+static bool gpuScanout=false,gpuScanoutQuiet=false;
 // One worker avoids a compile stampede. Blocks own device, descriptor snapshot
 // and handler until completion; the backend still serializes Vulkan/cache use.
 static dispatch_queue_t pipelineCompilationQueue() {
@@ -55,6 +55,7 @@ static dispatch_queue_t pipelineCompilationQueue() {
 }
 
 static int lockScanoutSurface(uintptr_t p) {return fuxi::frameKernelCall([&]{return IOSurfaceLock((IOSurfaceRef)p,0,nullptr);});}
+static int lockScanoutPendingSurface(uintptr_t p) {return fuxi::frameKernelCall([&]{return IOSurfaceLock((IOSurfaceRef)p,kIOSurfaceLockAvoidSync,nullptr);});}
 static void unlockScanoutSurface(uintptr_t p) {fuxi::frameKernelCall([&]{(void)IOSurfaceUnlock((IOSurfaceRef)p,0,nullptr);});}
 static fuxi::MetalBackend selectedBackend=fuxi::MetalBackend::fuxi;
 #ifndef FUXI_MTL_BOOTARGS
@@ -116,8 +117,9 @@ static void checkClient() {
   if(clientMode==fuxi::ClientMode::allow){
    char args[4096]={};
    (void)FUXI_MTL_BOOTARGS(args,sizeof(args));
-   gpuScanout=fuxi::gpuScanoutEnabled(args);
+   gpuScanout=fuxi::gpuScanoutEnabled(args);gpuScanoutQuiet=fuxi::translationOption(args,"sweetfb_noconsole=");
    if(gpuScanout)fprintf(stderr,"FUXI MTL: GPU scanout surface locks per submission\n");
+   if(fuxi::earlyScheduledWait(fuxi::systemTranslationPolicy(),gpuScanout,gpuScanoutQuiet,clientProcess))fprintf(stderr,"FUXI MTL: CA scheduled wait early=1 commit-reserved surfaces\n");
    selectedBackend=fuxi::selectMetalBackend(args);if(selectedBackend==fuxi::MetalBackend::invalid)clientMode=fuxi::ClientMode::deny;
   }
   if(!strcmp(clientProcess,"backboardd")) {
@@ -903,13 +905,13 @@ static id surveyPipeline(id refused,NSError **error,id device){
 struct FuxiEventPoint {size_t operation;FuxiEvent *event;uint64_t value;bool signal;};
 @class FuxiCommandBuffer;
 static thread_local FuxiCommandBuffer *completionCommand;
-@interface FuxiQueue : FuxiLabeledObject { @public fuxi::ShadowPool _shadowPool;id _device;dispatch_queue_t _completionQueue,_submitQueue,_retireQueue,_deliveryQueue;dispatch_semaphore_t _inflight;std::atomic<unsigned> _depth;std::atomic<uint64_t> _traceReturn,_traceDelivery,_traceHandlers,_traceWaitCompleted; }
+@interface FuxiQueue : FuxiLabeledObject { @public fuxi::ShadowPool _shadowPool;id _device;dispatch_queue_t _completionQueue,_submitQueue,_retireQueue,_deliveryQueue;dispatch_semaphore_t _inflight;std::atomic<unsigned> _depth;std::atomic<uint64_t> _traceReturn,_traceDelivery,_traceHandlers,_traceWaitCompleted,_traceWaitScheduled; }
 @end
 @interface FuxiCommandBuffer : FuxiLabeledObject {
  @public FuxiQueue *_queue; NSMutableArray *_resources,*_handlers,*_scheduledHandlers; NSError *_error;dispatch_group_t _completionGroup;
- dispatch_group_t _scheduledGroup,_commitReady;BOOL _overlap,_finished;
+ dispatch_group_t _scheduledGroup,_commitReady;BOOL _overlap,_finished,_earlySubmit;
  fuxi::FrameSample _flightTrace;fuxi::FrameClock::time_point _commitStart,_commitReturn;uint64_t _gpuBefore;bool _surfaceFrame;
- std::function<void()> _retirement;std::shared_ptr<fuxi::SurfaceLease> _lease;
+ std::function<void()> _retirement;std::shared_ptr<fuxi::SurfaceLease> _lease,_pendingLease;
  struct ShadowUse {FuxiBuffer *buffer;fuxi::ShadowRanges ranges;uint32_t textureUses=0;ShadowUse(FuxiBuffer *b):buffer(b),ranges(b->_wrappedLength){}};
  std::unordered_map<fuxi::Buffer *,ShadowUse> _shadowUses;fuxi::ShadowSnapshot _shadows;
  std::unordered_set<void *> _resourceSet;fuxi::CommandResourceCache _resourceCache;
@@ -1166,7 +1168,7 @@ static NSString *renderPassText(MTLRenderPassDescriptor *d){
  if(fuxi::systemTranslationPolicy().frameTrace && !strcmp(clientProcess,"backboardd")){
   b->_frameTrace=true;b->_traceCreated=fuxi::FrameClock::now();b->_traceCounts=fuxi::frameCounts;b->_traceThread=std::this_thread::get_id();
  }
- b->_resources=[NSMutableArray new];b->_handlers=[NSMutableArray new];b->_scheduledHandlers=[NSMutableArray new];b->_completionGroup=dispatch_group_create();b->_overlap=fuxi::systemTranslationPolicy().overlap;if(b->_overlap){b->_scheduledGroup=dispatch_group_create();b->_commitReady=dispatch_group_create();}return [b autorelease];
+ b->_resources=[NSMutableArray new];b->_handlers=[NSMutableArray new];b->_scheduledHandlers=[NSMutableArray new];b->_completionGroup=dispatch_group_create();b->_overlap=fuxi::systemTranslationPolicy().overlap;b->_earlySubmit=fuxi::earlyScheduledWait(fuxi::systemTranslationPolicy(),gpuScanout,gpuScanoutQuiet,clientProcess);if(b->_overlap){b->_scheduledGroup=dispatch_group_create();b->_commitReady=dispatch_group_create();}return [b autorelease];
 }
 // NativeMetal retains owners even for the unretained entry point. Resources
 // remain alive through synchronous completion; this only strengthens lifetime.
@@ -1367,7 +1369,7 @@ static NSString *renderPassText(MTLRenderPassDescriptor *d){
  if(_frameTrace){
   auto previous=_queue->_traceReturn.load();auto now=uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(_commitStart.time_since_epoch()).count());
   if(previous && now>previous && now-previous<100000000)_flightTrace.commitGap=now-previous;
-  _flightTrace.priorDelivery=_queue->_traceDelivery.load();_flightTrace.priorHandlers=_queue->_traceHandlers.load();_flightTrace.priorWaitCompleted=_queue->_traceWaitCompleted.load();_flightTrace.cpuBeforeCommit=uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(_commitStart-_traceCreated).count());_flightTrace.createdNs=uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(_traceCreated.time_since_epoch()).count());_flightTrace.cpu=fuxi::frameCPU();
+  _flightTrace.schedWait=_queue->_traceWaitScheduled.load();_flightTrace.priorDelivery=_queue->_traceDelivery.load();_flightTrace.priorHandlers=_queue->_traceHandlers.load();_flightTrace.priorWaitCompleted=_queue->_traceWaitCompleted.load();_flightTrace.cpuBeforeCommit=uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(_commitStart-_traceCreated).count());_flightTrace.createdNs=uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(_traceCreated.time_since_epoch()).count());_flightTrace.cpu=fuxi::frameCPU();
   _flightTrace.encodeCountsUnknown=_traceThread!=std::this_thread::get_id();
   if(!_flightTrace.encodeCountsUnknown)_flightTrace.counts={fuxi::frameCounts.pipelines-_traceCounts.pipelines,fuxi::frameCounts.descriptors-_traceCounts.descriptors,fuxi::frameCounts.allocations-_traceCounts.allocations};
  }
@@ -1378,7 +1380,11 @@ static NSString *renderPassText(MTLRenderPassDescriptor *d){
  // Snapshot caller-owned no-copy bytes before commit returns. The worker drains
  // prior submissions before refreshing a shared shadow allocation.
  auto snapshotStart=_frameTrace?fuxi::FrameClock::now():fuxi::FrameClock::time_point{};
- try{prepareCommandShadows(self,_frameTrace?&_flightTrace:nullptr);for(auto &entry:_shadowUses){auto &use=entry.second;_shadows.add(use.buffer->_buffer->contents,use.buffer->_wrapped,use.ranges);}
+ try{if(_earlySubmit){auto *backend=owner(_queue->_device)->backend;backend->requireLive();
+   _pendingLease=std::make_shared<fuxi::SurfaceLease>(true,lockScanoutPendingSurface,unlockScanoutSurface,&backend->poisoned);
+   for(id r in _resources)if([r isKindOfClass:[FuxiTexture class]])_pendingLease->add((uintptr_t)[(FuxiTexture *)r iosurface]);
+  }
+  prepareCommandShadows(self,_frameTrace?&_flightTrace:nullptr);for(auto &entry:_shadowUses){auto &use=entry.second;_shadows.add(use.buffer->_buffer->contents,use.buffer->_wrapped,use.ranges);}
   _shadows.capture(_queue->_shadowPool);if(_frameTrace)_flightTrace.snapshotBytes+=_shadows.bytes();
  }catch(const std::exception &e){[self submissionError:e.what()];}
  _commitReturn=fuxi::FrameClock::now();
@@ -1446,7 +1452,8 @@ static NSString *renderPassText(MTLRenderPassDescriptor *d){
  {fuxi::FrameTraceScope scope((_frameTrace || _overlap)?&_flightTrace:nullptr);
  try{if(_retirement){_retirement();_retirement={};}}catch(const std::exception &e){[self submissionError:e.what()];}
  auto releaseStart=_frameTrace?fuxi::FrameClock::now():fuxi::FrameClock::time_point{};
- _lease.reset();if(_frameTrace)_flightTrace.surfaceRelease=fuxi::frameNanos(releaseStart); // Never hand scanout a surface before its fence; poison keeps it locked.
+ if(_pendingLease && _status==MTLCommandBufferStatusError)_pendingLease->quarantine();
+ _lease.reset();_pendingLease.reset();if(_frameTrace)_flightTrace.surfaceRelease=fuxi::frameNanos(releaseStart); // Never hand scanout a surface before its fence; poison keeps it locked.
  if(_status!=MTLCommandBufferStatusError){
   for(const auto &op:_ops)if(op.pipeline)completedDraws.fetch_add(1);
  }
@@ -1468,8 +1475,12 @@ static NSString *renderPassText(MTLRenderPassDescriptor *d){
  if(_overlap)dispatch_group_leave(_completionGroup);
 }
 - (void)waitUntilCompleted {CENSUS();if(completionCommand!=self){auto start=_frameTrace?fuxi::FrameClock::now():fuxi::FrameClock::time_point{};dispatch_group_wait(_completionGroup,DISPATCH_TIME_FOREVER);if(_frameTrace)_queue->_traceWaitCompleted=std::max<uint64_t>(1,fuxi::frameNanos(start));}}
-- (void)waitUntilScheduled {CENSUS();if(!_overlap)return;@synchronized(self){if(_scheduled || _finished || _status==MTLCommandBufferStatusError)return;}dispatch_group_wait(_scheduledGroup,DISPATCH_TIME_FOREVER);}
-- (BOOL)commitAndWaitUntilSubmitted {CENSUS();[self commit];[self waitUntilScheduled];return _scheduled && self.status!=MTLCommandBufferStatusError;}
+- (void)waitUntilScheduled {CENSUS();if(!_overlap)return;auto start=_frameTrace?fuxi::FrameClock::now():fuxi::FrameClock::time_point{};
+ bool wait=false;@synchronized(self){wait=!_earlySubmit && !_scheduled && !_finished && _status!=MTLCommandBufferStatusError;}
+ if(wait)dispatch_group_wait(_scheduledGroup,DISPATCH_TIME_FOREVER);
+ if(_frameTrace)_queue->_traceWaitScheduled=std::max<uint64_t>(1,fuxi::frameNanos(start));
+}
+- (BOOL)commitAndWaitUntilSubmitted {CENSUS();[self commit];[self waitUntilScheduled];return (_earlySubmit || _scheduled) && self.status!=MTLCommandBufferStatusError;}
 - (CFTimeInterval)kernelStartTime {FRONTEND_TIME(self);CENSUS();return 0;}
 - (CFTimeInterval)kernelEndTime {FRONTEND_TIME(self);CENSUS();return 0;}
 - (CFTimeInterval)GPUStartTime {FRONTEND_TIME(self);CENSUS();return 0;}
@@ -1485,10 +1496,11 @@ static NSString *renderPassText(MTLRenderPassDescriptor *d){
 }
 - (void)reserveOverlap {
  auto start=_frameTrace?fuxi::FrameClock::now():fuxi::FrameClock::time_point{};
- dispatch_semaphore_wait(_queue->_inflight,DISPATCH_TIME_FOREVER);if(_frameTrace)_flightTrace.admissionWait+=fuxi::frameNanos(start);_flightTrace.inflight=++_queue->_depth;
+ if(!_earlySubmit){dispatch_semaphore_wait(_queue->_inflight,DISPATCH_TIME_FOREVER);if(_frameTrace)_flightTrace.admissionWait+=fuxi::frameNanos(start);_flightTrace.inflight=++_queue->_depth;}
  _enqueued=YES;dispatch_group_enter(_commitReady);
  dispatch_async(_queue->_submitQueue,^{@autoreleasepool{
   dispatch_group_wait(_commitReady,DISPATCH_TIME_FOREVER);
+  if(_earlySubmit){auto start=_frameTrace?fuxi::FrameClock::now():fuxi::FrameClock::time_point{};dispatch_semaphore_wait(_queue->_inflight,DISPATCH_TIME_FOREVER);if(_frameTrace)_flightTrace.admissionWait+=fuxi::frameNanos(start);_flightTrace.inflight=++_queue->_depth;}
   [self executeCommitted];
  }});
 }
@@ -1719,7 +1731,7 @@ static NSString *surfaceDescriptorText(IOSurfaceRef surface,NSUInteger plane){
 - (id)newCommandQueueWithMaxCommandBufferCount:(NSUInteger)n {CENSUS();
  if(!n || n>64) {unsupported(self,_cmd);return nil;}FuxiQueue *q=[self newCommandQueue];if(n==1 && q && q->_inflight){dispatch_release(q->_inflight);q->_inflight=dispatch_semaphore_create(1);}return q;
 }
-- (id)newCommandQueue {CENSUS();if(clientMode==fuxi::ClientMode::census)return nil;FuxiQueue *q=[FuxiQueue new];q->_device=[self retain];q->_depth=0;q->_traceReturn=0;q->_traceDelivery=0;q->_traceHandlers=0;q->_traceWaitCompleted=0;if(fuxi::systemTranslationPolicy().overlap){
+- (id)newCommandQueue {CENSUS();if(clientMode==fuxi::ClientMode::census)return nil;FuxiQueue *q=[FuxiQueue new];q->_device=[self retain];q->_depth=0;q->_traceReturn=0;q->_traceDelivery=0;q->_traceHandlers=0;q->_traceWaitCompleted=0;q->_traceWaitScheduled=0;if(fuxi::systemTranslationPolicy().overlap){
  // The compositor's submit/retire/handler work is on the frame path; at default
  // QoS it competes with background daemons (UniXNU AdrenoMetal c6d29ca does the same).
  dispatch_queue_attr_t attr=dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL,compositorQoS(),0);

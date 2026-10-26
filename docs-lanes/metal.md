@@ -2097,3 +2097,124 @@ The ADT remains byte-identical, including seven CPUs, pinned UFS root and
 | `shim/out/fuxi-metal1-payload.bin` | `781e358637e37205e6bc1140406d7965801293516ad74c9453a733273969eeb2` |
 | `shim/out/fuxi-metal1-boot.img` | `c430735773e9b97f0fa60f37244da085ab219ad97c46224dbf2f297834b59851` |
 | `tools/out/fuxi-gpu-abi-test` | `fc04e8157061a21d6f713197625010006e28b77b56c01cddf1d38ffd5cd85ae1` |
+
+## CA scheduled wait and commit reservations
+
+2026-10-26. Host-verified only; no device/120 fps result. The supplied profiler
+finds about 19% of CA's display thread in the scheduled wait; supplied frame
+traces suggest about 4 ms of waiting between commit and swap. Letting the next
+encode overlap submission/GPU work is the performance hypothesis, not a measured
+result of this change.
+
+**Previous behavior, facts from code:** without overlap, commit synchronously
+submits, waits for the fence and retires caches; `waitUntilScheduled` is a no-op.
+With overlap, caller-side `reserveOverlap` takes an in-flight semaphore and
+reserves serial `_submitQueue` order (including explicit enqueue order). Commit
+captures no-copy CPU bytes and releases `_commitReady`. The worker waits for
+older queue entries, takes sorted exclusive `SurfaceLease`s, refreshes shadows
+and calls `Backend::submit`. Backend can wait for a free slot, full drain or
+host-range conflict before recording, flushing and calling `QueueSubmit`.
+Successful submission sets `_scheduled`/Scheduled status; empty submissions
+also schedule. Event-split work can set the flag on the first submitted chunk.
+`waitUntilScheduled` returns if already scheduled/finished/error, otherwise waits
+for `_scheduledGroup`, released after the worker publishes scheduled handlers;
+that wait can therefore include handlers. `commitAndWaitUntilSubmitted` commits,
+waits and reports scheduled/no-error. It need not await this frame's fence, but
+admission, surface reuse and backend waits can transitively await older fences.
+
+The supplied CA stack calls `MetalContext::flush(true)` immediately before IOMFB
+swaps the drawable IOSurface. The inferred requirement is that swap must not
+copy an incomplete surface, rather than requiring the CPU to observe Vulkan
+submission. This is an inference about this CA path, not all private Apple uses.
+
+**Kernel ordering, facts from code:** swap saves the newest record/`fDirty`;
+the timer copies it later. Normal IOSurface writer locks count `gpuWriters`
+under `sweet_gpu_lock` after waiting for an older display copy of that surface.
+The worker holds its lease from before submission through render-fence/cache
+retirement. GPU copy rejects writers/quarantine (owned mode returns 3 and
+preserves dirty work without CPU fallback). `fuxi_gpu_scanout_reserve` also
+observes the client fence/ring-idle state via `fg_abi_observe`, retires imported
+caches/restores TTBR, and excludes new client submissions until copy ownership
+is established. `sweet_surface_gpu_poll` polls **the display copy**, retaining
+its exact source until fence/drain; it cannot track an unsubmitted Metal render.
+Double scanout publishes the completed back buffer only after transfer/TE/START
+guards pass. The previous CA wait ensured the worker had acquired the producer
+lease before swap; same-ring order alone cannot protect an early unsubmitted
+render.
+
+**Enable early CA waits** with these existing exact switches together; no new
+`fuxigpuperf` bit:
+
+```
+fuxigpuoverlap=1 fuxigpusubmit=1 fuxigpuscanout=1 sweetfb_noconsole=1
+```
+
+Only backboardd changes behavior; any missing/invalid switch keeps its previous
+wait. Keep the existing GPU/ABI and qualified panel/TE/double-scanout setup;
+`fuxigpupipelined=1` remains independent. Startup logs `FUXI MTL: CA scheduled
+wait early=1 commit-reserved surfaces`. Use the matching frontend/kernel.
+
+Commit now synchronously acquires a deduplicated **counted pending lease** on
+all retained imported surfaces with `IOSurfaceLock(kIOSurfaceLockAvoidSync)`
+(option 2), before returning or releasing `_commitReady`. The updated kernel
+increments `gpuWriters` without sleeping for old display readers/copies.
+The worker still needs its normal exclusive writer lease before touching pixels.
+Queue order stays caller-reserved; in-flight admission moves to the worker,
+so a third commit cannot await an older GPU flight on CA. `waitUntilScheduled`
+returns immediately on this path; commit-and-wait reports accepted/no currently
+known error. Scheduled status and handlers still follow real backend scheduling;
+explicit enqueue, events, completion/presentation handlers and completion waits
+retain their ordering and behavior.
+
+Before copying any layer, guarded present retains the exact source objects and
+atomically checks all of them for producers/quarantine, holding a read reservation
+through CPU/GPU copying. A pending surface defers the **whole** record, leaves
+the previous panel frame, restores dirty work and keeps polling without another
+swap. A newer swap remains latest-wins; retry never overwrites it with an older
+record. The guard covers CPU/multi-layer/unsupported-GPU fallback too. If pending
+commit races an existing read, its count increments immediately but the worker's
+normal lock waits for that read, and for the copy fence if a GPU copy started.
+If commit wins first, present cannot start reading. Render fence/cache retirement
+precedes the final producer unlock. This mutual exclusion proves ordering without
+assuming render-before-copy GPU ring order; multiple pending producers remain
+unreadable until **all** retire. Existing cache/ring/copy/publication guards stay.
+
+Success releases both leases before callbacks. Errors after reservation keep it
+closed, even known pre-submit errors, so a swapped partial multi-submit render
+cannot become readable. Unknown DMA retains existing poisoned ownership too.
+Such surfaces may remain undisplayable until teardown/reboot. Reservation failure
+returns failure and submits no render; reader admission/allocation failure defers.
+GPU flights remain bounded to the queue limit/two slots, but queued commands,
+resources and snapshots can accumulate if encoding outruns retirement. Physical
+framebuffer writers and clients bypassing normal writer leases remain outside
+this contract.
+
+The backend drain is retained: `hostUses` tracks noncoherent allocations only,
+but indexed validation also CPU-reads coherent index bytes; the opaque shadow
+`prepare` callback can CPU-write shared coherent backing. Replacing these drains
+with today's range test misses coherent GPU/CPU conflicts and aliases. Narrowing
+requires complete read/write and prepare-destination metadata. These waits now
+happen on the opted-in worker.
+
+`fuxigpuframetrace=1` (or 2) adds `sched_wait=p50/p90` ms, measuring actual
+entry-to-return of overlap `waitUntilScheduled`, including immediate returns and
+excluding commit. An atomic queue handoff attributes the most recent wait to
+its **next commit**, like the existing prior-completion fields; first sample is
+zero. Compare steady-state `sched_wait`, `commit_call`, `admission_wait`,
+`submit_queue`, `slot_wait` and `commit_gap`; small waits alone do not prove fps.
+
+Verification: portable `test-fuxi-metal-frontend.py` ASan/UBSan models pass;
+new `OverlapFrontendTests.mm` paused-queue/recording, enqueue/handler ordering and
+failure tests are **not compiled/run on Linux** and still need macOS.
+`test-fuxi-metal-overlap.py` passes lavapipe two-flight pixels/resource lifetime,
+noncoherent exclusion and loss/timeout; `test-fuxi-metal-frametrace.py` passes.
+`test-fuxi-gpu-scanout.py`/`test-fuxi-unixnu.py` pass production-code sanitizer
+models for pending deferral/retry, multiple producers, CPU/read/copy exclusion,
+real trap option/error wiring and quarantine, plus existing TE/double failures.
+Complete changed surface/framebuffer translation units and unchanged Adreno/
+console integration pass AArch64 syntax against saved XNU headers/flags; no
+kernel link or macOS/iOS frontend build. `test-fuxi-adreno-mapping.py` passes.
+Patches **0106** and **0108** are regenerated; **0098** is unchanged. Every
+`tools/sync-fuxi-*.py --check` passes. Device qualification still must establish
+IOSurface option propagation, image/cache correctness, failure behavior,
+backlog/latency and CA/START cadence; no phone access or deployment occurred.

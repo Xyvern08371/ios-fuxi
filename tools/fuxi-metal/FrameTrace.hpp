@@ -59,7 +59,7 @@ struct FrameSample {
  uint64_t backendLockCPU=0,slotWaitCPU=0,pipeCPU=0,descCPU=0,recordCPU=0,flushCPU=0,kernelIOCPU=0,queueSubmitCPU=0;
  uint64_t wall=0,cpuBeforeCommit=0,shadowCopy=0,leaseLock=0,backendSubmit=0,gpuWait=0,gpuExec=0;
  uint64_t inflight=0,completionLatency=0;
- uint64_t commitCall=0,commitGap=0,admissionWait=0,snapshot=0,submitQueue=0;
+ uint64_t schedWait=0,commitCall=0,commitGap=0,admissionWait=0,snapshot=0,submitQueue=0;
  uint64_t backendLock=0,slotWait=0,flush=0,queueSubmit=0,retireLock=0,invalidate=0,retireHost=0,surfaceRelease=0,scheduledHandlers=0;
  uint64_t textureShadowBytes=0,textureRepitchedBytes=0;std::array<uint64_t,3> textureShadowUses{};
  uint64_t snapshotBytes=0,shadowCopyBytes=0,shadowScannedIndices=0;std::array<uint64_t,size_t(ShadowFullReason::count)> shadowFullReasons{};
@@ -200,7 +200,7 @@ public:
   fprintf(out," shadow_scanned_indices/frame=%.2f shadow_full_reasons=",totals.shadowScannedIndices/n);for(size_t i=0;i<totals.shadowFullReasons.size();++i)fprintf(out,"%s%s:%.2f",i?",":"",shadowFullReasonNames[i],totals.shadowFullReasons[i]/n);
   fprintf(out," texture_shadow_bytes/frame=%.2f texture_repitched_bytes/frame=%.2f texture_shadow_uses=sampled:%.2f,target:%.2f,other:%.2f",totals.textureShadowBytes/n,totals.textureRepitchedBytes/n,totals.textureShadowUses[0]/n,totals.textureShadowUses[1]/n,totals.textureShadowUses[2]/n);
   auto stage=[&](const char *name,uint64_t FrameSample::*field){fprintf(out," %s=%.3f/%.3f",name,p(field,50),p(field,90));};
-  stage("commit_call",&FrameSample::commitCall);stage("commit_gap",&FrameSample::commitGap);stage("admission_wait",&FrameSample::admissionWait);stage("snapshot",&FrameSample::snapshot);stage("submit_queue",&FrameSample::submitQueue);
+  stage("sched_wait",&FrameSample::schedWait);stage("commit_call",&FrameSample::commitCall);stage("commit_gap",&FrameSample::commitGap);stage("admission_wait",&FrameSample::admissionWait);stage("snapshot",&FrameSample::snapshot);stage("submit_queue",&FrameSample::submitQueue);
   stage("backend_lock",&FrameSample::backendLock);stage("slot_wait",&FrameSample::slotWait);stage("flush",&FrameSample::flush);stage("queue_submit",&FrameSample::queueSubmit);stage("retire_lock",&FrameSample::retireLock);stage("invalidate",&FrameSample::invalidate);stage("retire_host",&FrameSample::retireHost);stage("surface_release",&FrameSample::surfaceRelease);stage("scheduled_handlers",&FrameSample::scheduledHandlers);
   stage("prior_delivery",&FrameSample::priorDelivery);stage("prior_handlers",&FrameSample::priorHandlers);stage("prior_wait_completed",&FrameSample::priorWaitCompleted);
   stage("backend_cpu",&FrameSample::backendCPU);stage("frontend_cpu",&FrameSample::frontendCPU);stage("frontend_wall",&FrameSample::frontendWall);

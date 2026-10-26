@@ -72,6 +72,8 @@ extern "C" { int sweet_fb_display_off; }        /* read by bsd/dev/fuxi_touch.c 
 #include <sys/proc.h>
 
 #if defined(FUXI)
+extern bool sweet_surface_present_begin(SweetSurface **surfaces, unsigned count);
+extern void sweet_surface_present_end(void);
 extern void fuxi_backlight_publish(IOService *provider);
 extern void fuxi_backlight_display_state(IOService *provider, bool on);
 #endif
@@ -702,6 +704,22 @@ AppleCLCD::present(const uint8_t *rec)
 	uint32_t mask = get32(rec, 0x104);
 	uint64_t t0 = mach_absolute_time();
 	bool gpuFrame = false, cpuFrame = false;
+#if defined(FUXI)
+ struct PresentRead {
+  SweetSurface *surfaces[SWEET_FB_LAYERS] = {}, *sources[SWEET_FB_LAYERS] = {}; unsigned count = 0; bool held = false;
+  ~PresentRead() { if (held) sweet_surface_present_end(); for (unsigned i = 0; i < count; i++) sources[i]->release(); }
+ } read;
+ if (fScanout) {
+  for (unsigned layer = 0; layer < SWEET_FB_LAYERS; layer++) {
+   uint32_t id = get32(rec, 0x54 + 4 * layer);
+   if ((mask & (1u << layer)) && id) { SweetSurface *s = sweet_surface_copy(id); if (s == fSurface) OSSafeReleaseNULL(s); read.surfaces[layer] = s; if (s) read.sources[read.count++] = s; }
+  }
+  if (!sweet_surface_present_begin(read.sources, read.count)) {
+   fScanoutDefers++; IOLockLock(fLock); fDirty = true; IOLockUnlock(fLock); return;
+  }
+  read.held = true;
+ }
+#endif
  uint64_t cpuBytes = 0, cpuTicks = 0;
 
 	if (!fConsolePaused) {
@@ -725,7 +743,11 @@ AppleCLCD::present(const uint8_t *rec)
 		if (!(mask & (1u << layer)) || id == 0) {
 			continue;
 		}
-		SweetSurface *s = sweet_surface_copy(id);
+		SweetSurface *s;
+#if defined(FUXI)
+  if (fScanout) { s = read.surfaces[layer]; if (s) s->retain(); } else
+#endif
+  s = sweet_surface_copy(id);
 		if (sweet_fb_swaps_logged < 16) {
 			sweet_fb_swaps_logged++;
 			IOLog("SWEET FB: swap %u layer %u surface %u %ux%u fmt 0x%x bpr %u a %d,%d %ux%u b %d,%d %dx%d\n",

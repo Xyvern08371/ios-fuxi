@@ -1,4 +1,15 @@
 /* Native selectors/ownership against a paused CPU fence model; requires Mac. */
+#import <IOSurface/IOSurfaceRef.h>
+#include <atomic>
+#include <cassert>
+static std::atomic<unsigned> pendingLocks{0},heldLocks{0};
+static std::atomic<bool> failPending{false};
+static kern_return_t overlapLock(IOSurfaceRef,IOSurfaceLockOptions options,uint32_t *) {
+ if(options==kIOSurfaceLockAvoidSync){if(failPending)return 1;++pendingLocks;}++heldLocks;return 0;
+}
+static kern_return_t overlapUnlock(IOSurfaceRef,IOSurfaceLockOptions,uint32_t *) {assert(heldLocks);--heldLocks;return 0;}
+#define IOSurfaceLock overlapLock
+#define IOSurfaceUnlock overlapUnlock
 #define FUXI_MTL_HOST_TEST
 #define FUXI_MTL_FRONTEND_TEST
 #define FUXI_MTL_BACKEND_HEADER "TestBackend.hpp"
@@ -56,6 +67,48 @@ int main(){@autoreleasepool{
  a=[(FuxiCommandBuffer *)[queue commandBuffer] retain];encoder=[a blitCommandEncoder];[encoder copyFromBuffer:(id)buffer sourceOffset:0 toBuffer:(id)output destinationOffset:0 size:4096];[encoder endEncoding];
  dispatch_suspend(queue->_submitQueue);[a commit];memset(bytes,77,sizeof(bytes));dispatch_resume(queue->_submitQueue);[a waitUntilCompleted];
  for(unsigned i=0;i<4096;++i)assert(((uint8_t *)[output contents])[i]==19);[a release];[buffer release];[output release];
+ // Opt-out wait still blocks until real scheduling.
+ dispatch_suspend(queue->_submitQueue);a=[(FuxiCommandBuffer *)[queue commandBuffer] retain];
+ a->_frameTrace=YES;a->_traceCreated=fuxi::FrameClock::now();a->_traceThread=std::this_thread::get_id();
+ std::promise<void> waiting;auto synchronous=std::async(std::launch::async,[&]{@autoreleasepool{waiting.set_value();assert([a commitAndWaitUntilSubmitted]);}});
+ waiting.get_future().wait();assert(synchronous.wait_for(std::chrono::milliseconds(30))==std::future_status::timeout);
+ dispatch_resume(queue->_submitQueue);synchronous.get();[a waitUntilCompleted];assert(queue->_traceWaitScheduled && a->_scheduled);[a release];
+ // Early CA waits reserve counted leases even with the submit queue and one flight paused.
+ fuxi::Backend::modelHostImport=true;gpuScanout=true;
+ IOSurfaceRef surface=IOSurfaceCreate((CFDictionaryRef)@{(id)kIOSurfaceWidth:@8,(id)kIOSurfaceHeight:@6,
+  (id)kIOSurfaceBytesPerElement:@4,(id)kIOSurfaceBytesPerRow:@64,(id)kIOSurfaceAllocSize:@16384,(id)kIOSurfacePixelFormat:@(0x42475241)});assert(surface);
+ auto *descriptor=[MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:8 height:6 mipmapped:NO];
+ descriptor.storageMode=MTLStorageModeShared;descriptor.usage=MTLTextureUsageShaderRead|MTLTextureUsageRenderTarget;
+ FuxiTexture *texture=(FuxiTexture *)[device newTextureWithDescriptor:descriptor iosurface:surface plane:0];assert(texture && !heldLocks);
+ FuxiQueue *earlyQueue=(FuxiQueue *)[device newCommandQueueWithMaxCommandBufferCount:1];
+ auto earlyCommand=[&]{FuxiCommandBuffer *c=[(FuxiCommandBuffer *)[earlyQueue commandBuffer] retain];c->_earlySubmit=YES;c->_frameTrace=YES;c->_traceCreated=fuxi::FrameClock::now();c->_traceThread=std::this_thread::get_id();[c->_resources addObject:texture];return c;};
+ dispatch_suspend(earlyQueue->_submitQueue);dispatch_suspend(earlyQueue->_retireQueue);
+ a=earlyCommand();b=earlyCommand();third=earlyCommand();__block unsigned order=0;
+ [a addScheduledHandler:^(id<MTLCommandBuffer> c){assert(c.status==MTLCommandBufferStatusScheduled && order==0);++order;}];
+ [b addScheduledHandler:^(id<MTLCommandBuffer> c){assert(c.status==MTLCommandBufferStatusScheduled && order==1);++order;}];
+ [third addScheduledHandler:^(id<MTLCommandBuffer> c){assert(c.status==MTLCommandBufferStatusScheduled && order==2);++order;}];
+ [a enqueue];
+ auto returned=std::async(std::launch::async,[&]{@autoreleasepool{assert([b commitAndWaitUntilSubmitted]);assert([a commitAndWaitUntilSubmitted]);assert([third commitAndWaitUntilSubmitted]);}});
+ assert(returned.wait_for(std::chrono::seconds(1))==std::future_status::ready);returned.get();
+ assert(pendingLocks==3 && heldLocks==3 && !order && !a->_scheduled && !b->_scheduled && !third->_scheduled && !earlyQueue->_depth);
+ assert(earlyQueue->_traceWaitScheduled && a->_flightTrace.schedWait);
+ __block unsigned lateScheduled=0;[b addScheduledHandler:^(id<MTLCommandBuffer> c){assert(c.status==MTLCommandBufferStatusScheduled && order==2);++lateScheduled;}];assert(!lateScheduled);
+ dispatch_resume(earlyQueue->_submitQueue);
+ // Worker recording can also remain blocked after the caller has returned.
+ std::promise<void> recording,releaseRecording;auto proceed=releaseRecording.get_future();
+ // The serial submit queue is drained before installing the next model hook.
+ dispatch_resume(earlyQueue->_retireQueue);[third waitUntilCompleted];[b waitUntilCompleted];[a waitUntilCompleted];
+ assert(order==3 && lateScheduled==1 && !heldLocks);[a release];[b release];[third release];
+ fuxi::Backend::beforeSubmit=[&]{recording.set_value();proceed.wait();};a=earlyCommand();
+ assert([a commitAndWaitUntilSubmitted]);recording.get_future().wait();assert(!a->_scheduled && heldLocks==2);
+ releaseRecording.set_value();[a waitUntilCompleted];fuxi::Backend::beforeSubmit={};assert(!heldLocks);[a release];
+ // A reservation failure rejects commit; a later submission failure keeps its reservation closed.
+ failPending=true;a=earlyCommand();assert(![a commitAndWaitUntilSubmitted]);[a waitUntilCompleted];assert(a.error && !heldLocks);[a release];failPending=false;
+ fuxi::Backend::beforeSubmit=[]{throw std::runtime_error("modeled recording failure");};a=earlyCommand();
+ [a addScheduledHandler:^(id<MTLCommandBuffer> c){(void)c;assert(false);}];
+ [a commitAndWaitUntilSubmitted];[a waitUntilCompleted];assert(a.error && !a->_scheduled && heldLocks==1);fuxi::Backend::beforeSubmit={};[a release];
+ overlapUnlock(surface,0,nullptr); // test-only recovery of a fail-closed reservation
+ [earlyQueue release];[texture release];CFRelease(surface);gpuScanout=false;
  // Device loss at retirement reports Error once, never presents, still unblocks waiters.
  dispatch_suspend(queue->_retireQueue);a=[(FuxiCommandBuffer *)[queue commandBuffer] retain];drawable=[FuxiOverlapDrawable new];
  [a presentDrawable:(id)drawable];__block unsigned errors=0;

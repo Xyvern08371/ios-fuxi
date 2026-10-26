@@ -23,7 +23,7 @@ inline bool gpuScanoutEnabled(const char *args) {
 class SurfaceLease {
  using Lock=int (*)(uintptr_t);
  using Unlock=void (*)(uintptr_t);
- bool enabled_,exclusive_;Lock lock_;Unlock unlock_;std::function<bool()> poisoned_;
+ bool enabled_,exclusive_,quarantined_=false;Lock lock_;Unlock unlock_;std::function<bool()> poisoned_;
  inline static std::mutex mutex_;inline static std::condition_variable wake_;inline static std::vector<uintptr_t> writers_;
  std::vector<uintptr_t> held_;
 public:
@@ -40,7 +40,9 @@ public:
    if(poisoned_()){held_.pop_back();throw std::runtime_error("scanout device poisoned");}try{writers_.push_back(surface);}catch(...){held_.pop_back();throw;}}
   if(lock_(surface)){if(exclusive_){writers_.erase(std::find(writers_.begin(),writers_.end(),surface));wake_.notify_all();}held_.pop_back();throw std::runtime_error("scanout IOSurface lock failed");}
  }
+ void quarantine(){quarantined_=true;}
  ~SurfaceLease() {
+  if(quarantined_)return;
   // An uncertain submission keeps both the producer lock and the allocation
   // alive. The kernel quarantines DMA; no framebuffer reader may reuse it.
   if(!exclusive_){if(!poisoned_())for(auto it=held_.rbegin();it!=held_.rend();++it)unlock_(*it);return;}

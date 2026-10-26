@@ -91,6 +91,9 @@ static sweet_gpu_backing sweet_gpu_cache[FG_CACHE_SLOTS];
 static uint64_t sweet_gpu_generation, sweet_gpu_age;
 static struct fg_times sweet_gpu_times;
 static SweetSurface *sweet_gpu_inflight; /* strong until fence/drain */
+#define kIOSurfaceLockAvoidSync 0x2
+static SweetSurface *sweet_present_readers[4];
+static unsigned sweet_present_count;
 static unsigned sweet_gpu_slot;
 static uint64_t sweet_gpu_begin;
 static bool sweet_gpu_init(void)
@@ -222,15 +225,36 @@ int sweet_surface_gpu_poll(uint64_t *elapsed)
  if (release) release->release(); /* free() takes the cache lock */
  return result;
 }
-/* IOSurface writer traps wait on the producer thread, never the display
- * timer. A writer already holding the surface makes GPU submission ineligible.
- * Userspace must obey IOSurface lock/unlock when writing a mapped surface. */
-static bool sweet_gpu_writer(SweetSurface *s, bool lock)
+bool sweet_surface_present_begin(SweetSurface **surfaces, unsigned count)
+{
+ if (count > 4 || !sweet_gpu_init()) return false;
+ IOLockLock(sweet_gpu_lock);
+ bool ok = sweet_present_count == 0;
+ for (unsigned i = 0; i < count; i++) if (surfaces[i]->gpuWriters || surfaces[i]->gpuQuarantined) ok = false;
+ if (ok) { for (unsigned i = 0; i < count; i++) sweet_present_readers[i] = surfaces[i]; sweet_present_count = count; }
+ IOLockUnlock(sweet_gpu_lock);
+ return ok;
+}
+void sweet_surface_present_end(void)
+{
+ IOLockLock(sweet_gpu_lock);
+ sweet_present_count = 0;
+ IOLockWakeup(sweet_gpu_lock, &sweet_gpu_inflight, false);
+ IOLockUnlock(sweet_gpu_lock);
+}
+static bool sweet_surface_present_reading(SweetSurface *s)
+{
+ for (unsigned i = 0; i < sweet_present_count; i++) if (sweet_present_readers[i] == s) return true;
+ return false;
+}
+/* AvoidSync reserves a pending producer without waiting; it must take a
+ * normal writer lease before touching pixels. Display reads never sleep. */
+static bool sweet_gpu_writer(SweetSurface *s, bool lock, bool pending = false)
 {
  if (!sweet_gpu_init()) return false;
  IOLockLock(sweet_gpu_lock);
  if (lock) {
-  while (sweet_gpu_inflight == s)
+  while (!pending && (sweet_gpu_inflight == s || sweet_surface_present_reading(s)))
    IOLockSleep(sweet_gpu_lock, &sweet_gpu_inflight, THREAD_UNINT);
   if (!s->gpuQuarantined) s->gpuWriters++;
  } else if (s->gpuWriters) s->gpuWriters--;
@@ -1005,7 +1029,7 @@ IOSurfaceRootUserClient::trapLock(void *id, void *options, void *seedOut,
 		return kIOReturnNotFound;
 	}
 #if defined(FUXI)
- if (!((uintptr_t)options & kIOSurfaceLockReadOnly) && !sweet_gpu_writer(s, true)) {
+ if (!((uintptr_t)options & kIOSurfaceLockReadOnly) && !sweet_gpu_writer(s, true, ((uintptr_t)options & kIOSurfaceLockAvoidSync) != 0)) {
   s->release(); return kIOReturnNotReady;
  }
 #endif
