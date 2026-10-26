@@ -2,7 +2,8 @@
 
 Add `sweetprof=1` to the FUXI boot arguments (11 bytes before a separating
 space). With the argument absent or not exactly 1, no worker or table is
-created. The worker starts from the UFS initialization hook, sleeps 60 seconds,
+created. `sweetprof=N` (2..3600) delays the start by N seconds instead, e.g.
+`sweetprof=130` to cover `fuxitouchscript=120`. The worker starts from the UFS initialization hook, sleeps 60 seconds,
 then selects the first process named `backboardd`, holds a task reference, and
 profiles it once for 60 seconds. It does not follow process restarts.
 

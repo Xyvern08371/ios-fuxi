@@ -114,8 +114,10 @@ static void worker(void){if(!setjmp(terminated))sp_worker(NULL,0);assert(!refs &
 int main(void){
  reset();for(unsigned present=0;present<2;present++)for(unsigned value=0;value<4;value++){
   boot_present=present;boot_value=value;unsigned before=starts;sweet_prof_start();
-  assert(starts-before==(present && value==1));assert(!allocs && !sleeps && !output && !threadrefs);
+  assert(starts-before==(present && value>=1));assert(!allocs && !sleeps && !output && !threadrefs);
+  assert(sp_delay==(present && value>1?value:60));sp_delay=60;
  }
+ boot_present=1;boot_value=3601;{unsigned before=starts;sweet_prof_start();assert(starts==before && sp_delay==60);}
  worker();assert(ticks==120ULL*NSEC_PER_SEC && sleeps==30001 && blocks==sleeps && last_leeway==100000);
  assert(reads==120000 && allocs==1 && frees==1 && output==4);
  assert(strstr(logs[0],"PROF backboardd[1] slide 0x200000 mh 0x100000000"));
