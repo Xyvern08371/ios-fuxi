@@ -62,17 +62,21 @@ void main(){color=c.value;}
         texture_vertex = '#version 450\nvoid main(){vec2 p=vec2((gl_VertexIndex<<1)&2,gl_VertexIndex&2);gl_Position=vec4(p*2.0-1.0,0,1);}\n'
         texture_fragment = '#version 450\nlayout(set=0,binding=0) uniform sampler2D image;\nlayout(location=0) out vec4 color;\nvoid main(){ivec2 p=ivec2(gl_FragCoord.xy)*(textureSize(image,0)-1)/15;color=texelFetch(image,p,0);}\n'
         texture_env = dict(env, CONTROL_LOD='0')
-        for stage, source in [('vert', texture_vertex), ('frag', texture_fragment)]:
+        storage_fragment = texture_fragment.replace('layout(location=0)', 'layout(set=0,binding=1) buffer Indices {uint value[];} indices;\nlayout(location=0)').replace('void main(){', 'void main(){if(gl_FragCoord.x<1.0 && gl_FragCoord.y<1.0){indices.value[0]=65536u;indices.value[1]=2u;}')
+        for stage, source in [('vert', texture_vertex), ('frag', texture_fragment), ('storage.frag', storage_fragment)]:
             src = d/('texture.'+stage)
             src.write_text(source)
             out = d/('texture.'+stage+'.spv')
             subprocess.run([a.glslang, '-V', '--target-env', 'vulkan1.2', str(src), '-o', str(out)], check=True, capture_output=True)
-            texture_env['CONTROL_VERTEX' if stage == 'vert' else 'CONTROL_FRAGMENT'] = str(out)
+            texture_env[{'vert':'CONTROL_VERTEX','frag':'CONTROL_FRAGMENT','storage.frag':'CONTROL_STORAGE_FRAGMENT'}[stage]] = str(out)
         subprocess.run(common+['-shared', '-fPIC', str(ROOT/'tools/fuxi-metal/TextureShadowBridge.cpp'), '-o', str(d/'texture-bridge.so')], check=True)
         subprocess.run(common+['-DFUXI_MTL_HOST_TEST', '-DFUXI_MTL_ICD="'+str(a.icd.resolve())+'"',
             '-DFUXI_MTL_TRANSLATOR="'+str(d/'texture-bridge.so')+'"', str(ROOT/'tools/fuxi-metal/TextureShadowCopyTests.cpp'), '-ldl', '-pthread', '-o', str(d/'texture-pixels')], check=True)
         for args in ('', 'fuxigpuoverlap=1 fuxigpusubmit=1'):
             subprocess.run([str(d/'texture-pixels')], env=dict(texture_env, FUXI_MTL_TEST_BOOTARGS='fuxigpuframetrace=1 '+args), check=True, timeout=60)
+        subprocess.run(common+['-DFUXI_MTL_HOST_TEST', '-DFUXI_MTL_ICD="'+str(a.icd.resolve())+'"',
+            '-DFUXI_MTL_TRANSLATOR="'+str(d/'texture-bridge.so')+'"', str(ROOT/'tools/fuxi-metal/AdmissionTests.cpp'), '-ldl', '-pthread', '-o', str(d/'admission')], check=True)
+        subprocess.run([str(d/'admission')], env=dict(texture_env, FUXI_MTL_TEST_BOOTARGS='fuxigpuframetrace=1 fuxigpuoverlap=1 fuxigpusubmit=1'), check=True, timeout=60)
         for old in (False, True):
             extra = ['-DSHADOW_OLD_ADAPTER'] if old else []
             subprocess.run(common+extra+['-shared', '-fPIC', str(ROOT/'tools/fuxi-metal/ShadowBridge.cpp'), '-o', str(d/'bridge.so')], check=True)

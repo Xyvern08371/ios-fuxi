@@ -42,7 +42,7 @@ static void transfers(fuxi::Backend &b){
   assert(refuses([&]{b.linearTexture(buffer,format,1,w,h+1,offset,row);}).size());
   assert(b.resourceBytes()==charged);
   b.destroy(buffer);assert(t->backingBuffer->references==1);verify(); // texture owns backend backing too.
-  b.destroy(t);b.destroy(out);assert(b.resourceBytes()==baseline && fuxi::liveMemoryObjects==memory);
+  b.destroy(t);b.destroy(out);b.trimMemory();assert(b.resourceBytes()==baseline && fuxi::liveMemoryObjects==memory);
  }
  // Survey-sized buffers use tight final rows, including strides that differ
  // from lavapipe's image pitch. Compare every texel and preserve the buffer.
@@ -59,7 +59,7 @@ static void transfers(fuxi::Backend &b){
  // Exact alias still borrows its allocation and retains the backing buffer.
  auto *buffer=b.allocate(65536);auto *alias=b.linearTexture(buffer,80,1,16,8,0,64);
  assert(!alias->shadow && alias->borrowedMemory && !alias->charged);b.destroy(buffer);b.destroy(alias);
- assert(b.resourceBytes()==baseline && fuxi::liveMemoryObjects==memory);
+ b.trimMemory();assert(b.resourceBytes()==baseline && fuxi::liveMemoryObjects==memory);
  // Force budget exhaustion only for the shadow, then prove rollback of the
  // attempted image and that the caller's existing buffer remains usable.
  auto *small=b.allocate(128);std::vector<fuxi::Buffer *> ballast;
@@ -120,7 +120,7 @@ int main(int argc,char **argv){
  assert(argc==1 || argc==2);
  if(argc==2){lines(b,argv[1]);puts("PASS: M9o actual bridge line/list/strip/index/restart pixels, odd/empty counts, lazy cache reuse and sampled shadow CPU coherence");}
  else puts("SKIP: M9o shader/line controls require --translator");
- assert(b.resourceBytes()==baseline);
+ b.trimMemory();assert(b.resourceBytes()==baseline);
  assert(fuxi::primitiveCount(fuxi::Topology::Line,598)==598 && fuxi::primitiveCount(fuxi::Topology::Line,599)==598);
  puts("PASS: M9o mismatch diagnostics, shadow rows/offset/tight bounds, CPU/GPU coherence, sentinels, ownership, budget/rollback and poison/requireLive");
 }

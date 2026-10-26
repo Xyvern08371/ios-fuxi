@@ -2190,7 +2190,9 @@ resources and snapshots can accumulate if encoding outruns retirement. Physical
 framebuffer writers and clients bypassing normal writer leases remain outside
 this contract.
 
-The backend drain is retained: `hostUses` tracks noncoherent allocations only,
+The original backend drain was retained here (superseded by
+[Index admission and unchanged sampled shadows](#index-admission-and-unchanged-sampled-shadows)):
+`hostUses` tracks noncoherent allocations only,
 but indexed validation also CPU-reads coherent index bytes; the opaque shadow
 `prepare` callback can CPU-write shared coherent backing. Replacing these drains
 with today's range test misses coherent GPU/CPU conflicts and aliases. Narrowing
@@ -2424,3 +2426,157 @@ memory-pressure delivery remain unverified on Linux. All twelve sync checks
 pass. Regenerated **0098**, **0106**, **0108** are byte-identical; **no generated
 patch changes**. No kernel or external Mesa/metal2vulkan/NativeMetal source
 changes, device access, deployment, firmware download, push or workflow run.
+
+## Index admission and unchanged sampled shadows
+
+2026-10-27. **Device results for this revision: not yet observed.** The supplied
+227-frame backboardd trace on iOS 16.7 / FuxiMetal `78aaa3a` reports
+`wait_reasons=drain:180,conflict:0,slots:0`, slot-wait p50/p90 **6.312/8.160 ms**,
+submit queue **3.0/8.1 ms**, QueueSubmit **1.04 ms**, commit gap **12.5/33.3 ms**,
+GPU execution p50 about **6–8.7 ms**, wall p50 **24 ms**, and cadence ticks
+**1:192,2:21,3:1,4+:13**. These are the preceding device baseline, not results
+of these changes. They support the serialization diagnosis, not a measured
+60/120 fps improvement.
+
+`Backend::submit` previously drained whenever a retirement ticket accompanied
+any `Operation::indices`. The protected read is the CPU `memcpy` scan of
+`indices->contents + indexOffset + indexWidth*i`: it finds the largest index,
+excluding primitive restart for strips, then checks fixed-function attribute
+fetch bounds with `vertexFetchFits`. The translator draw planner receives only
+length/offset/type metadata, not those bytes. An earlier GPU fill, copy,
+image-to-buffer readback, mapped attachment alias or storage-buffer shader could
+otherwise change an index during inspection, or leave noncoherent host bytes
+stale until retirement. `hostUses` alone cannot protect this: it intentionally
+excludes coherent allocations. Same-command GPU-written draw input still needs
+a separate submission; inspecting old bytes cannot validate future GPU results.
+
+Each live slot now retains **all resource uses and possible GPU writes**, separate
+from its existing noncoherent cache-maintenance uses. Writes include explicit
+buffer destinations, color/clear/upload/copy/mip texture destinations (including
+borrowed backing), and storage buffers from the **final runtime draw plan**.
+Only a final-module explicit `NonWritable` proof removes a storage writer;
+unknown storage remains writable, independently of merge policy. Matching
+Vulkan memory or overlapping host address ranges catch buffer/image/import
+aliases. Tracking is conservative at allocation granularity. The metadata lasts
+through fence wait **and cache invalidation**, then clears under the backend
+mutex with slot release. Synchronous submissions hold that mutex through their
+fence/cache retirement. Poison wakes admission into `requireLive` without
+inspecting potentially quarantined shadow bytes.
+
+Index inspection now requests a drain only while another live slot may write
+its allocation. The wait predicate rechecks after every wake. A command-owned
+upload ring or ordinary buffer with no pending writer does **not** request an
+index drain. Upload provenance is diagnostic, never permission to ignore a GPU
+writer. `setBytes` marks its command-owned 64 KiB blocks; slices remain immutable
+through completion and reuse still starts only after retirement. An opaque
+`prepare` callback retains its full drain. Noncoherent whole-allocation
+flush/invalidate conflicts retain their existing exclusion. No third slot was
+added: two remain independently resettable and pinned. Baseline slot-only waits
+were zero; whether two slots limit the improved workload is **not yet observed**.
+The existing third-submit test proves admission blocks until a slot retires.
+
+The supplied **8,752,548 bytes/frame** in each of `snapshot_bytes`,
+`shadow_copy_bytes` and `texture_shadow_bytes`, with about **46.74 sampled
+shadow-buffer uses/frame**, describes the no-copy **buffer fallback**:
+`newBufferWithBytesNoCopy` tries host import, then allocates GPU backing when
+unaligned/read-only/COW client pages cannot be imported. Its public `contents`
+remains `_wrapped`; `retainCommandTexture` records the sampled buffer texture's
+offset/row extent, and `prepareCommandShadows` counts that extent once per
+backing buffer. `commit` freezes caller bytes before returning;
+`executeCommitted` previously installed an opaque callback that copied the
+snapshot into shared backing after a full drain. It is not an IOSurface snapshot:
+`importTexture` uses the same IOSurface pages and the existing producer leases.
+`textureRepitchedBytes` is a separate GPU buffer-to-optimal-image pitch fallback
+in `Backend::submit`'s `refresh`, not the CPU snapshot/copy. Its supplied
+**513,947 bytes/frame** is unchanged by this revision.
+
+Raw no-copy pointers have no observable CPU mutation generation or IOSurface
+seed. Skipping on object identity, shader-read usage or `didModifyRange` alone
+would miss legal CPU writes. `ShadowCache` instead compares exact bytes at
+commit and shares immutable chunks of at most **4 KiB** with command snapshots.
+Only changed chunks allocate/copy; previous queued versions remain immutable.
+The cache retains at most **4 MiB per fallback buffer** and clears on capacity
+pressure; eviction affects cost only. Completed snapshots release their chunk
+references; queued commands can retain older versions, as with the existing
+unbounded early-submit backlog. Caching applies only to bounded, sampled-only
+buffer textures. General buffer/index access, targets, explicit useResource,
+unknown/full ranges and synchronous commit retain the original packed path.
+Both raw pointer writes and `replaceRegion` through texture views are detected.
+
+Shadow application now supplies explicit snapshot destinations to the backend,
+rather than an opaque callback. Before comparing mapped backing it waits for
+any overlapping GPU writer, including coherent buffers and aliased attachments.
+Snapshot destinations are ordinary mapped fallback buffers; borrowed linear
+images also publish their backing buffer, so their writers expose that range.
+Unchanged cached chunks require no backing write and can overlap prior readers;
+changed chunks wait for overlapping GPU readers/writers before copying. An
+unrelated flight need not retire. Each comparison/application runs under the
+backend mutex; a condition-variable wake rechecks hazards. Comparing the actual
+backing also detects intervening GPU writes or another queue's older version;
+a CPU version match alone never licenses skipping the backing refresh. Packed
+fallback snapshots still copy all their recorded ranges and exclude overlapping
+flights. Event-split commands apply the snapshot once before the first chunk.
+Opaque callers of `prepare` still drain.
+
+The existing aggregate frame-trace line adds:
+
+- `drain_submits`: submit admission calls requesting a drain, including empty
+  or subsequently rejected calls; counted once per call, even across wakes.
+- `drain_reasons=indices-upload,indices-gpu-writable,prepare`: counts of calls
+  encountering each reason. Upload is a subset of GPU-writable and normally
+  zero; reasons may overlap. Upload bytes alone never cause a drain.
+- `index_submits=upload,readonly,gpu_writable`: calls containing upload indices,
+  ordinary indices without an observed pending writer, or a pending GPU index
+  writer. Mixed calls can occupy multiple categories.
+- `shadow_waits`: calls encountering a snapshot destination hazard; separate
+  from full-drain, cache-conflict and slot-only reasons. Existing `wait_reasons`
+  counts each reason once per call, including hazards first seen after a wake.
+- `snapshot_reused_bytes/frame`: frozen texture bytes reused without a new CPU
+  snapshot copy; `snapshot_bytes/frame` now counts actual new snapshot payload.
+- `shadow_skipped_bytes/frame`: snapshot payload already equal to GPU backing;
+  `shadow_copy_bytes/frame` counts actual applied payload. `texture_shadow_bytes`
+  retains its logical range meaning, so it need not equal either copy counter.
+
+For unchanged warm sampled inputs, the opportunity is **8.75 MB/frame fewer
+snapshot copies plus 8.75 MB/frame fewer backing copies**, about **17.5 MB/frame**
+of memcpy payload (1.05 GB/s at 60 fps, 2.10 GB/s at 120). Dirty inputs copy only
+changed chunks; first use/cache eviction copies again. Byte comparisons still
+read the ranges and may contend for cache/memory bandwidth; the previous
+snapshot p50 **1.26 ms** is an opportunity, not a promised time saving. Removing
+unnecessary drains permits CPU recording/submission alongside the previous GPU
+flight, but the observed 6–8.7 ms GPU time, surface leases, noncoherent conflicts,
+slot pressure, queue backlog and display pacing still govern 60/120 fps.
+Device qualification must compare new reason/byte counters, slot/admission/
+submit waits, pixels, cadence, latency and GPU execution; no device access or
+new device timing is claimed.
+
+Validation: all **34** `tools/test-fuxi-metal*.py` entrypoints were invoked.
+The **17 runnable scripts passed**: backend, frontend (portable ASan/UBSan models),
+frametrace, shadows (including new real-Vulkan `AdmissionTests`), overlap,
+merge/barriers, memory, mipfeedback, M6, M9m/n/o, metal, metal2, metal2g/h and
+stage with `--policy-storage-only`. Shadows additionally compare cached/bounded/
+full pixels over 25 textures / 125 draws, unchanged repeated frames and CPU
+mutations; admission holds real retirement tickets open to check upload/read-only
+indices, fill/attachment/storage GPU writers, opaque prepare, unchanged/dirty/
+GPU-written shadow backing and unrelated flights. Portable cache tests cover
+4 KiB dirty chunks, frozen queued A/B/A versions, changed extents, eviction,
+backing invalidation and policy fallback. Frame-trace tests check aggregation,
+reset and all added fields. Native encoding/shadow tests add upload provenance,
+view CPU writes, paused submission and reused/dirty snapshot assertions; native
+`.mm` compilation/execution remains **unverified on Linux**. Two-slot exclusion,
+noncoherent conflicts and loss/timeout quarantine still pass. `slot_wait` includes
+admission predicate work as well as sleeps; `shadow_copy` includes the backing
+comparison/application, so skipped bytes do not imply zero CPU time.
+
+The other **17 scripts could not run their suites** because required external
+translator/checkouts, Apple SDK/metallib/cache or boot/artifact inputs are absent:
+artifacts, ca-offline, cache/cache-hits, defaults, draw-plans, M6b, M7,
+M9a/b/g/h/i/k/l, pipeline and translation. Their argument/precondition failures
+are not passes. M9o's optional external shader/line portion and stage's real
+artifact verification are likewise unavailable. Old M9n/o/shadow teardown
+assertions now explicitly trim intentionally pooled memory before checking the
+baseline; the mip-feedback fixture disables draw-plan reuse because its push
+bytes change through an environment variable outside `DrawInput` (production
+planning has no such input). All **12** `tools/sync-fuxi-*.py --check` pass;
+no generated patches changed. No device access, deployment, external project
+changes, vendoring, Apple/GPL code or binaries, push or workflow run occurred.

@@ -36,7 +36,7 @@ int main(){@autoreleasepool{
  [inlineRender setVertexBytes:firstBytes length:sizeof(firstBytes) atIndex:0];[inlineRender drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
  memset(firstBytes,0xff,sizeof(firstBytes));[inlineRender setVertexBytes:nextBytes length:sizeof(nextBytes) atIndex:0];[inlineRender drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];[inlineRender endEncoding];
  auto firstBinding=inlineCommand->_ops[0].buffers[0][0],nextBinding=inlineCommand->_ops[1].buffers[0][0];
- assert(firstBinding.buffer==nextBinding.buffer && firstBinding.offset==0 && nextBinding.offset==256 && firstBinding.length()==37 && nextBinding.length()==384);
+ assert(firstBinding.buffer->upload && firstBinding.buffer==nextBinding.buffer && firstBinding.offset==0 && nextBinding.offset==256 && firstBinding.length()==37 && nextBinding.length()==384);
  assert(((uint8_t *)firstBinding.buffer->contents)[0]==0x43 && !((uint8_t *)firstBinding.buffer->contents)[37]);
  auto uploadBuffer=firstBinding.buffer;unsigned inlineDraws=0;fuxi::Backend::modelDraw=[&](const fuxi::Operation &op){auto b=op.buffers[0][0];assert(b.bytes && b.length()-b.offset==(inlineDraws?128:37));++inlineDraws;};
  [inlineCommand commit];assert(!inlineCommand.error && inlineDraws==2);

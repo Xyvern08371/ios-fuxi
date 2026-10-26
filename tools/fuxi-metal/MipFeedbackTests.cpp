@@ -4,7 +4,8 @@
 #include <cstdio>
 int main(){
  assert(fuxi::backboardGate.admit("12345678-1234-1234-1234-123456789abc",open(getenv("CONTROL_GATE"),O_RDONLY|O_DIRECTORY|O_CLOEXEC)));
- fuxi::Backend b;auto *t=b.allocateTexture(80,5,704,96,10);auto *upload=b.allocate(704*96*4),*read=b.allocate(704*96*4);
+ fuxi::Backend b;b.reuseDrawPlans=false; // Fixture push bytes vary through CONTROL_LOD, outside DrawInput.
+ auto *t=b.allocateTexture(80,5,704,96,10);auto *upload=b.allocate(704*96*4),*read=b.allocate(704*96*4);
  memset(upload->contents,91,upload->length);fuxi::Operation put{};put.texture=t;put.src=upload;put.upload=true;b.submit({put});
  auto *p=b.compilePipeline(nullptr,"control",nullptr,"control");auto *sam=b.allocateSampler(false,false,1);
  fuxi::Operation op{};op.texture=t;op.pipeline=p;op.samples[0]=t;op.samplers[0]=sam;op.vertices=6;op.dstLevel=1;op.areaWidth=352;op.areaHeight=48;op.viewport={0,48,352,-48,0,1};op.scissor={{0,0},{352,48}};op.sampleCount[0]=10;op.load=2;op.store=1;

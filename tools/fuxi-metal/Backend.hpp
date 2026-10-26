@@ -77,7 +77,7 @@ inline void importCheck(VkResult r,int line=__builtin_LINE()) {
  X(CreatePipelineLayout) X(DestroyPipelineLayout) X(CreateGraphicsPipelines) X(DestroyPipeline) \
  X(CreatePipelineCache) X(DestroyPipelineCache) X(GetPipelineCacheData) \
  X(CmdBindVertexBuffers) X(CmdBindIndexBuffer) X(CmdDrawIndexed) X(CmdSetViewport) X(CmdSetScissor) X(CmdPushConstants) X(CmdBeginRenderPass) X(CmdEndRenderPass) X(CmdBindPipeline) X(CmdDraw) X(CmdCopyImageToBuffer) X(CmdPipelineBarrier) X(CreateFence) X(DestroyFence) X(QueueSubmit) X(WaitForFences)
-struct Buffer { VkBuffer buffer{}; VkDeviceMemory memory{}; void *contents{}; size_t length{}, allocated{},charged{},memoryBytes{},references=1;uint32_t memoryType{};bool imported=false; };
+struct Buffer { VkBuffer buffer{}; VkDeviceMemory memory{}; void *contents{}; size_t length{}, allocated{},charged{},memoryBytes{},references=1;uint32_t memoryType{};bool imported=false,upload=false; };
 struct Texture : TextureLevels {VkImage image{};VkDeviceMemory memory{};VkImageView view{};size_t allocated{},charged{},memoryBytes{},references=1;
  uint32_t memoryType{};VkImageUsageFlags usage{};uint32_t format=80;VkFormat vkFormat=VK_FORMAT_B8G8R8A8_UNORM;
  // layout is level zero; levelLayouts[1..levels) track the remaining mips.
@@ -183,7 +183,7 @@ class Backend {
  struct SubmitSlot {
   VkCommandPool commandPool{};VkCommandBuffer command{};VkFence submitFence{};VkQueryPool queryPool{};
   Buffer *aliasScratch=nullptr;VkDescriptorPool descriptorPool{};uint32_t descriptorSets{};
-  std::vector<VkDescriptorPoolSize> descriptorCapacity;std::vector<HostUse> hostUses;bool busy=false;
+  std::vector<VkDescriptorPoolSize> descriptorCapacity;std::vector<HostUse> hostUses,uses,writes;bool busy=false;
  } slots[2];
  std::condition_variable submitWake;
  static constexpr size_t aliasScratchLimit=1024*1024;
@@ -801,8 +801,8 @@ public:
    VkPipelineLayoutCreateInfo li{};li.setLayoutCount=p->setLayout?1:0;li.pSetLayouts=&p->setLayout;li.sType=VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;li.pushConstantRangeCount=translated.rangeCount;li.pPushConstantRanges=ranges;check(CreatePipelineLayout(device,&li,nullptr,&p->layout));
    p->recipe=translated;
    p->mipAccess[0]=MipAccess(translated.vertex,translated.vertexCount);p->mipAccess[1]=MipAccess(translated.fragment,translated.fragmentCount);
-   if(systemTranslationPolicy().merge)for(auto &d:p->descriptors)if(d.type==VK_DESCRIPTOR_TYPE_STORAGE_BUFFER)for(unsigned stage=0;stage<2;++stage)
-    if((d.stages&(stage?16u:1u)) && p->mipAccess[stage].readOnlyStorage(d.binding))p->readOnlyStorage[stage]|=1u<<d.binding;
+   for(auto &d:p->descriptors)if(d.type==VK_DESCRIPTOR_TYPE_STORAGE_BUFFER)for(unsigned stage=0;stage<2;++stage)
+    if(d.binding<16 && (d.stages&(stage?16u:1u)) && p->mipAccess[stage].readOnlyStorage(d.binding))p->readOnlyStorage[stage]|=1u<<d.binding;
    p->retainedBytes+=p->mipAccess[0].retainedBytes()+p->mipAccess[1].retainedBytes();
    auto began=std::chrono::steady_clock::now();
    try {
@@ -886,27 +886,42 @@ public:
  }
  // The caller must invoke retirement exactly once, before Backend destruction.
  // Slots pin every referenced object, including resources released by the client.
- void submit(std::vector<Operation> ops,const std::function<void()> &scheduled={},std::function<void()> *retirement=nullptr,const std::function<void()> &prepare={}) {
+ void submit(std::vector<Operation> ops,const std::function<void()> &scheduled={},std::function<void()> *retirement=nullptr,const std::function<void()> &prepare={},ShadowSnapshot *shadows=nullptr,ShadowPool *shadowPool=nullptr) {
   auto submitStart=std::chrono::steady_clock::now();auto submitQueued=submitStart;
   auto since=[](std::chrono::steady_clock::time_point t){return (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-t).count();};
   auto *timing=systemTranslationPolicy().frameTrace?currentFrame:nullptr;
   std::unique_lock<std::mutex> guard(mutex);
   if(currentFrame)currentFrame->backendLock+=since(submitStart);
-  requireLive();std::vector<HostUse> hostUses;
+  requireLive();if(shadows && !shadowPool)throw std::runtime_error("shadow snapshot requires pool");std::vector<HostUse> hostUses,uses,writes;
+  auto addUse=[](std::vector<HostUse> &list,VkDeviceMemory memory,const void *address,size_t bytes){if(std::none_of(list.begin(),list.end(),[&](auto old){return old.memory==memory && old.address==address && old.bytes==bytes;}))list.push_back({memory,address,bytes});};
+  auto bufferUse=[&](std::vector<HostUse> &list,Buffer *b){if(b)addUse(list,b->memory,b->contents,b->length);};
+  auto textureUse=[&](std::vector<HostUse> &list,Texture *t){if(t){addUse(list,t->memory,t->mapped,t->allocated);bufferUse(list,t->backingBuffer);}};
+  for(const auto &op:ops){bufferUse(uses,op.src);bufferUse(uses,op.dst);bufferUse(uses,op.indices);textureUse(uses,op.texture);textureUse(uses,op.sourceTexture);for(auto *t:op.samples)textureUse(uses,t);for(unsigned i=0;i<std::min(op.colorCount,8u);++i)textureUse(uses,op.color(i).texture);for(auto &stage:op.buffers)for(auto binding:stage)bufferUse(uses,binding.buffer);if(op.pipeline)for(auto *blob:op.pipeline->constantBlobs)bufferUse(uses,blob);}
   if(retirement || systemTranslationPolicy().overlap){
-   auto use=[&](VkDeviceMemory memory,const void *address,size_t bytes){if(std::none_of(hostUses.begin(),hostUses.end(),[&](const auto &old){return old.memory==memory && old.address==address && old.bytes==bytes;}))hostUses.push_back({memory,address,bytes});};
-   auto buffer=[&](Buffer *b){if(b && !coherent(b->memoryType))use(b->memory,b->contents,b->length);};
-   auto texture=[&](Texture *t){if(t){if(t->mapped && !coherent(t->memoryType))use(t->memory,t->mapped,t->allocated);buffer(t->backingBuffer);}};
+   auto buffer=[&](Buffer *b){if(b && !coherent(b->memoryType))bufferUse(hostUses,b);};
+   auto texture=[&](Texture *t){if(t){if(t->mapped && !coherent(t->memoryType))addUse(hostUses,t->memory,t->mapped,t->allocated);buffer(t->backingBuffer);}};
    for(const auto &op:ops){buffer(op.src);buffer(op.dst);buffer(op.indices);texture(op.texture);texture(op.sourceTexture);for(auto *t:op.samples)texture(t);for(unsigned i=0;i<std::min(op.colorCount,8u);++i)texture(op.color(i).texture);for(auto &stage:op.buffers)for(auto binding:stage)buffer(binding.buffer);if(op.pipeline)for(auto *blob:op.pipeline->constantBlobs)buffer(blob);}
   }
-  auto conflicts=[&]{for(auto &pending:slots)if(pending.busy)for(auto old:pending.hostUses)for(auto use:hostUses)if(old.memory==use.memory || hostRangesOverlap(old.address,old.bytes,use.address,use.bytes))return true;return false;};
-  // Noncoherent whole-allocation flush/invalidate cannot race another flight on
-  // the same host range. Coherent ranges are absent from hostUses, so CPU index
-  // inspection and opaque shadow prepare callbacks still require a full drain.
-  bool drain=bool(prepare) || (retirement && std::any_of(ops.begin(),ops.end(),[](const auto &op){return op.indices!=nullptr;}));
+  auto aliases=[](HostUse a,HostUse b){return (a.memory && a.memory==b.memory) || hostRangesOverlap(a.address,a.bytes,b.address,b.bytes);};
+  auto conflicts=[&]{for(auto &pending:slots)if(pending.busy)for(auto old:pending.hostUses)for(auto use:hostUses)if(aliases(old,use))return true;return false;};
+  auto indexHazard=[&](bool uploadOnly=false){for(auto &op:ops)if(op.indices && (!uploadOnly || op.indices->upload))for(auto &pending:slots)if(pending.busy)for(auto old:pending.writes)if(aliases(old,{op.indices->memory,op.indices->contents,op.indices->length}))return true;return false;};
+  auto shadowHazard=[&]{if(!shadows)return false;bool writer=false,used=false,reader=false;
+   shadows->eachRange([&](void *p,size_t n){for(auto &pending:slots)if(pending.busy){for(auto old:pending.writes)writer|=hostRangesOverlap(p,n,old.address,old.bytes);for(auto old:pending.uses)used|=hostRangesOverlap(p,n,old.address,old.bytes);}});
+   if(writer || !used)return writer;
+   shadows->eachDirty([&](void *p,size_t n){for(auto &pending:slots)if(pending.busy)for(auto old:pending.uses)reader|=hostRangesOverlap(p,n,old.address,old.bytes);});return reader;
+  };
+  // Coherent index reads need only exclude real GPU writers. Noncoherent cache
+  // maintenance still excludes every shared allocation; opaque prepare drains.
+  bool sawDrain=false,sawIndex=false,sawUpload=false,sawPrepare=false,sawDrainWait=false,sawConflict=false,sawSlots=false,sawShadow=false,otherIndices=false;
+  if(currentFrame){bool upload=false;for(auto &op:ops)if(op.indices)(op.indices->upload?upload:otherIndices)=true;currentFrame->indexUploadSubmits+=upload;}
   auto slotStart=FrameClock::now();
-  if(currentFrame){currentFrame->drainWaits+=drain && (slots[0].busy || slots[1].busy);currentFrame->conflictWaits+=conflicts();currentFrame->slotWaits+=slots[0].busy && (!retirement || slots[1].busy);}
-  submitWake.wait(guard,[&]{return (!slots[0].busy || (retirement && !slots[1].busy)) && (!drain || (!slots[0].busy && !slots[1].busy)) && !conflicts();});
+  submitWake.wait(guard,[&]{if(poisoned)return true;bool index=indexHazard(),drain=bool(prepare) || index,busy=slots[0].busy || slots[1].busy,conflict=conflicts(),shadow=shadowHazard(),full=slots[0].busy && (!retirement || slots[1].busy);
+   if(currentFrame){auto once=[](bool value,bool &seen,uint64_t &count){if(value && !seen){++count;seen=true;}};
+    once(drain,sawDrain,currentFrame->drainSubmits);once(index,sawIndex,currentFrame->indexGPUWritableDrains);once(indexHazard(true),sawUpload,currentFrame->indexUploadDrains);once(bool(prepare),sawPrepare,currentFrame->prepareDrains);
+    once(drain && busy,sawDrainWait,currentFrame->drainWaits);once(conflict,sawConflict,currentFrame->conflictWaits);once(full,sawSlots,currentFrame->slotWaits);once(shadow,sawShadow,currentFrame->shadowWaits);}
+   return !full && (!drain || !busy) && !conflict && !shadow;
+  });
+  if(currentFrame){currentFrame->indexGPUWritableSubmits+=sawIndex;currentFrame->indexReadOnlySubmits+=otherIndices && !sawIndex;}
   if(currentFrame)currentFrame->slotWait+=since(slotStart);
   requireLive();auto &slot=slots[slots[0].busy?1:0];
   auto &commandPool=slot.commandPool;auto &command=slot.command;auto &submitFence=slot.submitFence;auto &queryPool=slot.queryPool;
@@ -916,6 +931,7 @@ public:
 #endif
   auto locked=currentFrame?FrameClock::now():FrameClock::time_point{};if(currentFrame)currentFrame->leaseLock+=uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(locked-submitStart).count());
   if(prepare){prepare();if(currentFrame)locked=FrameClock::now();}
+  if(shadows){auto start=FrameClock::now();auto total=shadows->bytes(),copied=shadows->apply(*shadowPool);auto ns=frameNanos(start);shadowCopyNanos+=ns;if(currentFrame){currentFrame->shadowCopyBytes+=copied;currentFrame->shadowSkippedBytes+=total-copied;currentFrame->shadowCopy+=ns;}}
   auto *cpuTiming=systemTranslationPolicy().frameCPU && timing && !timing->cpuSampledSubmits?timing:nullptr;
   if(cpuTiming)++cpuTiming->cpuSampledSubmits;
   else if(timing && systemTranslationPolicy().frameCPU)++timing->cpuOmittedSubmits;
@@ -1528,6 +1544,15 @@ public:
    {auto ns=since(submitDone);++submits;submitRetireNanos+=ns;if(currentFrame)currentFrame->retireHost+=ns;}
    return;
    }
+   for(size_t n=0;n<ops.size();++n){auto &op=ops[n];bufferUse(writes,op.dst);
+    if(op.pipeline || op.clearOnly){for(unsigned i=0;i<std::min(op.colorCount,8u);++i)textureUse(writes,op.color(i).texture);}
+    else if(op.texture && (op.upload || op.sourceTexture || op.generateMips))textureUse(writes,op.texture);
+    if(op.pipeline)for(unsigned j=0;j<draws[n].descriptorCount;++j){auto &d=draws[n].descriptors[j];if(d.type!=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER)continue;
+     for(unsigned stage=0;stage<2;++stage)if((d.stages&(stage?16u:1u)) && (d.binding>=16 || !(op.pipeline->readOnlyStorage[stage]&(1u<<d.binding)))){
+      if(d.source==1){if(d.slot<op.pipeline->constantBlobs.size())bufferUse(writes,op.pipeline->constantBlobs[d.slot]);}else if(!d.source && d.slot<resourceSlots)bufferUse(writes,op.buffers[stage][d.slot].buffer);
+     }
+    }
+   }
    // Build/pin retirement before QueueSubmit: allocation failure cannot abandon DMA.
    auto pinnedBuffers=buffers;auto pinnedTextures=textures;
    std::vector<Pipeline *> pinnedPipelines;std::vector<Sampler *> pinnedSamplers;
@@ -1546,7 +1571,7 @@ public:
     if(currentFrame)currentFrame->gpuWait+=frameNanos(waitStart);
     auto lockStart=FrameClock::now();std::lock_guard<std::mutex> lock(mutex);
     if(currentFrame)currentFrame->retireLock+=frameNanos(lockStart);
-    auto releaseSlot=[&]{slot.hostUses.clear();slot.busy=false;submitWake.notify_all();};
+    auto releaseSlot=[&]{slot.hostUses.clear();slot.uses.clear();slot.writes.clear();slot.busy=false;submitWake.notify_all();};
     try {
      if(result!=VK_SUCCESS){poisoned=true;check(result);}
      // Another in-flight failure also prohibits host invalidation and teardown.
@@ -1571,7 +1596,7 @@ public:
     }catch(...){poisoned=true;releaseSlot();throw;} // Quarantine all pinned GPU objects on uncertain ownership.
    };
    for(auto *b:pinnedBuffers)++b->references;for(auto *t:pinnedTextures)++t->references;for(auto *p:pinnedPipelines)++p->references;for(auto *s:pinnedSamplers)++s->references;
-   slot.hostUses=std::move(hostUses);slot.busy=true;
+   slot.hostUses=std::move(hostUses);slot.uses=std::move(uses);slot.writes=std::move(writes);slot.busy=true;
    submitToQueue();if(scheduled)scheduled();
    submitted=false;completed=true;
    *retirement=std::move(finish);

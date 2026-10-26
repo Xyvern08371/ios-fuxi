@@ -6,6 +6,22 @@
 #include <thread>
 using namespace fuxi;
 int main(){
+ assert(shadowCacheable(1,false,false));for(unsigned uses=0;uses<8;++uses){assert(!shadowCacheable(uses,true,false) && !shadowCacheable(uses,false,true));if(uses!=1)assert(!shadowCacheable(uses,false,false));}
+ // Shared immutable chunks freeze queued A/B/A commits; only changed pages copy.
+ {
+  ShadowPool pool;ShadowCache cache;std::vector<uint8_t> cpu(12288,19),gpu(12288,3);ShadowRanges r(cpu.size());r.add(256,9000);ShadowSnapshot a,b,c;
+  a.addCached(gpu.data(),cpu.data(),r,cache);assert(a.bytes()==9000 && a.copiedBytes()==9000 && !a.reusedBytes());
+  b.addCached(gpu.data(),cpu.data(),r,cache);assert(!b.copiedBytes() && b.reusedBytes()==9000);assert(a.apply(pool)==9000 && b.apply(pool)==0);
+  cpu[5000]=29;a.addCached(gpu.data(),cpu.data(),r,cache);assert(a.copiedBytes()==4096 && a.reusedBytes()==4904);
+  cpu[5000]=39;b.addCached(gpu.data(),cpu.data(),r,cache);cpu[5000]=29;c.addCached(gpu.data(),cpu.data(),r,cache);cpu[5000]=99;
+  assert(a.apply(pool)==4096 && gpu[5000]==29);assert(b.apply(pool)==4096 && gpu[5000]==39);assert(c.apply(pool)==4096 && gpu[5000]==29);
+  assert(gpu[255]==3 && gpu[9256]==3);
+  // A GPU write invalidates the backing even when the CPU version is unchanged.
+  cpu[5000]=29;a.addCached(gpu.data(),cpu.data(),r,cache);assert(!a.copiedBytes());gpu[5000]=0;assert(a.apply(pool)==4096 && gpu[5000]==29);
+  // Arbitrary new ranges and cache eviction keep older command versions alive.
+  ShadowRanges full(cpu.size());full.full();a.addCached(gpu.data(),cpu.data(),full,cache);std::vector<uint8_t> large(ShadowCache::budget+4096,7);ShadowRanges big(large.size());big.full();b.addCached(large.data(),large.data(),big,cache);
+  cpu.assign(cpu.size(),55);assert(a.apply(pool)>0 && gpu[0]==19 && gpu[5000]==29);b.release(pool);
+ }
  ShadowRanges merged(1024);merged.add(80,20);merged.add(20,20);merged.add(40,40);merged.add(15,5);merged.add(90,5);assert(merged.bytes()==85);
  unsigned intervals=0;merged.each([&](auto r){assert(r.offset==15 && r.size==85);++intervals;});assert(intervals==1);
  merged.add(1024,0);assert(merged.bytes()==85);merged.add(UINT64_MAX,2);assert(merged.isFull() && merged.bytes()==1024);
