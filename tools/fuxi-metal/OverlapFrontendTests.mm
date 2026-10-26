@@ -79,7 +79,7 @@ int main(){@autoreleasepool{
   (id)kIOSurfaceBytesPerElement:@4,(id)kIOSurfaceBytesPerRow:@64,(id)kIOSurfaceAllocSize:@16384,(id)kIOSurfacePixelFormat:@(0x42475241)});assert(surface);
  auto *descriptor=[MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:8 height:6 mipmapped:NO];
  descriptor.storageMode=MTLStorageModeShared;descriptor.usage=MTLTextureUsageShaderRead|MTLTextureUsageRenderTarget;
- FuxiTexture *texture=(FuxiTexture *)[device newTextureWithDescriptor:descriptor iosurface:surface plane:0];assert(texture && !heldLocks);
+ FuxiTexture *texture=(FuxiTexture *)[device newTextureWithDescriptor:descriptor iosurface:surface plane:0];assert(texture && !heldLocks);unsigned pendingBase=pendingLocks; // texture creation probes one AvoidSync lock
  FuxiQueue *earlyQueue=(FuxiQueue *)[device newCommandQueueWithMaxCommandBufferCount:1];
  auto earlyCommand=[&]{FuxiCommandBuffer *c=[(FuxiCommandBuffer *)[earlyQueue commandBuffer] retain];c->_earlySubmit=YES;c->_frameTrace=YES;c->_traceCreated=fuxi::FrameClock::now();c->_traceThread=std::this_thread::get_id();[c->_resources addObject:texture];return c;};
  dispatch_suspend(earlyQueue->_submitQueue);dispatch_suspend(earlyQueue->_retireQueue);
@@ -90,7 +90,7 @@ int main(){@autoreleasepool{
  [a enqueue];
  auto returned=std::async(std::launch::async,[&]{@autoreleasepool{assert([b commitAndWaitUntilSubmitted]);assert([a commitAndWaitUntilSubmitted]);assert([third commitAndWaitUntilSubmitted]);}});
  assert(returned.wait_for(std::chrono::seconds(1))==std::future_status::ready);returned.get();
- assert(pendingLocks==3 && heldLocks==3 && !order && !a->_scheduled && !b->_scheduled && !third->_scheduled && !earlyQueue->_depth);
+ assert(pendingLocks-pendingBase==3 && heldLocks==3 && !order && !a->_scheduled && !b->_scheduled && !third->_scheduled && !earlyQueue->_depth);
  assert(earlyQueue->_traceWaitScheduled && a->_flightTrace.schedWait);
  __block unsigned lateScheduled=0;[b addScheduledHandler:^(id<MTLCommandBuffer> c){assert(c.status==MTLCommandBufferStatusScheduled && order==2);++lateScheduled;}];assert(!lateScheduled);
  dispatch_resume(earlyQueue->_submitQueue);
