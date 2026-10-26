@@ -220,7 +220,7 @@ public:
  bool supportsTimestamps() const{return timestampBits && timestampPeriod>0;}
  explicit Backend(const char *client="unknown") {
   setenv("TU_DARWIN_SERVICE","NativeAdrenoGpuPublished",1);
-  setenv("TU_DARWIN_OPEN_TYPE","0",1);setupTurnip();setenv("MESA_LOG_LEVEL","debug",1);
+  setenv("TU_DARWIN_OPEN_TYPE","0",1);setupTurnip();setenv("MESA_LOG_LEVEL","warning",0);  // info logs a line per submit; env may raise it
   try {
    library=dlopen(FUXI_MTL_ICD,RTLD_NOW|RTLD_LOCAL);
    if(!library) throw std::runtime_error("dlopen Turnip failed");

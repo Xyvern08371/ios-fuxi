@@ -776,7 +776,8 @@ one client and one hardware job) still apply; allocation failure returns nil.
 
 `Backend.hpp` directly dlopens `/usr/local/lib/libvulkan_freedreno.dylib` after
 setting the same service/open/debug environment as M3: NativeAdrenoGpuPublished,
-open type 0, TU_DEBUG=nocb and MESA_LOG_LEVEL=debug. It requires the observed
+open type 0, TU_DEBUG=nocb and MESA_LOG_LEVEL=warning unless the environment
+already sets it (info printed one line per submit). It requires the observed
 Qualcomm device identity. Operations use vkCmdFillBuffer/vkCmdCopyBuffer, explicit
 host/transfer and transfer/transfer barriers, mapped-memory flush/invalidate,
 and a finite **2 s fence wait**. Commit is synchronous; the owner mutex
