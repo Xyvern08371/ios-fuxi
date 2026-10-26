@@ -8,6 +8,7 @@ Private output includes native reports, staged progress and console bytes.
 import argparse
 import json
 from pathlib import Path
+import re
 import struct
 import time
 import zlib
@@ -146,6 +147,7 @@ def main():
     ap.add_argument('--out', type=Path, required=True)
     ap.add_argument('--seconds', type=float, default=65)
     ap.add_argument('--framebuffer',action='store_true',help='save the validated inherited framebuffer after collecting logs')
+    ap.add_argument('--tour-shots',action='store_true',help='also save framebuffer-shotN-NAME.png at each "FUXI TOUR: shot N NAME" console line (fuxitour=S)')
     ap.add_argument('--skip-clocks',action='store_true',help='do not take the AHB-ungating clock snapshot before handoff')
     ap.add_argument('--reset-minutes',type=int,help='move the monitor PSCI reset deadline to now + N minutes (1-60)')
     ap.add_argument('--touch-test',type=float,metavar='SECONDS',help='before handoff: touch snapshot, power-up, then poll touch events for SECONDS')
@@ -345,6 +347,24 @@ def main():
     previous = None
     until = time.monotonic() + args.seconds
     renew = time.monotonic() + 600
+    def save_framebuffer(name):
+        raw=bytearray()
+        for off in range(0,1080*2400*4,512):
+            raw.extend(request(0x4e,min(512,1080*2400*4-off),off&0xffff,off>>16))
+        if name=='framebuffer':
+            (args.out/'framebuffer.bgra').write_bytes(raw)
+        rows=[]
+        for y in range(2400):
+            line=raw[y*4320:(y+1)*4320]
+            rgb=bytearray(1080*3)
+            rgb[0::3],rgb[1::3],rgb[2::3]=line[2::4],line[1::4],line[0::4]
+            rows.append(b'\0'+rgb)
+        def chunk(kind,data):
+            return struct.pack('>I',len(data))+kind+data+struct.pack('>I',zlib.crc32(kind+data))
+        png=b'\x89PNG\r\n\x1a\n'+chunk(b'IHDR',struct.pack('>IIBBBBB',1080,2400,8,2,0,0,0))
+        png+=chunk(b'IDAT',zlib.compress(b''.join(rows),6))+chunk(b'IEND',b'')
+        (args.out/(name+'.png')).write_bytes(png)
+    tour_tail, tour_done = b'', set()
     with (args.out / 'progress.jsonl').open('w') as progress, (args.out / 'boot.log').open('wb') as log:
         while time.monotonic() < until:
             status = monitor()
@@ -364,10 +384,18 @@ def main():
                 while start < total:
                     index = start % 0x400000
                     length = min(total-start, 0x400000-index)
-                    log.write(read_ram(offsets['_sweet_log_ring']+index, length))
+                    data = read_ram(offsets['_sweet_log_ring']+index, length)
+                    log.write(data)
+                    tour_tail = (tour_tail+data)[-4096:] if args.tour_shots else b''
                     start += length
                 log.flush()
                 last_total = total
+                for m in re.finditer(rb'FUXI TOUR: shot (\d+) ([a-z-]+)\n', tour_tail):
+                    if m.group(1) not in tour_done:
+                        tour_done.add(m.group(1))
+                        shot_start = time.monotonic()
+                        save_framebuffer('framebuffer-shot%s-%s' % (m.group(1).decode(), m.group(2).decode()))
+                        print('tour shot', m.group(1).decode(), m.group(2).decode(), 'saved in %.1f s' % (time.monotonic()-shot_start), flush=True)
             if args.display_poll:
                 status['display'] = display_poll()
             progress.write(json.dumps(status)+'\n')
@@ -401,21 +429,7 @@ def main():
             time.sleep(.25)
     (args.out/'display-after.bin').write_bytes(request(0x42,432))
     if args.framebuffer:
-        raw=bytearray()
-        for off in range(0,1080*2400*4,512):
-            raw.extend(request(0x4e,min(512,1080*2400*4-off),off&0xffff,off>>16))
-        (args.out/'framebuffer.bgra').write_bytes(raw)
-        rows=[]
-        for y in range(2400):
-            line=raw[y*4320:(y+1)*4320]
-            rgb=bytearray(1080*3)
-            rgb[0::3],rgb[1::3],rgb[2::3]=line[2::4],line[1::4],line[0::4]
-            rows.append(b'\0'+rgb)
-        def chunk(kind,data):
-            return struct.pack('>I',len(data))+kind+data+struct.pack('>I',zlib.crc32(kind+data))
-        png=b'\x89PNG\r\n\x1a\n'+chunk(b'IHDR',struct.pack('>IIBBBBB',1080,2400,8,2,0,0,0))
-        png+=chunk(b'IDAT',zlib.compress(b''.join(rows),6))+chunk(b'IEND',b'')
-        (args.out/'framebuffer.png').write_bytes(png)
+        save_framebuffer('framebuffer')
         print('Saved framebuffer memory; physical panel output still needs confirmation',flush=True)
 
 
