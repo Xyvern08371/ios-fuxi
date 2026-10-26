@@ -1193,3 +1193,14 @@ overlap runner cannot start without an installed `glslangValidator`; no shader
 compiler was downloaded. Native Objective-C frontend execution is skipped on
 Linux. Full kernel link, native frontend and device performance remain
 unverified.
+
+## Display-thread CPU cost audit
+
+2026-10-27. **Device results: not yet observed.** The
+[Metal CPU audit](metal.md#display-thread-cpu-allocation-and-encoding-cost)
+records the supplied profile, bounded texture-memory recycling, operation and
+inline-upload storage reuse, exact source-level copy sizes, registry attribution
+limit and synchronous fence candidates. The inspected framebuffer property
+lookup uses `IOService` with options 0; the supplied work-interval caller offset
+does not identify its key in the inspected cache. No framebuffer property or
+SwapWait/source/TE/transfer guard changes. Kernel patches regenerate unchanged.

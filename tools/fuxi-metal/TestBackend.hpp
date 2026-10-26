@@ -28,7 +28,8 @@ struct Pipeline {ShadowWindow shadowWindows[2][resourceSlots]{};CompileOptions o
 struct Sampler {};
 struct Viewport {float x,y,width,height,minDepth,maxDepth;};
 struct Rect {struct {int32_t x,y;}offset;struct {uint32_t width,height;}extent;};
-struct BufferBind {Buffer *buffer{};uint64_t offset{};bool bytes=false;};
+struct BufferBind {Buffer *buffer{};uint64_t offset{};bool bytes=false;uint32_t end{};
+ uint64_t length() const{return end?end:buffer?buffer->length:0;}};
 struct ColorTarget {Texture *texture{};uint32_t level{},load=2,store=1;float clear[4]{};};
 struct Operation {
  Buffer *src, *dst; size_t from, to, size; uint8_t value;

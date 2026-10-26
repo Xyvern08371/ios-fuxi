@@ -52,7 +52,7 @@ int main(){
  auto submittedCPU=deferred.backendCPU;assert(retire && bool(submittedCPU)==systemTranslationPolicy().frameCPU && !deferred.gpuWait);
  std::thread retireWorker([&]{FrameTraceScope scope(&deferred);retire();});retireWorker.join();
  assert(deferred.backendCPU==submittedCPU && deferred.gpuWait);
- backend.destroy(t);backend.destroy(up);backend.destroy(out);
+ backend.destroy(t);backend.destroy(up);backend.destroy(out);backend.trimMemory();
  assert(backend.resourceBytes()==baseline+(reuse?262144:0));backend.close();
  assert(liveMemoryObjects==objects); // retained scratch is reclaimed on clean close
  {

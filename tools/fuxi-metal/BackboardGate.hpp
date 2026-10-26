@@ -1,5 +1,6 @@
 /* Boot-scoped crash recovery; no signal handler or mid-context CPU replay. */
 #pragma once
+#include "TransientMemory.hpp"
 #include "ClientStorage.hpp"
 #include "FrameTrace.hpp"
 #include "SamplingPolicy.hpp"
@@ -107,9 +108,9 @@ public:
   // This is compositor timestamp occupancy, not a whole-engine busy counter.
   double busy=100.0*double(gpu-lastGPU)/1e9/(t-lastReport);if(busy>100.0)busy=100.0;
   if(count && gpu==lastGPU)busy=-1.0; // completed frames without timestamp data
-  fprintf(stderr,"FUXI MTL: backboardd frames=%llu gpu_ms=%.3f late=%llu failures=%llu sampling_skipped=%llu hz=%.2f window_frames=%llu gpu_busy_est_pct=%.1f\n",
+  fprintf(stderr,"FUXI MTL: backboardd frames=%llu gpu_ms=%.3f late=%llu failures=%llu sampling_skipped=%llu hz=%.2f window_frames=%llu gpu_busy_est_pct=%.1f tex_pool_hits=%llu tex_pool_misses=%llu tex_pool_trims=%llu tex_pool_bytes=%llu\n",
    (unsigned long long)frames,count?(gpu-lastGPU)/1e6/double(count):0.0,(unsigned long long)late,
-   (unsigned long long)failures,(unsigned long long)skippedSamplingDraws.load(),double(count)/(t-lastReport),(unsigned long long)count,busy);
+   (unsigned long long)failures,(unsigned long long)skippedSamplingDraws.load(),double(count)/(t-lastReport),(unsigned long long)count,busy,(unsigned long long)texturePoolHits.load(),(unsigned long long)texturePoolMisses.load(),(unsigned long long)texturePoolTrims.load(),(unsigned long long)texturePoolBytes.load());
   if(systemTranslationPolicy().frameTrace)frameTrace.report();
   lastReport=t;lastFrames=frames;lastGPU=gpu;
  }

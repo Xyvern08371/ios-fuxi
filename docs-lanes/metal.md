@@ -2309,3 +2309,118 @@ extra delay. The new native paused-finish test requires that three same-surface
 commands retire and release every lease/flight while completion work is paused,
 then deliver their completion handlers in order. Native `.mm` compilation and
 execution still require macOS; Linux portable tests cannot establish that result.
+
+## Display-thread CPU allocation and encoding cost
+
+2026-10-27. **Device results for these changes: not yet observed.** The supplied
+60 s / 30,000-sample display-thread profile reports 49% runloop idle, 513 texture
+`vkAllocateMemory` samples, about 1,250 record-copy samples, 174 operation-vector
+growth samples, 1,382 registry samples and 227 SwapWait samples. The supplied
+trace p50s are CPU-before-commit 6 ms, backend submission 3 ms, GPU execution
+6.3 ms and commit gap 13 ms, with about 48 fps and 17% multi-tick intervals.
+These describe the preceding device build; they are not host test results.
+
+`Backend::allocateTextureUnlocked` now takes device-local memory from an exact
+requirements-size/alignment, Vulkan-format/usage and memory-type pool. The pool
+holds at most **32 allocations / 64 MiB**, within the existing **256 MiB** total
+resource charge. It caches memory, not images: each new image starts undefined
+with a fresh layout/defined-level state. `destroyTextureUnlocked` donates only
+successfully created ordinary allocations after the final reference disappears.
+Async `submit` pins every used texture before QueueSubmit and drops those pins
+only after fence/cache retirement. Synchronous submission and destruction share
+the backend mutex. Imports, borrowed buffer-image memory and failed creations
+never donate memory; IOSurface lifetime, lock, use-count and ownership semantics
+are unchanged. Device loss poisons the backend even without a live flight;
+poisoned pools neither reuse nor free memory, retaining containment semantics.
+
+Unused entries expire after **five seconds**, checked by the maintenance worker
+once a second and on ordinary texture allocation. Resource-budget pressure,
+texture allocation OOM (one retry), Darwin memory-pressure warning/critical
+notifications and clean close trim quiescent cached allocations. Notification
+cancellation completes before backend destruction. Trimming can contend for the
+backend mutex; it never waits for a live texture to become recyclable. The
+maintenance thread now also runs when persistent shader caching is disabled.
+
+The existing five-second `FUXI MTL: backboardd frames=...` line appends lifetime
+**`tex_pool_hits`, `tex_pool_misses`, `tex_pool_trims`, `tex_pool_bytes`**.
+Hits/misses count ordinary texture-memory requests, trims count cached memory
+objects actually freed, and bytes is the current retained-memory gauge (including
+quarantined idle memory after loss). Capacity refusals immediately free the
+returning allocation and do not count as cached-object trims. There is no new
+per-frame logging. Existing frame-trace `allocations` counts actual Vulkan
+allocations, so a hit contributes zero.
+
+`record` previously copied the **2 x 16 `BufferBind` array, 768 bytes** with its
+explicit `memcpy(op.buffers, _buffers, sizeof(_buffers))`. These are pointers,
+offsets and flags, not CA's vertex/index payload. It also copied `_state` into
+a temporary `Operation` and moved that into `_ops`; the LP64 production operation
+is **1,712 bytes**. The supplied `+0xfec` PC cannot be mapped conclusively to
+one compiler-generated copy without that build's binary/symbol mapping. These
+are the exact source-level copies in that location, rather than an inferred
+inline-data length. Bindings now live in `_state.buffers`; `record` constructs
+the snapshot directly in `_ops`, eliminating the separate 768-byte binding copy
+and temporary-to-vector move. One immutable state snapshot per draw remains.
+
+Each queue recycles up to four empty operation vectors within **8 MiB**, reserving
+256 operations initially and remembering the bounded completed-command high-water
+capacity. A first larger workload can still grow; warmed commands reuse storage.
+Live/queued commands never share vectors; overflow storage is destroyed with its
+command. Completion returns storage, and abandoned commands return it at dealloc.
+Backend submission still makes its existing per-submit working vector copy.
+
+`setBytes` already copied each payload once, but allocated a Vulkan buffer for
+every call. It now copies once into a command-owned upload ring of **64 KiB**
+blocks, with 256-byte slice alignment and zeroed 16-byte tail padding. Each
+binding records its logical end in existing `BufferBind` padding, keeping the
+24-byte binding / 1,712-byte operation size. Translator input, descriptor range
+and vertex-fetch checks honor that end instead of the block's spare capacity.
+Caller mutations and later setters cannot change an older draw's snapshot.
+A command is limited to 64 blocks (**4 MiB**); a queue retains at most eight
+retired blocks (**512 KiB**) until queue destruction. Live blocks remain charged
+and retained through completion; loss discards them from reuse. This is bounded
+upload storage, not a cache for imported or general-purpose buffer ownership.
+
+Read-only iOS 16.7 cache conclusions (facts only, no Apple code/binaries tracked):
+`IOMobileFramebuffer`'s `kern_CopyProperty` queries the opened framebuffer
+service in plane **`IOService`**, allocator null, options **0** (no recursive or
+parent-search bits). QuartzCore's `copy_display_property` fallback likewise
+uses the display service, `IOService`, options 0. In this cache,
+`IOMFBDisplay::begin_work_interval` starts at **0x1882c1e38**; **+0xf8** is
+**0x1882c1f30**, after work-interval start, not a property-search call site.
+Its direct calls and resolved heartbeat/minimum-duration paths do not establish
+a searched key. Thus the supplied stack attribution does **not** identify a
+well-defined missing property, and absence alone does not establish a recursive
+walk. **The key remains unresolved; no AppleCLCD property is fabricated.**
+A matching caller PC/build mapping is needed to attribute those registry samples.
+
+Code identifies synchronous WaitFence candidates, not the caller of the older
+uncaptured poll sample: non-overlap `commitSynchronous` submits without a
+retirement ticket; CPU texture `getBytes`/`replaceRegion` transfers do the same;
+event-split chunks also synchronously retire before crossing the CPU event.
+`Backend::submit` then calls `WaitForFences` before cache invalidation/return.
+Overlap's final chunk instead waits in the retire worker. Backend slot/index/
+shadow drains wait on its condition variable for prior retirement, not directly
+in the kernel poll. `allocateTextureUnlocked` and `record` contain no explicit
+fence wait; their driver calls cannot be attributed to the uncaptured stack.
+`FuxiAdrenoUserClient::wait` sleeps between `fuxi_gpu_abi_poll` attempts using
+`delay(waitPollUs)` (default 100 us). None of these waits is proven unnecessary;
+removing CPU-read/write or source/cache retirement guards would be incorrect.
+SwapWait/TE/transfer guards are also unchanged by this frontend-only revision.
+
+Expected benefit is fewer kernel BO allocations and fewer render-state copies
+and heap growth stalls. At 48 frames/s the three sampled allocation/copy/growth
+sites represent roughly **0.36 / 0.87 / 0.12 ms per frame** of sampled thread
+residence (about **1.35 ms/frame total opportunity**, not a promised saving).
+Residual snapshot copies, misses, scheduling, GPU execution and display waits
+remain. Registry and fence samples have no claimed saving. No additive latency
+budget or tail bound follows from these samples: stable 60 fps / all frames
+under 16.6 ms and more frames under 8.3 ms still require device qualification.
+
+Validation: portable frontend/policy/storage/upload tests, production Vulkan
+memory-pool tests (software ICD, ASan/UBSan, loss/timeout), backend, frame-trace,
+unixnu and scanout suites pass. Native `EncodingFrontendTests.mm` adds actual
+selector/storage/slice/reuse checks; native compilation/execution and Darwin
+memory-pressure delivery remain unverified on Linux. All twelve sync checks
+pass. Regenerated **0098**, **0106**, **0108** are byte-identical; **no generated
+patch changes**. No kernel or external Mesa/metal2vulkan/NativeMetal source
+changes, device access, deployment, firmware download, push or workflow run.

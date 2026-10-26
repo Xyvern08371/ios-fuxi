@@ -16,7 +16,11 @@
 #include <thread>
 #include <condition_variable>
 #include <sys/resource.h>
+#ifdef __APPLE__
+#include <dispatch/dispatch.h>
+#endif
 #include "ResourceLimits.hpp"
+#include "TransientMemory.hpp"
 #include "ClientSetup.hpp"
 #include "DrawSafety.hpp"
 #include "TextureLevels.hpp"
@@ -78,6 +82,7 @@ struct Texture : TextureLevels {VkImage image{};VkDeviceMemory memory{};VkImageV
  uint32_t memoryType{};VkImageUsageFlags usage{};uint32_t format=80;VkFormat vkFormat=VK_FORMAT_B8G8R8A8_UNORM;
  // layout is level zero; levelLayouts[1..levels) track the remaining mips.
  VkImageTiling tiling=VK_IMAGE_TILING_OPTIMAL;VkImageLayout layout=VK_IMAGE_LAYOUT_UNDEFINED;std::array<VkImageLayout,32> levelLayouts{};void *mapped{};bool imported=false,borrowedMemory=false;
+ MemoryKey recycleKey{};bool recyclable=false;
  Buffer *backingBuffer{};size_t backingOffset{},backingRow{};bool shadow=false;
  std::vector<VkImageView> attachmentViews;bool canGenerate=false,filterable=true,blendable=false;};
 struct Sampler {size_t references=1;VkSampler sampler{};uint32_t filters=1;float lodMin=0,lodMax=0;};
@@ -88,7 +93,8 @@ struct VariantKey {
 };
 struct Pipeline {ShadowWindow shadowWindows[2][resourceSlots]{};std::array<uint32_t,resourceSlots> textureTypes{};size_t references=1,retainedBytes=0;void *translation{};CompileOptions options{};uint32_t fetchMask{};bool orderedColorAccess=false;std::vector<std::pair<uint32_t,VkRenderPass>> renders;VkPipeline pipeline{},stripPipeline{};std::array<VkPipeline,2> linePipelines{};Translation recipe{};VkPipelineLayout layout{};VkRenderPass render{};uint32_t pushOffset{},pushSize{},pushStages{};uint8_t pushBytes[128]{};VkDescriptorSetLayout setLayout{};VkSampler bakedSamplers[16]{};BakedSampler bakedSamplerInfo[16]{};MipAccess mipAccess[2];uint32_t readOnlyStorage[2]{};std::vector<Descriptor> descriptors;std::vector<Buffer *> constantBlobs;std::vector<std::array<uint8_t,32>> blobHashes;std::vector<std::pair<VariantKey,Pipeline *>> variants;
 };
-struct BufferBind {Buffer *buffer{};uint64_t offset{};bool bytes=false;};
+struct BufferBind {Buffer *buffer{};uint64_t offset{};bool bytes=false;uint32_t end{};
+ uint64_t length() const{return end?end:buffer?buffer->length:0;}};
 struct ColorTarget {Texture *texture{};uint32_t level{},load=2,store=1;float clear[4]{};};
 struct Operation {
  Buffer *src, *dst; size_t from, to, size; uint8_t value;
@@ -112,7 +118,7 @@ struct Operation {
 class Backend {
  // A device loss from another API must poison flights before its cleanup runs.
  void check(VkResult result,int line=__builtin_LINE()) {
-  if(result==VK_ERROR_DEVICE_LOST && (slots[0].busy || slots[1].busy))poisoned=true;
+  if(result==VK_ERROR_DEVICE_LOST)poisoned=true;
   fuxi::check(result,line);
  }
  void *library{};
@@ -123,6 +129,23 @@ class Backend {
  Translator::CacheScope artifactCallbacks{};Translator::CacheScopeVerified artifactCallbacksVerified{};
  bool creationFeedback=false,cacheStopping=false;
  std::thread cacheWorker;std::condition_variable cacheWake;
+#ifdef __APPLE__
+ dispatch_source_t memoryPressure{};dispatch_semaphore_t pressureStopped{};
+ void startMemoryPressure(){
+  pressureStopped=dispatch_semaphore_create(0);
+  if(!pressureStopped)return;
+  memoryPressure=dispatch_source_create(DISPATCH_SOURCE_TYPE_MEMORYPRESSURE,0,DISPATCH_MEMORYPRESSURE_WARN|DISPATCH_MEMORYPRESSURE_CRITICAL,dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_LOW,0));
+  if(!memoryPressure){dispatch_release(pressureStopped);pressureStopped=nullptr;return;}
+  dispatch_set_context(memoryPressure,this);
+  dispatch_source_set_event_handler_f(memoryPressure,[](void *p){static_cast<Backend *>(p)->trimMemory();});
+  dispatch_source_set_cancel_handler_f(memoryPressure,[](void *p){dispatch_semaphore_signal(static_cast<Backend *>(p)->pressureStopped);});dispatch_resume(memoryPressure);
+ }
+ void stopMemoryPressure(){
+  if(!memoryPressure)return;
+  dispatch_source_cancel(memoryPressure);dispatch_semaphore_wait(pressureStopped,DISPATCH_TIME_FOREVER);
+  dispatch_release(memoryPressure);dispatch_release(pressureStopped);memoryPressure=nullptr;pressureStopped=nullptr;
+ }
+#endif
  using CacheClock=std::chrono::steady_clock;
  CacheClock::time_point cacheActivity{},cacheCheckpoint=CacheClock::now();
  struct CacheActivity {CacheClock::time_point *last;~CacheActivity(){if(last)*last=CacheClock::now();}};
@@ -145,6 +168,16 @@ class Backend {
   driverHits=driverMisses=driverUnknown=objectHits=objectMisses=0;return checkpoint;
  }
  ObjectCache<Pipeline> objects;ResourceLimits limits;DrawPlanCache<Pipeline> drawPlans;
+ TransientMemory<VkDeviceMemory> textureMemory;
+ static uint64_t memoryNow(){return std::chrono::duration_cast<std::chrono::nanoseconds>(CacheClock::now().time_since_epoch()).count();}
+ void trimMemoryUnlocked(bool all=false,uint64_t now=memoryNow()){
+  if(poisoned)return;
+  textureMemory.trim(now,all,[&](VkDeviceMemory h,size_t bytes){frameKernelCall([&]{FreeMemory(device,h,nullptr);});--liveMemoryObjects;liveMemoryBytes-=bytes;limits.release(bytes);});
+ }
+ void reserveMemoryUnlocked(size_t bytes){
+  if(bytes>ResourceLimits::budget-limits.used)trimMemoryUnlocked(true);
+  limits.reserve(bytes);
+ }
  // Two independently resettable lanes. A busy lane belongs to its retirement.
  struct HostUse {VkDeviceMemory memory;const void *address;size_t bytes;};
  struct SubmitSlot {
@@ -210,11 +243,13 @@ public:
  struct ImageTransition {Texture *texture;uint32_t level;VkImageLayout before,after;};
  struct SampleViewUse {Texture *texture;uint32_t base,count;VkImageLayout layout;};
  std::vector<ImageTransition> imageTransitions;std::vector<SampleViewUse> sampleViewUses;
+ void trimMemoryForTest(uint64_t now){std::lock_guard<std::mutex> guard(mutex);trimMemoryUnlocked(false,now);}
  size_t cachedFrames() const{return frameCache.size();}
  size_t cachedViews() const{return viewCache.size();}
  void dropPipelineCacheForTest(){std::lock_guard<std::mutex> guard(mutex);requireLive();objects.clear([&](Pipeline *p){drawPlans.invalidate(p);destroyPipelineUnlocked(p);});}
  void discardReuseForTest(){std::lock_guard<std::mutex> guard(mutex);requireLive();for(auto &slot:slots)clearSubmitObjects(slot);clearFrames();clearViews();}
 #endif
+ void trimMemory(){std::lock_guard<std::mutex> guard(mutex);trimMemoryUnlocked(true);}
  uint32_t maxTextureDimension() const{return limits.dimension;}
  size_t resourceBytes() const{std::lock_guard<std::mutex> guard(mutex);return limits.used;}
  bool supportsTimestamps() const{return timestampBits && timestampPeriod>0;}
@@ -317,15 +352,23 @@ public:
    }
    requireLive();
    GetDeviceQueue(device,family,0,&queue);if(!queue) throw std::runtime_error("null queue");
-   if(cacheMode==CacheMode::persistent)try {
-    cacheWorker=std::thread([this]{std::unique_lock<std::mutex> lock(mutex);
-     while(!cacheWake.wait_for(lock,std::chrono::seconds(5),[this]{return cacheStopping;})){
-      bool checkpoint=cachePeriodUnlocked();lock.unlock();if(checkpoint)artifactCache.checkpoint();lock.lock();
+#ifdef __APPLE__
+   startMemoryPressure();
+#endif
+   try {
+    cacheWorker=std::thread([this]{std::unique_lock<std::mutex> lock(mutex);auto lastPeriod=CacheClock::now();
+     while(!cacheWake.wait_for(lock,std::chrono::seconds(1),[this]{return cacheStopping;})){
+      trimMemoryUnlocked();bool checkpoint=false;
+      if(CacheClock::now()-lastPeriod>=std::chrono::seconds(5)){checkpoint=cachePeriodUnlocked();lastPeriod=CacheClock::now();}
+      lock.unlock();if(checkpoint)artifactCache.checkpoint();lock.lock();
      }});
-   }catch(...){fprintf(stderr,"FUXI MTL: cache timer unavailable; shutdown checkpoints only\n");}
+   }catch(...){fprintf(stderr,"FUXI MTL: maintenance timer unavailable; trim on allocation/shutdown\n");}
   } catch(...) {close();throw;}
  }
  void close() {
+#ifdef __APPLE__
+  stopMemoryPressure();
+#endif
   // Join before device/cache destruction, including poisoned contexts. A sleeping
   // worker owns no GPU resource and wakes immediately on shutdown.
   if(cacheWorker.joinable()){{std::lock_guard<std::mutex> guard(mutex);cacheStopping=true;}cacheWake.notify_all();cacheWorker.join();}
@@ -336,7 +379,7 @@ public:
   artifactCache.close();
   for(auto &slot:slots)clearSubmitObjects(slot);clearFrames();clearViews();for(auto &slot:slots){destroyUnlocked(slot.aliasScratch);slot.aliasScratch=nullptr;}
   objects.clear([&](Pipeline *p){drawPlans.invalidate(p);destroyPipelineUnlocked(p);});
-  pipelineCache.close();
+  pipelineCache.close();trimMemoryUnlocked(true);
   if(device && DestroyDevice) DestroyDevice(device,nullptr);
   if(instance && DestroyInstance) DestroyInstance(instance,nullptr);
   if(library) dlclose(library);
@@ -359,7 +402,7 @@ public:
    uint32_t type=0;while(type<memory.memoryTypeCount && (!(req.memoryTypeBits&(1u<<type)) || !(memory.memoryTypes[type].propertyFlags&VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT))) ++type;
    if(type==memory.memoryTypeCount) throw std::runtime_error("no host-visible memory");
    VkMemoryAllocateInfo ai{};ai.sType=VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;ai.allocationSize=req.size;ai.memoryTypeIndex=type;b->memoryType=type;
-   limits.reserve(ai.allocationSize);b->charged=ai.allocationSize;
+   reserveMemoryUnlocked(ai.allocationSize);b->charged=ai.allocationSize;
    check(frameKernelCall([&]{return AllocateMemory(device,&ai,nullptr,&b->memory);}));if(systemTranslationPolicy().frameTrace)++frameCounts.allocations;++liveMemoryObjects;liveMemoryBytes+=ai.allocationSize;b->memoryBytes=ai.allocationSize;check(frameKernelCall([&]{return BindBufferMemory(device,b->buffer,b->memory,0);}));
    check(frameKernelCall([&]{return MapMemory(device,b->memory,0,VK_WHOLE_SIZE,0,&b->contents);}));memset(b->contents,0,(length+15)&~size_t(15));return b;
   } catch(...) {destroyUnlocked(b);throw;}
@@ -386,7 +429,7 @@ public:
    if(type==memory.memoryTypeCount)throw std::runtime_error("no-copy buffer memory type");
    VkImportMemoryHostPointerInfoEXT hi{};hi.sType=VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT;hi.handleType=VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;hi.pHostPointer=base;
    VkMemoryAllocateInfo ai{};ai.sType=VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;ai.pNext=&hi;ai.allocationSize=bytes;ai.memoryTypeIndex=type;
-   limits.reserve(ai.allocationSize);b->charged=ai.allocationSize;
+   reserveMemoryUnlocked(ai.allocationSize);b->charged=ai.allocationSize;
    importCheck(frameKernelCall([&]{return AllocateMemory(device,&ai,nullptr,&b->memory);}));if(systemTranslationPolicy().frameTrace)++frameCounts.allocations;++liveMemoryObjects;liveMemoryBytes+=ai.allocationSize;b->memoryBytes=ai.allocationSize;b->allocated=bytes;b->memoryType=type;check(frameKernelCall([&]{return BindBufferMemory(device,b->buffer,b->memory,0);}));
    check(frameKernelCall([&]{return MapMemory(device,b->memory,0,VK_WHOLE_SIZE,0,&b->contents);}));return b;
   }catch(...){destroyUnlocked(b);throw;}
@@ -454,7 +497,10 @@ public:
  }
  bool destroyTextureUnlocked(Texture *t) {
   if(!t || --t->references)return !poisoned;
-  if(!poisoned) {clearFrames(t);clearViews(t);if(t->mapped && !t->borrowedMemory)frameKernelCall([&]{return UnmapMemory(device,t->memory);});for(auto v:t->attachmentViews)if(v)DestroyImageView(device,v,nullptr);if(t->view)DestroyImageView(device,t->view,nullptr);if(t->image)DestroyImage(device,t->image,nullptr);if(t->memory && !t->borrowedMemory){frameKernelCall([&]{return FreeMemory(device,t->memory,nullptr);});--liveMemoryObjects;liveMemoryBytes-=t->memoryBytes;}}limits.release(t->charged);destroyUnlocked(t->backingBuffer);delete t;return !poisoned;
+  if(!poisoned) {clearFrames(t);clearViews(t);if(t->mapped && !t->borrowedMemory)frameKernelCall([&]{return UnmapMemory(device,t->memory);});for(auto v:t->attachmentViews)if(v)DestroyImageView(device,v,nullptr);if(t->view)DestroyImageView(device,t->view,nullptr);if(t->image)DestroyImage(device,t->image,nullptr);if(t->memory && !t->borrowedMemory){
+   if(t->recyclable && textureMemory.put(t->recycleKey,t->memory,memoryNow()))t->charged=0;
+   else {frameKernelCall([&]{return FreeMemory(device,t->memory,nullptr);});--liveMemoryObjects;liveMemoryBytes-=t->memoryBytes;}
+  }}limits.release(t->charged);destroyUnlocked(t->backingBuffer);delete t;return !poisoned;
  }
  bool supportsHostImport() const {return hostImport && hostAlignment && GetMemoryHostPointerPropertiesEXT && GetPhysicalDeviceImageFormatProperties2;}
  void destroySamplerUnlocked(Sampler *s) {if(s && !--s->references){if(!poisoned && s->sampler)DestroySampler(device,s->sampler,nullptr);delete s;}}
@@ -518,7 +564,7 @@ public:
    if(type==memory.memoryTypeCount)throw std::runtime_error("IOSurface host memory type mismatch");
    VkImportMemoryHostPointerInfoEXT hi{};hi.sType=VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT;hi.handleType=external.handleType;hi.pHostPointer=base;
    VkMemoryAllocateInfo ai{};ai.sType=VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;ai.pNext=&hi;ai.allocationSize=bytes;ai.memoryTypeIndex=type;t->memoryType=type;
-   limits.reserve(ai.allocationSize);t->charged=ai.allocationSize;
+   reserveMemoryUnlocked(ai.allocationSize);t->charged=ai.allocationSize;
    // Import/charge the whole surface, binding the image at its plane's offset.
    check(frameKernelCall([&]{return AllocateMemory(device,&ai,nullptr,&t->memory);}));if(systemTranslationPolicy().frameTrace)++frameCounts.allocations;++liveMemoryObjects;liveMemoryBytes+=ai.allocationSize;t->memoryBytes=ai.allocationSize;t->allocated=bytes;check(frameKernelCall([&]{return BindImageMemory(device,t->image,t->memory,offset);}));
    check(frameKernelCall([&]{return MapMemory(device,t->memory,0,VK_WHOLE_SIZE,0,&t->mapped);}));
@@ -563,10 +609,18 @@ public:
    uint32_t memoryType=0;while(memoryType<memory.memoryTypeCount && (!(req.memoryTypeBits&(1u<<memoryType)) || !(memory.memoryTypes[memoryType].propertyFlags&VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)))++memoryType;
    if(memoryType==memory.memoryTypeCount)throw std::runtime_error("no device-local texture memory");
    VkMemoryAllocateInfo ai{};ai.sType=VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;ai.allocationSize=req.size;ai.memoryTypeIndex=memoryType;t->memoryType=memoryType;
-   limits.reserve(ai.allocationSize);t->charged=ai.allocationSize;
-   check(frameKernelCall([&]{return AllocateMemory(device,&ai,nullptr,&t->memory);}));if(systemTranslationPolicy().frameTrace)++frameCounts.allocations;++liveMemoryObjects;liveMemoryBytes+=ai.allocationSize;t->memoryBytes=ai.allocationSize;check(frameKernelCall([&]{return BindImageMemory(device,t->image,t->memory,0);}));
+   trimMemoryUnlocked();t->recycleKey={req.size,req.alignment,uint32_t(ii.format),uint32_t(ii.usage),memoryType};
+   t->memory=textureMemory.take(t->recycleKey);
+   if(t->memory)t->charged=ai.allocationSize;
+   else {
+    reserveMemoryUnlocked(ai.allocationSize);t->charged=ai.allocationSize;
+    auto result=frameKernelCall([&]{return AllocateMemory(device,&ai,nullptr,&t->memory);});
+    if(result==VK_ERROR_OUT_OF_DEVICE_MEMORY || result==VK_ERROR_OUT_OF_HOST_MEMORY){trimMemoryUnlocked(true);result=frameKernelCall([&]{return AllocateMemory(device,&ai,nullptr,&t->memory);});}
+    check(result);if(systemTranslationPolicy().frameTrace)++frameCounts.allocations;++liveMemoryObjects;liveMemoryBytes+=ai.allocationSize;
+   }
+   t->memoryBytes=ai.allocationSize;check(frameKernelCall([&]{return BindImageMemory(device,t->image,t->memory,0);}));
    VkImageViewCreateInfo vi{};vi.sType=VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;vi.image=t->image;vi.viewType=t->textureType==0?VK_IMAGE_VIEW_TYPE_1D:VK_IMAGE_VIEW_TYPE_2D;vi.format=ii.format;
-   vi.subresourceRange={VK_IMAGE_ASPECT_COLOR_BIT,0,levels,0,1};check(CreateImageView(device,&vi,nullptr,&t->view));return t;
+   vi.subresourceRange={VK_IMAGE_ASPECT_COLOR_BIT,0,levels,0,1};check(CreateImageView(device,&vi,nullptr,&t->view));t->recyclable=true;return t;
   }catch(...) {destroyTextureUnlocked(t);throw;}
  }
  VkImageView attachmentView(Texture *t,uint32_t level) {
@@ -954,7 +1008,7 @@ public:
        !scissorFits(r.offset.x,r.offset.y,r.extent.width,r.extent.height,op.areaWidth?op.areaWidth:op.texture->levelWidth(op.dstLevel),op.areaHeight?op.areaHeight:op.texture->levelHeight(op.dstLevel)))throw std::runtime_error("viewport/scissor target bounds");
     if(op.indices && !shadowIndexBytes(op.indices->length,op.indexOffset,op.vertices,op.indexWidth))throw std::runtime_error("index buffer bounds/type");
     DrawInput input{};input.count=op.vertices;input.start=op.first;input.strip=primitiveRestart(op.topology);input.indexed=op.indices!=nullptr;input.indexLength=op.indices?op.indices->length:0;input.indexOffset=op.indexOffset;
-    for(unsigned stage=0;stage<2;++stage)for(unsigned i=0;i<resourceSlots;++i){auto b=op.buffers[stage][i];if(b.buffer){if(b.buffer->memory==op.texture->memory || hostRangesOverlap(b.buffer->contents,b.buffer->length,op.texture->mapped,op.texture->allocated))throw std::runtime_error("attachment/buffer feedback");addBuffer(b.buffer);input.buffers[stage][i]={b.buffer->length,b.offset,b.bytes?1u:0u};}}
+    for(unsigned stage=0;stage<2;++stage)for(unsigned i=0;i<resourceSlots;++i){auto b=op.buffers[stage][i];if(b.buffer){if(b.buffer->memory==op.texture->memory || hostRangesOverlap(b.buffer->contents,b.buffer->length,op.texture->mapped,op.texture->allocated))throw std::runtime_error("attachment/buffer feedback");addBuffer(b.buffer);if(b.length()>b.buffer->length || b.offset>b.length())throw std::runtime_error("binding slice bounds");input.buffers[stage][i]={b.length(),b.offset,b.bytes?1u:0u};}}
     for(unsigned i=0;i<resourceSlots;++i){auto *t=i==0 && !op.samples[i]?op.sourceTexture:op.samples[i];auto *sam=i==0 && !op.samplers[i]?op.sampler:op.samplers[i];
      if(t){if(op.pipeline->textureTypes[i]!=UINT32_MAX && op.pipeline->textureTypes[i]!=t->textureType)throw std::runtime_error("sampled texture dimension mismatch or old bridge adapter");
       uint32_t base=op.sampleBase[i],count=op.sampleCount[i]?op.sampleCount[i]:t->levels-base;
@@ -1078,7 +1132,7 @@ public:
     for(auto &a:op.pipeline->options.attributes)if(a.format){auto slot=a.buffer;
      if(slot>=4 || !op.buffers[0][slot].buffer)throw std::runtime_error("unbound vertex buffer");
      auto bound=op.buffers[0][slot];
-     if(!vertexFetchFits(bound.buffer->length,bound.offset,last,op.pipeline->options.strides[slot],a.offset,a.format))throw std::runtime_error("vertex fetch bounds");
+     if(!vertexFetchFits(bound.length(),bound.offset,last,op.pipeline->options.strides[slot],a.offset,a.format))throw std::runtime_error("vertex fetch bounds");
     }
     // CPU index bounds are valid only for quiescent host input. A preceding GPU
     // write in this command needs readback before its values can be checked.
@@ -1349,7 +1403,7 @@ public:
 #ifdef FUXI_MTL_HOST_TEST
         sampleViewUses.push_back({t,base,count,image.imageLayout});
 #endif
-       }else {auto b=op.buffers[d.stages==1?0:1][d.slot];if(!b.buffer || !d.range || d.offset>((b.buffer->length+15)&~size_t(15)) || d.range>((b.buffer->length+15)&~size_t(15))-d.offset)throw std::runtime_error("planned buffer range mismatch");buffer={b.buffer->buffer,d.offset,d.range};write.pBufferInfo=&buffer;}
+       }else {auto b=op.buffers[d.stages==1?0:1][d.slot];if(!b.buffer || !d.range || d.offset>((b.length()+15)&~size_t(15)) || d.range>((b.length()+15)&~size_t(15))-d.offset)throw std::runtime_error("planned buffer range mismatch");buffer={b.buffer->buffer,d.offset,d.range};write.pBufferInfo=&buffer;}
        if(fast){auto &value=(*bindings)[i];value={d.binding,d.type,image,buffer};writes[i]=write;writes[i].pImageInfo=write.pImageInfo?&value.image:nullptr;writes[i].pBufferInfo=write.pBufferInfo?&value.buffer:nullptr;}
        else {Measure measure{descriptorNanos};UpdateDescriptorSets(device,1,&write,0,nullptr);}
       }
