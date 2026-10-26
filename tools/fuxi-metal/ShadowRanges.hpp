@@ -48,6 +48,11 @@ public:
   auto last=first;while(last!=intervals.end() && last->offset<=end){offset=std::min(offset,last->offset);end=std::max(end,last->offset+last->size);++last;}
   if(first==last)intervals.insert(first,{offset,end-offset});else {first->offset=offset;first->size=end-offset;intervals.erase(first+1,last);}
  }
+ void texture(uint64_t offset,uint64_t row,uint64_t width,uint64_t height,uint64_t pixel){
+  if(!width || !height || !pixel || width>UINT64_MAX/pixel){full(ShadowFullReason::bounds);return;}uint64_t tight=width*pixel;
+  if(row<tight || row%pixel || offset%pixel || offset>length || tight>length-offset || height-1>(length-offset-tight)/row){full(ShadowFullReason::bounds);return;}
+  add(offset,(height-1)*row+tight);
+ }
  void binding(const ShadowWindow &w,uint64_t offset){
   if(w.kind==2)return;if(w.kind!=1){full(w.kind==0?ShadowFullReason::wholeWindow:ShadowFullReason::other);return;}
   if(w.start<0){uint64_t delta=uint64_t(-(w.start+1))+1;if(delta>offset){full(ShadowFullReason::bounds);return;}offset-=delta;}

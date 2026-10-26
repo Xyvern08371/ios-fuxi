@@ -1241,7 +1241,7 @@ public:
     transition(t,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);flushImages();
     VkBufferImageCopy region{};region.bufferOffset=t->backingOffset;region.bufferRowLength=t->backingRow/texelBytes(t->format);
     region.imageSubresource={VK_IMAGE_ASPECT_COLOR_BIT,0,0,1};region.imageExtent={t->width,t->height,1};
-    CmdCopyBufferToImage(cmd,t->backingBuffer->buffer,t->image,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,1,&region);t->setDefined(0);
+    CmdCopyBufferToImage(cmd,t->backingBuffer->buffer,t->image,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,1,&region);t->setDefined(0);if(timing)timing->textureRepitchedBytes+=uint64_t(t->width)*t->height*texelBytes(t->format);
    };
    std::vector<Texture *> refreshed;
    auto refreshImages=[&](size_t opIndex){diagnosticOp=opIndex;const auto &op=ops[opIndex];

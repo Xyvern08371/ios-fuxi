@@ -751,7 +751,7 @@ static bool textureDescriptorAccepted(MTLTextureDescriptor *d,uint32_t dimension
   // shadow is refreshed at use; CPU writes must precede commit, never race it.
   if(FuxiBuffer *backing=(FuxiBuffer *)[self buffer]){
    std::lock_guard<std::mutex> guard(backend->mutex);backend->requireLive();
-   auto *base=(uint8_t *)backing->_buffer->contents+[self bufferOffset]+r.origin.y*[self bufferBytesPerRow]+r.origin.x*pixel;
+   auto *base=(uint8_t *)(backing->_shadow && [self usage]==MTLTextureUsageShaderRead?backing->_wrapped:backing->_buffer->contents)+[self bufferOffset]+r.origin.y*[self bufferBytesPerRow]+r.origin.x*pixel;
    for(size_t y=0;y<r.size.height;++y){auto *cpu=(uint8_t *)bytes+y*row;auto *buffer=base+y*[self bufferBytesPerRow];
     if(write)memmove(buffer,cpu,r.size.width*pixel);else memmove(cpu,buffer,r.size.width*pixel);}
    return;
@@ -910,7 +910,7 @@ static thread_local FuxiCommandBuffer *completionCommand;
  dispatch_group_t _scheduledGroup,_commitReady;BOOL _overlap,_finished;
  fuxi::FrameSample _flightTrace;fuxi::FrameClock::time_point _commitStart,_commitReturn;uint64_t _gpuBefore;bool _surfaceFrame;
  std::function<void()> _retirement;std::shared_ptr<fuxi::SurfaceLease> _lease;
- struct ShadowUse {FuxiBuffer *buffer;fuxi::ShadowRanges ranges;ShadowUse(FuxiBuffer *b):buffer(b),ranges(b->_wrappedLength){}};
+ struct ShadowUse {FuxiBuffer *buffer;fuxi::ShadowRanges ranges;uint32_t textureUses=0;ShadowUse(FuxiBuffer *b):buffer(b),ranges(b->_wrappedLength){}};
  std::unordered_map<fuxi::Buffer *,ShadowUse> _shadowUses;fuxi::ShadowSnapshot _shadows;
  std::unordered_set<void *> _resourceSet;fuxi::CommandResourceCache _resourceCache;
  fuxi::FrontendTimes _frontendTimes;
@@ -929,8 +929,15 @@ static thread_local FuxiCommandBuffer *completionCommand;
 static void retainCommandResource(FuxiCommandBuffer *command,id resource,bool bounded=false,fuxi::ShadowFullReason reason=fuxi::ShadowFullReason::other){
  if(command->_resourceCache.seen((void *)resource,bounded,reason))return;
  FuxiBuffer *buffer=nil;if([resource isKindOfClass:[FuxiBuffer class]])buffer=resource;else if([resource isKindOfClass:[FuxiTexture class]])buffer=[(FuxiTexture *)resource buffer];
- if(buffer && buffer->_shadow){auto &use=command->_shadowUses.try_emplace(buffer->_buffer,buffer).first->second;if(!bounded)use.ranges.full(reason);}
+ if(buffer && buffer->_shadow){auto &use=command->_shadowUses.try_emplace(buffer->_buffer,buffer).first->second;if(!bounded)use.ranges.full(reason);if(!bounded && [resource isKindOfClass:[FuxiTexture class]])use.textureUses|=4;}
  if(resource && command->_resourceSet.insert((void *)resource).second)[command->_resources addObject:resource];
+}
+static void retainCommandTexture(FuxiCommandBuffer *command,FuxiTexture *texture,bool sampled){
+ retainCommandResource(command,texture,true);FuxiBuffer *buffer=(FuxiBuffer *)[texture buffer];if(!buffer || !buffer->_shadow)return;
+ auto &use=command->_shadowUses.at(buffer->_buffer);use.textureUses|=sampled?1:2;
+ if(sampled && [texture usage]==MTLTextureUsageShaderRead && [texture mipmapLevelCount]==1 && [texture textureType]==MTLTextureType2D)
+  use.ranges.texture([texture bufferOffset],[texture bufferBytesPerRow],[texture width],[texture height],fuxi::Backend::texelBytes((uint32_t)[texture pixelFormat]));
+ else use.ranges.full();
 }
 static void trackShadowDraw(FuxiCommandBuffer *command,const fuxi::Operation &op,fuxi::ShadowIndexCache &cache,uint64_t &scanned){
  fuxi::ShadowIndexRange indices;bool inspected=false;
@@ -954,7 +961,8 @@ static void prepareCommandShadows(FuxiCommandBuffer *command,fuxi::FrameSample *
  }
  for(auto &entry:indices){auto &use=command->_shadowUses.at(entry.first);command->_shadows.add(entry.first->contents,use.buffer->_wrapped,entry.second);}command->_shadows.capture(command->_queue->_shadowPool);
  fuxi::ShadowIndexCache cache;uint64_t scanned=0;for(const auto &op:command->_ops)if(op.pipeline)trackShadowDraw(command,op,cache,scanned);
- if(trace){trace->shadowScannedIndices+=scanned;for(auto &entry:command->_shadowUses)for(size_t i=0;i<trace->shadowFullReasons.size();++i)trace->shadowFullReasons[i]+=entry.second.ranges.fullReason(fuxi::ShadowFullReason(i));}
+ if(trace){trace->shadowScannedIndices+=scanned;for(auto &entry:command->_shadowUses){auto &use=entry.second;for(size_t i=0;i<trace->shadowFullReasons.size();++i)trace->shadowFullReasons[i]+=use.ranges.fullReason(fuxi::ShadowFullReason(i));
+  if(use.textureUses)trace->textureShadowBytes+=use.ranges.bytes();for(size_t i=0;i<trace->textureShadowUses.size();++i)trace->textureShadowUses[i]+=bool(use.textureUses&(1u<<i));}}
 }
 static uint64_t refreshCommandShadows(FuxiCommandBuffer *command){
  uint64_t bytes=0;for(auto &entry:command->_shadowUses){auto &use=entry.second;bytes+=command->_shadows.refresh(use.buffer->_buffer->contents,use.buffer->_wrapped,use.ranges);}command->_shadows.release(command->_queue->_shadowPool);return bytes;
@@ -1113,12 +1121,12 @@ static uint64_t refreshCommandShadows(FuxiCommandBuffer *command){
   }
  }
  op.load=_drawn?1:_load;op.store=1;
- for(unsigned i=1;i<op.colorCount;++i){op.colors[i-1].load=_drawn?1:_state.colors[i-1].load;op.colors[i-1].store=1;if(_targets[i-1])retainCommandResource(_command,_targets[i-1]);}
+ for(unsigned i=1;i<op.colorCount;++i){op.colors[i-1].load=_drawn?1:_state.colors[i-1].load;op.colors[i-1].store=1;if(_targets[i-1])retainCommandTexture(_command,_targets[i-1],false);}
  for(unsigned i=0;i<fuxi::resourceSlots;++i){op.samples[i]=_samples[i]?_samples[i]->_texture:nullptr;if(_samples[i]){op.sampleBase[i]=_samples[i]->_baseLevel;op.sampleCount[i]=(uint32_t)[_samples[i] mipmapLevelCount];}op.samplers[i]=_samplers[i]?_samplers[i]->_sampler:nullptr;
- if(_samples[i])retainCommandResource(_command,_samples[i]);if(_samplers[i])retainCommandResource(_command,_samplers[i]);}
+ if(_samples[i])retainCommandTexture(_command,_samples[i],true);if(_samplers[i])retainCommandResource(_command,_samplers[i]);}
  memcpy(op.buffers,_buffers,sizeof(_buffers));if(indices){retainCommandResource(_command,indices,true);auto it=_command->_shadowUses.find(op.indices);if(it!=_command->_shadowUses.end())it->second.ranges.add(offset,uint64_t(count)*width);}
  op.clear[0]=_clear.red;op.clear[1]=_clear.green;op.clear[2]=_clear.blue;op.clear[3]=_clear.alpha;
- retainCommandResource(_command,_target);retainCommandResource(_command,_pipeline);_lastOp=_command->_ops.size();_command->_ops.push_back(std::move(op));_drawn=YES;
+ retainCommandTexture(_command,_target,false);retainCommandResource(_command,_pipeline);_lastOp=_command->_ops.size();_command->_ops.push_back(std::move(op));_drawn=YES;
 }
 - (void)drawPrimitives:(MTLPrimitiveType)t vertexStart:(NSUInteger)start vertexCount:(NSUInteger)count {FRONTEND_TIME(_command);@try {CENSUS();DescriptorContext descriptor(_passText);[self record:t start:start count:count indices:nil offset:0 width:2];} @catch(NSException *e){(void)e;[self rejectSelector:_cmd];}}
 - (void)drawPrimitives:(MTLPrimitiveType)t vertexStart:(NSUInteger)start vertexCount:(NSUInteger)count instanceCount:(NSUInteger)instances {FRONTEND_TIME(_command);@try {CENSUS();DescriptorContext descriptor(_passText);[self active];
@@ -1130,7 +1138,7 @@ static uint64_t refreshCommandShadows(FuxiCommandBuffer *command){
  DescriptorContext context(_passText);
  if(!_drawn){fuxi::Operation op=_state;op.diagnostic=_passText.UTF8String;op.texture=_target->_texture;op.clearOnly=true;op.load=_load;op.store=_store;
  op.clear[0]=_clear.red;op.clear[1]=_clear.green;op.clear[2]=_clear.blue;op.clear[3]=_clear.alpha;
- retainCommandResource(_command,_target);for(unsigned i=1;i<op.colorCount;++i)if(_targets[i-1])retainCommandResource(_command,_targets[i-1]);_command->_ops.push_back(op);
+ retainCommandTexture(_command,_target,false);for(unsigned i=1;i<op.colorCount;++i)if(_targets[i-1])retainCommandTexture(_command,_targets[i-1],false);_command->_ops.push_back(op);
  }else {auto &op=_command->_ops[_lastOp];op.store=_store;for(unsigned i=1;i<op.colorCount;++i)op.colors[i-1].store=_state.colors[i-1].store;}
  _ended=YES;_command->_encoding=NO;} @catch(NSException *e) {(void)e;[self rejectSelector:_cmd];}}
 

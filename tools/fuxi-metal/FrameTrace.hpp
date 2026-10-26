@@ -61,6 +61,7 @@ struct FrameSample {
  uint64_t inflight=0,completionLatency=0;
  uint64_t commitCall=0,commitGap=0,admissionWait=0,snapshot=0,submitQueue=0;
  uint64_t backendLock=0,slotWait=0,flush=0,queueSubmit=0,retireLock=0,invalidate=0,retireHost=0,surfaceRelease=0,scheduledHandlers=0;
+ uint64_t textureShadowBytes=0,textureRepitchedBytes=0;std::array<uint64_t,3> textureShadowUses{};
  uint64_t snapshotBytes=0,shadowCopyBytes=0,shadowScannedIndices=0;std::array<uint64_t,size_t(ShadowFullReason::count)> shadowFullReasons{};
  uint64_t planHits=0,planMisses=0;
  uint64_t queueSubmits=0,imageBarriers=0,readBarriersSkipped=0,crossEncoderMerges=0;
@@ -160,6 +161,7 @@ public:
   draws+=s.draws;passes+=s.passes;counts.pipelines+=s.counts.pipelines;counts.descriptors+=s.counts.descriptors;counts.allocations+=s.counts.allocations;
   mergedDraws+=s.mergedDraws;for(size_t i=1;i<mergeSplits.size();++i)mergeSplits[i]+=s.mergeSplits[i];
   totals.cpuSampledSubmits+=s.cpuSampledSubmits;totals.cpuOmittedSubmits+=s.cpuOmittedSubmits;
+  totals.textureShadowBytes+=s.textureShadowBytes;totals.textureRepitchedBytes+=s.textureRepitchedBytes;for(size_t i=0;i<totals.textureShadowUses.size();++i)totals.textureShadowUses[i]+=s.textureShadowUses[i];
   totals.snapshotBytes+=s.snapshotBytes;totals.shadowCopyBytes+=s.shadowCopyBytes;totals.shadowScannedIndices+=s.shadowScannedIndices;for(size_t i=0;i<totals.shadowFullReasons.size();++i)totals.shadowFullReasons[i]+=s.shadowFullReasons[i];
   totals.frontendDrawSamples+=s.frontendDrawSamples;
   totals.planHits+=s.planHits;totals.planMisses+=s.planMisses;
@@ -196,6 +198,7 @@ public:
   fprintf(out," plan_hits/frame=%.2f plan_misses/frame=%.2f",totals.planHits/n,totals.planMisses/n);
   fprintf(out," snapshot_bytes/frame=%.2f shadow_copy_bytes/frame=%.2f",totals.snapshotBytes/n,totals.shadowCopyBytes/n);
   fprintf(out," shadow_scanned_indices/frame=%.2f shadow_full_reasons=",totals.shadowScannedIndices/n);for(size_t i=0;i<totals.shadowFullReasons.size();++i)fprintf(out,"%s%s:%.2f",i?",":"",shadowFullReasonNames[i],totals.shadowFullReasons[i]/n);
+  fprintf(out," texture_shadow_bytes/frame=%.2f texture_repitched_bytes/frame=%.2f texture_shadow_uses=sampled:%.2f,target:%.2f,other:%.2f",totals.textureShadowBytes/n,totals.textureRepitchedBytes/n,totals.textureShadowUses[0]/n,totals.textureShadowUses[1]/n,totals.textureShadowUses[2]/n);
   auto stage=[&](const char *name,uint64_t FrameSample::*field){fprintf(out," %s=%.3f/%.3f",name,p(field,50),p(field,90));};
   stage("commit_call",&FrameSample::commitCall);stage("commit_gap",&FrameSample::commitGap);stage("admission_wait",&FrameSample::admissionWait);stage("snapshot",&FrameSample::snapshot);stage("submit_queue",&FrameSample::submitQueue);
   stage("backend_lock",&FrameSample::backendLock);stage("slot_wait",&FrameSample::slotWait);stage("flush",&FrameSample::flush);stage("queue_submit",&FrameSample::queueSubmit);stage("retire_lock",&FrameSample::retireLock);stage("invalidate",&FrameSample::invalidate);stage("retire_host",&FrameSample::retireHost);stage("surface_release",&FrameSample::surfaceRelease);stage("scheduled_handlers",&FrameSample::scheduledHandlers);

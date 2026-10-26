@@ -14,6 +14,11 @@ int main(){
  for(unsigned i=0;i<300;++i){seed=1664525*seed+1013904223;unsigned offset=seed%1024;seed=1664525*seed+1013904223;unsigned size=seed%33;size=std::min(size,1024-offset);random.add(offset,size);for(unsigned j=offset;j<offset+size;++j)mask[j]=true;
   std::array<bool,1024> covered{};random.each([&](auto r){for(uint64_t j=r.offset;j<r.offset+r.size;++j)covered[j]=true;});assert(covered==mask);
  }
+ ShadowRanges texture(4096);texture.texture(256,32,7,5,2);assert(texture.bytes()==142);texture.each([](auto r){assert(r.offset==256 && r.size==142);});
+ texture.texture(256,32,7,5,2);assert(texture.bytes()==142);texture.texture(384,32,7,2,2);assert(texture.bytes()==174);
+ texture.add(2000,16);assert(texture.bytes()==190);texture.full(ShadowFullReason::useResource);texture.texture(256,32,7,5,2);assert(texture.bytes()==4096 && texture.fullReason(ShadowFullReason::useResource));
+ for(auto d:{std::array<uint64_t,5>{0,16,0,5,1},{0,16,7,0,1},{0,16,7,5,0},{0,16,UINT64_MAX,5,2},{UINT64_MAX,16,7,5,1},{0,UINT64_MAX,7,5,1},{0,16,7,UINT64_MAX,1},{0,4,7,5,1},{1,16,7,5,2},{0,15,7,5,2}}){ShadowRanges r(4096);r.texture(d[0],d[1],d[2],d[3],d[4]);assert(r.isFull() && r.fullReason(ShadowFullReason::bounds));}
+ ShadowRanges tight(142);tight.texture(0,32,7,5,2);assert(!tight.isFull() && tight.bytes()==142);ShadowRanges shortTexture(141);shortTexture.texture(0,32,7,5,2);assert(shortTexture.isFull());
  ShadowRanges negative(1024);negative.binding({1,0,-8,24},128);assert(negative.bytes()==24);negative.each([](auto r){assert(r.offset==120);});
  negative.binding({1,0,std::numeric_limits<int64_t>::min(),1},0);assert(negative.isFull());
  for(auto w:{ShadowWindow{},ShadowWindow{3,0,0,4},ShadowWindow{1,0,1000,32},ShadowWindow{1,0,0,UINT64_MAX}}){ShadowRanges r(1024);r.binding(w,8);assert(r.isFull());}

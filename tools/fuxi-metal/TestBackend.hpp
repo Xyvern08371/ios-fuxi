@@ -21,7 +21,7 @@
 #include "BackboardGate.hpp"
 namespace fuxi {
 struct Buffer {void *contents;size_t length,allocated;};
-struct Texture : TextureLevels {size_t allocated{},charged{};uint32_t format=80;std::vector<uint8_t> pixels{};
+struct Texture : TextureLevels {size_t allocated{},charged{};uint32_t format=80;Buffer *backingBuffer{};size_t backingOffset{},backingRow{};bool shadow=false;std::vector<uint8_t> pixels{};
  size_t offset(uint32_t level) const {size_t o=0;for(uint32_t l=0;l<level;++l)o+=levelWidth(l)*levelHeight(l)*metalTexelBytes(format);return o;}
 };
 struct Pipeline {ShadowWindow shadowWindows[2][resourceSlots]{};CompileOptions options{};bool sampled=false;size_t references=1;};
@@ -80,7 +80,7 @@ public:
  Texture *linearTexture(Buffer *b,uint32_t format,uint32_t usage,uint32_t width,uint32_t height,size_t offset,size_t row) {
   requireLive();auto pixel=texelBytes(format);
   if(!b || usage!=1 || !limits.linearRows(width,height,pixel,row,offset,b->length))throw std::runtime_error("linear texture descriptor/extent/stride");
-  return allocateTexture(format,usage,width,height);
+  auto *t=allocateTexture(format,usage,width,height);t->shadow=true;t->backingBuffer=b;t->backingOffset=offset;t->backingRow=row;return t;
  }
  Sampler *allocateSampler(bool,bool,uint32_t=0,float=0,float=0,const uint32_t * =nullptr,uint32_t=0,uint32_t=1) {return new Sampler{};}
  void destroy(Sampler *s) {delete s;}

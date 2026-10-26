@@ -58,6 +58,27 @@ int main(){@autoreleasepool{
   memset(cpu,77,sizeof(cpu));if(mode!=4)memset(indexCPU,255,sizeof(indexCPU));dispatch_resume(queue->_submitQueue);[c waitUntilCompleted];assert(c.status==MTLCommandBufferStatusCompleted && draws==2 && c->_flightTrace.shadowCopyBytes==expected);
   [c release];[index release];
  }
+ fuxi::Backend::modelDraw={};
+ MTLTextureDescriptor *linear=[MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRG8Unorm width:7 height:5 mipmapped:NO];linear.storageMode=MTLStorageModeShared;linear.usage=MTLTextureUsageShaderRead;
+ FuxiTexture *texture=(FuxiTexture *)[buffer newTextureWithDescriptor:linear offset:256 bytesPerRow:32],*view=(FuxiTexture *)[texture newTextureViewWithPixelFormat:linear.pixelFormat];assert(texture && view);
+ FuxiSampler *sampler=(FuxiSampler *)[device newSamplerStateWithDescriptor:[[[MTLSamplerDescriptor alloc] init] autorelease]];
+ for(unsigned mode=0;mode<5;++mode){
+  memset(cpu,19,sizeof(cpu));memset(buffer->_buffer->contents,3,sizeof(cpu));uint8_t replacement[14];memset(replacement,29,sizeof(replacement));
+  [view replaceRegion:MTLRegionMake2D(0,0,7,1) mipmapLevel:0 withBytes:replacement bytesPerRow:14];assert(cpu[256]==29 && ((uint8_t *)buffer->_buffer->contents)[256]==3);
+  uint8_t output[14]={};[view getBytes:output bytesPerRow:14 fromRegion:MTLRegionMake2D(0,0,7,1) mipmapLevel:0];assert(!memcmp(output,replacement,14));
+  FuxiCommandBuffer *c=[(FuxiCommandBuffer *)[queue commandBuffer] retain];c->_frameTrace=YES;c->_traceCreated=fuxi::FrameClock::now();c->_traceThread=std::this_thread::get_id();
+  FuxiRender *e=(FuxiRender *)[c renderCommandEncoderWithDescriptor:pass];[e setRenderPipelineState:(id)pipeline];[e setFragmentTexture:(id)texture atIndex:0];[e setFragmentTexture:(id)view atIndex:1];[e setFragmentSamplerState:(id)sampler atIndex:0];
+  if(mode!=4){[e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];[e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];}
+  if(mode==1)[e useResource:(id)texture usage:MTLResourceUsageRead stages:MTLRenderStageFragment];
+  if(mode==2)[e useResource:(id)buffer usage:MTLResourceUsageRead stages:MTLRenderStageFragment];
+  [e endEncoding];if(mode==3)retainCommandTexture(c,texture,false);
+  size_t expected=mode==4?0:mode?sizeof(cpu):142;assert(!c->_rejected);
+  unsigned draws=0;fuxi::Backend::modelDraw=[&](const fuxi::Operation &op){auto *b=op.samples[0]->backingBuffer;assert(b==buffer->_buffer && op.samples[1]==texture->_texture);assert(((uint8_t *)b->contents)[256]==29 && ((uint8_t *)b->contents)[288]==19);++draws;};
+  dispatch_suspend(queue->_submitQueue);[c commit];assert(c->_flightTrace.snapshotBytes==expected && c->_flightTrace.textureShadowBytes==expected);assert(c->_flightTrace.shadowFullReasons[size_t(fuxi::ShadowFullReason::other)]==(mode==3));assert(c->_flightTrace.textureShadowUses[0]==(mode!=4) && c->_flightTrace.textureShadowUses[1]==(mode==3) && c->_flightTrace.textureShadowUses[2]==(mode==1));
+  memset(cpu,77,sizeof(cpu));dispatch_resume(queue->_submitQueue);[c waitUntilCompleted];assert(c.status==MTLCommandBufferStatusCompleted && c->_flightTrace.shadowCopyBytes==expected && draws==(mode==4?0:2));
+  assert(((uint8_t *)buffer->_buffer->contents)[2000]==(mode && mode!=4?19:3));[c release];
+ }
+ [sampler release];[view release];[texture release];
  fuxi::Backend::modelDraw={};[pipeline release];[target release];[buffer release];[queue release];[device release];
  puts("PASS: shadow bindings/offsets, frozen indexed u16 quads, strips/restarts, bounds and mutable-index fallback, aliased indices, scan cache and reason/byte trace");
 }}
