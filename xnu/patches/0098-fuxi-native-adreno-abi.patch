@@ -397,6 +397,15 @@
  /* Retain BOTH physical attempts, independently of the shared logical-call
   * report slot. Static storage only; no allocation or firmware in diagnostics. */
  static volatile struct {
+@@ -188,7 +306,7 @@
+ 
+ #define FG_SOURCE_VA 0x50000000u
+ #define FG_SOURCE_BYTES 0x01000000u
+-#define FG_SOURCE_TABLE (G3_PT + 0x10000)
++#define FG_SOURCE_TABLE (G3_PT + 0x20000) /* general tables use slots below 32 */
+ #define FG_SOURCE_L3 8u
+ _Static_assert(FG_SOURCE_TABLE + FG_CACHE_SLOTS*FG_SOURCE_L3*4096 <= G3_PT+0x100000,
+     "source tables exceed reserved GPU table pool");
 @@ -200,10 +318,14 @@
  static ppnum_t fg_ppns[FG_SOURCE_BYTES/PAGE_SIZE+1];
  static volatile uint64_t *fg_l2(void)
@@ -435,6 +444,15 @@
   delay(100);
   for (unsigned i = 0; i < 2; i++) {
    v = 2u << 16; (void)fg_access(GPU_SMMU_BASE + SMMU_S2CR(g3_slot[i]), &v, 1, 0);
+@@ -250,7 +377,7 @@
+ static int fg_source_tables(void)
+ {
+  volatile uint64_t *l2 = fg_l2();
+- if (!l2 || g3_next > 16) return 0;
++ if (!l2 || g3_next > 32) return 0;
+  for (unsigned i = 0; i < FG_CACHE_SLOTS*FG_SOURCE_L3; i++) {
+   unsigned slot = ((FG_SOURCE_VA >> 21) & 511) + i;
+   if (l2[slot]) return 0;
 @@ -265,6 +392,7 @@
   * new generation. No PFN scan or TLB invalidation on a cache hit. */
  int fuxi_gpu_unmap(unsigned slot, struct fg_times *t)

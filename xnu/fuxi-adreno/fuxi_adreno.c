@@ -306,7 +306,7 @@ static void fg_scm_call(uint64_t ret[4], unsigned slot, unsigned step,
 
 #define FG_SOURCE_VA 0x50000000u
 #define FG_SOURCE_BYTES 0x01000000u
-#define FG_SOURCE_TABLE (G3_PT + 0x10000)
+#define FG_SOURCE_TABLE (G3_PT + 0x20000) /* general tables use slots below 32 */
 #define FG_SOURCE_L3 8u
 _Static_assert(FG_SOURCE_TABLE + FG_CACHE_SLOTS*FG_SOURCE_L3*4096 <= G3_PT+0x100000,
     "source tables exceed reserved GPU table pool");
@@ -377,7 +377,7 @@ static int fg_isolate(void)
 static int fg_source_tables(void)
 {
  volatile uint64_t *l2 = fg_l2();
- if (!l2 || g3_next > 16) return 0;
+ if (!l2 || g3_next > 32) return 0;
  for (unsigned i = 0; i < FG_CACHE_SLOTS*FG_SOURCE_L3; i++) {
   unsigned slot = ((FG_SOURCE_VA >> 21) & 511) + i;
   if (l2[slot]) return 0;
