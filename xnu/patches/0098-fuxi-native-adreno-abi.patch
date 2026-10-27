@@ -1359,7 +1359,7 @@
 +#endif
 --- a/bsd/dev/fuxi_gpu_scanout.inc
 +++ b/bsd/dev/fuxi_gpu_scanout.inc
-@@ -0,0 +1,1230 @@
+@@ -0,0 +1,1284 @@
 +/* SPDX-License-Identifier: MIT
 + * Copyright (c) 2026 NativeMetal contributors
 + * Ported from UniXNU drivers/NativeMetal/GpuScanoutClient.h (MIT).
@@ -1768,8 +1768,16 @@
 + * The reader/writer speeds and the threshold semantics are not measured: not yet observed on device. */
 +#define FG_SCAN_MID_LO 160u
 +#define FG_SCAN_MID_HI 2420u
-+#define FG_SCAN_MID_CALIB 8u
-+static unsigned fg_scanout_mid_state, fg_scanout_mid_old, fg_scanout_mid_new, fg_scanout_mid_imm, fg_scanout_mid_held, fg_scanout_mid_calib;
++#define FG_SCAN_MID_TRIALS 4u
++#define FG_SCAN_MID_NVAR 4u
++/* Variants of the way to open the hardware start gate, tried in order within one boot (device B181: low16 of SYNC_THRESH alone did not open it):
++ * 0 high16 of SYNC_THRESH = 2420 (low16 kept); 1 both halves = 2420; 2 START_POS (+0x2a0) set just past the current read line before each
++ * in-window START and restored after it; 3 TEAR_CHECK_EN (+0x284) cleared for each in-window START and restored after it (only tried if the
++ * read counter keeps running with the enable cleared, checked once with interrupts masked). A variant ends after 4 trials that began writing at
++ * once (confirmed) or 4 that waited for the TE (failed: registers restored, next variant). Not yet observed on device. */
++static const char *const fg_scanout_mid_name[FG_SCAN_MID_NVAR] = {"thresh_hi16", "thresh_both", "start_pos", "tear_en"};
++static unsigned fg_scanout_mid_state, fg_scanout_mid_var, fg_scanout_mid_old, fg_scanout_mid_new, fg_scanout_mid_pos, fg_scanout_mid_en, fg_scanout_mid_dirty;
++static unsigned fg_scanout_mid_vimm[FG_SCAN_MID_NVAR], fg_scanout_mid_vheld[FG_SCAN_MID_NVAR];
 +static unsigned fg_scanout_mid_wait, fg_scanout_mid_forced, fg_scanout_mid_hist[7], fg_scanout_mid_g1[7]; /* state: 0 off, 1 verify, 2 confirmed, 3 disabled */
 +static uint64_t fg_scanout_mid_block_t;
 +static unsigned fg_scanout_mid_since(unsigned count) { return ((count & 0xffffu) - fg_scanout_te_init) & 0xffffu; }
@@ -1777,21 +1785,56 @@
 +{
 + return since <= 4 ? 0 : since < FG_SCAN_MID_LO ? 1 : since < 600 ? 2 : since < 1200 ? 3 : since < 1800 ? 4 : since <= FG_SCAN_MID_HI ? 5 : 6;
 +}
++static void fg_scanout_mid_undirty(void)
++{
++ if (!fg_scanout_mid_dirty) return;
++ if (fg_scanout_mid_var == 2) (void)fg_scanout_write(FG_SCAN_INTF+0x2a0, fg_scanout_mid_pos);
++ if (fg_scanout_mid_var == 3) (void)fg_scanout_write(FG_SCAN_INTF+0x284, fg_scanout_mid_en);
++ fg_scanout_mid_dirty = 0;
++}
++static int fg_scanout_mid_apply(unsigned v)
++{
++ unsigned want = fg_scanout_mid_old, back;
++ if (v < 2) {
++  want = v ? (FG_SCAN_MID_HI << 16) | FG_SCAN_MID_HI : (FG_SCAN_MID_HI << 16) | (fg_scanout_mid_old & 0xffffu);
++  if (!fg_scanout_write(FG_SCAN_INTF+0x29c, want) || !fg_scanout_read(FG_SCAN_INTF+0x29c, &back) || back != want) {
++   (void)fg_scanout_write(FG_SCAN_INTF+0x29c, fg_scanout_mid_old);
++   printf("FUXI SCANOUT: mid_start variant %u (%s) threshold write refused old=%#x want=%#x; skipped\n", v, fg_scanout_mid_name[v], fg_scanout_mid_old, want);
++   return 0;
++  }
++ } else if (v == 2) {
++  if (!fg_scanout_read(FG_SCAN_INTF+0x2a0, &fg_scanout_mid_pos)) return 0;
++ } else {
++  unsigned c1 = 0, c2 = 0, ok;
++  boolean_t interrupts = ml_set_interrupts_enabled(FALSE);
++  ok = fg_scanout_read(FG_SCAN_INTF+0x284, &fg_scanout_mid_en) && fg_scanout_write(FG_SCAN_INTF+0x284, 0) &&
++      fg_scanout_read(FG_SCAN_INTF+0x298, &c1);
++  if (ok) { delay(100); ok = fg_scanout_read(FG_SCAN_INTF+0x298, &c2); }
++  (void)fg_scanout_write(FG_SCAN_INTF+0x284, fg_scanout_mid_en);
++  (void)ml_set_interrupts_enabled(interrupts);
++  if (!ok || c1 == c2) {
++   printf("FUXI SCANOUT: mid_start variant %u (%s) skipped: read counter %#x -> %#x with the tear check disabled\n", v, fg_scanout_mid_name[v], c1, c2);
++   return 0;
++  }
++ }
++ fg_scanout_mid_new = want;
++ printf("FUXI SCANOUT: mid_start variant %u (%s) trying: thresh %#x -> %#x start_pos=%#x tear_en=%#x (START window %u..%u lines after TE)\n",
++     v, fg_scanout_mid_name[v], fg_scanout_mid_old, want, fg_scanout_mid_pos, fg_scanout_mid_en, FG_SCAN_MID_LO, FG_SCAN_MID_HI);
++ return 1;
++}
++static void fg_scanout_mid_from(unsigned v)
++{
++ for (; v < FG_SCAN_MID_NVAR; v++) if (fg_scanout_mid_apply(v)) { fg_scanout_mid_var = v; fg_scanout_mid_state = 1; return; }
++ fg_scanout_mid_state = 3;
++ printf("FUXI SCANOUT: mid_start no variant opens the gate; off, threshold %#x\n", fg_scanout_mid_old);
++}
 +static void fg_scanout_mid_setup(void)
 +{
-+ unsigned old, want, back;
++ unsigned old;
 + if (!fg_abi_mid || fg_scanout_mid_state || !fg_scanout_panel120_active) return;
 + if (!fg_scanout_read(FG_SCAN_INTF+0x29c, &old)) return;
-+ want = (old & 0xffff0000u) | FG_SCAN_MID_HI;
-+ if (!fg_scanout_write(FG_SCAN_INTF+0x29c, want) || !fg_scanout_read(FG_SCAN_INTF+0x29c, &back) || back != want) {
-+  (void)fg_scanout_write(FG_SCAN_INTF+0x29c, old);
-+  fg_scanout_mid_state = 3;
-+  printf("FUXI SCANOUT: mid_start threshold write refused old=%#x want=%#x; off\n", old, want);
-+  return;
-+ }
-+ fg_scanout_mid_old = old; fg_scanout_mid_new = want; fg_scanout_mid_state = 1;
-+ printf("FUXI SCANOUT: mid_start threshold %#x -> %#x (START window %u..%u lines after TE, software blocks 5..%u and above)\n",
-+     old, want, FG_SCAN_MID_LO, FG_SCAN_MID_HI, FG_SCAN_MID_LO-1);
++ fg_scanout_mid_old = old; fg_scanout_mid_pos = 0; fg_scanout_mid_en = 0; fg_scanout_mid_dirty = 0;
++ fg_scanout_mid_from(0);
 +}
 +/* 1 = a START may be issued now. */
 +static int fg_scanout_mid_allow(void)
@@ -1800,21 +1843,28 @@
 + if (fg_scanout_mid_state != 1 && fg_scanout_mid_state != 2) return 1;
 + if (!fg_scanout_read(FG_SCAN_INTF+0x298, &count)) return 1;
 + since = fg_scanout_mid_since(count);
-+ if (since <= 4 || since >= 4000 || (since >= FG_SCAN_MID_LO && since <= FG_SCAN_MID_HI)) { fg_scanout_mid_block_t = 0; return 1; }
++ if (since <= 4 || since >= 4000 || (since >= FG_SCAN_MID_LO && since <= FG_SCAN_MID_HI)) {
++  fg_scanout_mid_block_t = 0;
++  if (since >= FG_SCAN_MID_LO && since <= FG_SCAN_MID_HI && !fg_scanout_mid_dirty && (fg_scanout_mid_var == 2 || fg_scanout_mid_var == 3) &&
++      fg_scanout_write(fg_scanout_mid_var == 2 ? FG_SCAN_INTF+0x2a0 : FG_SCAN_INTF+0x284, fg_scanout_mid_var == 2 ? (count + 8) & 0xffffu : 0))
++   fg_scanout_mid_dirty = 1;
++  return 1;
++ }
 + uint64_t now = rsr("cntpct_el0");
 + if (!fg_scanout_mid_block_t) fg_scanout_mid_block_t = now;
 + else if (now - fg_scanout_mid_block_t > 2*rsr("cntfrq_el0")*fg_scanout_period_us/1000000) { fg_scanout_mid_forced++; fg_scanout_mid_block_t = 0; return 1; }
 + fg_scanout_mid_wait++;
 + return 0;
 +}
-+/* After a START: histogram of the read line, and the verification of the first in-window STARTs. */
++/* After a START: histogram of the read line, the verification of in-window STARTs, and the restore of START_POS / TEAR_CHECK_EN. */
 +static void fg_scanout_mid_account(unsigned count, unsigned gap1)
 +{
-+ unsigned since, b;
++ unsigned since, b, v = fg_scanout_mid_var;
 + if (!fg_abi_mid || !fg_scanout_panel120_active) return;
 + since = fg_scanout_mid_since(count); b = fg_scanout_mid_bucket(since);
 + fg_scanout_mid_hist[b]++; if (gap1) fg_scanout_mid_g1[b]++;
-+ if (fg_scanout_mid_state != 1 || since < FG_SCAN_MID_LO || since > FG_SCAN_MID_HI) return;
++ if (fg_scanout_mid_state != 1 && !fg_scanout_mid_dirty) return;
++ if (since < FG_SCAN_MID_LO || since > FG_SCAN_MID_HI) { fg_scanout_mid_undirty(); return; }
 + uint64_t limit = rsr("cntpct_el0") + rsr("cntfrq_el0")*200/1000000;
 + unsigned line, immediate = 0;
 + while (fg_scanout_read(FG_SCAN_INTF+0x2b0, &line)) {
@@ -1823,16 +1873,18 @@
 +  if (rsr("cntpct_el0") >= limit) break;
 +  delay(5);
 + }
-+ if (immediate) fg_scanout_mid_imm++; else fg_scanout_mid_held++;
-+ fg_scanout_mid_calib++;
-+ if (fg_scanout_mid_held >= FG_SCAN_MID_CALIB/2) {
++ fg_scanout_mid_undirty();
++ if (immediate) fg_scanout_mid_vimm[v]++; else fg_scanout_mid_vheld[v]++;
++ if (fg_scanout_mid_state != 1) return;
++ if (fg_scanout_mid_vheld[v] >= FG_SCAN_MID_TRIALS) {
++  printf("FUXI SCANOUT: mid_start variant %u (%s) failed: hardware still waits for the TE (immediate=%u held=%u); registers restored\n",
++      v, fg_scanout_mid_name[v], fg_scanout_mid_vimm[v], fg_scanout_mid_vheld[v]);
 +  (void)fg_scanout_write(FG_SCAN_INTF+0x29c, fg_scanout_mid_old);
-+  fg_scanout_mid_state = 3;
-+  printf("FUXI SCANOUT: mid_start hardware still waits for the TE (immediate=%u held=%u); threshold restored to %#x, off\n",
-+      fg_scanout_mid_imm, fg_scanout_mid_held, fg_scanout_mid_old);
-+ } else if (fg_scanout_mid_imm >= FG_SCAN_MID_CALIB/2) {
++  fg_scanout_mid_from(v + 1);
++ } else if (fg_scanout_mid_vimm[v] >= FG_SCAN_MID_TRIALS) {
 +  fg_scanout_mid_state = 2;
-+  printf("FUXI SCANOUT: mid_start confirmed: in-window STARTs begin writing at once (immediate=%u held=%u)\n", fg_scanout_mid_imm, fg_scanout_mid_held);
++  printf("FUXI SCANOUT: mid_start variant %u (%s) confirmed: in-window STARTs begin writing at once (immediate=%u held=%u)\n",
++      v, fg_scanout_mid_name[v], fg_scanout_mid_vimm[v], fg_scanout_mid_vheld[v]);
 + }
 +}
 +static void fg_scanout_probe_kick(unsigned te_frame)
@@ -2414,9 +2466,11 @@
 +  fg_scanout_probe_report();
 +  if (fg_abi_mid) {
 +   unsigned *h = fg_scanout_mid_hist, *g = fg_scanout_mid_g1;
-+   printf("FUXI SCANOUT: mid_start state=%u thresh=%#x->%#x imm=%u held=%u blocked_polls=%u forced=%u"
++   unsigned *vi = fg_scanout_mid_vimm, *vh = fg_scanout_mid_vheld;
++   printf("FUXI SCANOUT: mid_start state=%u var=%u(%s) thresh=%#x->%#x imm=%u/%u/%u/%u held=%u/%u/%u/%u blocked_polls=%u forced=%u"
 +       " read_line_since_te<=4/<160/<600/<1200/<1800/<=2420/more starts=%u/%u/%u/%u/%u/%u/%u gap1=%u/%u/%u/%u/%u/%u/%u\n",
-+       fg_scanout_mid_state, fg_scanout_mid_old, fg_scanout_mid_new, fg_scanout_mid_imm, fg_scanout_mid_held, fg_scanout_mid_wait, fg_scanout_mid_forced,
++       fg_scanout_mid_state, fg_scanout_mid_var, fg_scanout_mid_name[fg_scanout_mid_var], fg_scanout_mid_old, fg_scanout_mid_new,
++       vi[0], vi[1], vi[2], vi[3], vh[0], vh[1], vh[2], vh[3], fg_scanout_mid_wait, fg_scanout_mid_forced,
 +       h[0], h[1], h[2], h[3], h[4], h[5], h[6], g[0], g[1], g[2], g[3], g[4], g[5], g[6]);
 +   for (unsigned i = 0; i < 7; i++) h[i] = g[i] = 0;
 +   fg_scanout_mid_wait = fg_scanout_mid_forced = 0;
