@@ -8,7 +8,7 @@ static fuxi::Operation alias(fuxi::Texture *t,unsigned width,unsigned height){
 int main(){
  using namespace fuxi;
  assert(systemTranslationPolicy().frameTrace);bool reuse=systemTranslationPolicy().pipelined;
- Backend backend;auto baseline=backend.resourceBytes();auto objects=liveMemoryObjects.load();
+ Backend backend;backend.buffersPooled=false;auto baseline=backend.resourceBytes();auto objects=liveMemoryObjects.load();
  auto *t=backend.allocateTexture(80,5,1024,512);auto *up=backend.allocate(1024*512*4),*out=backend.allocate(1024*512*4);
  for(size_t i=0;i<up->length;++i)((uint8_t *)up->contents)[i]=uint8_t(i*13%251);
  Operation upload{};upload.texture=t;upload.src=up;upload.upload=true;

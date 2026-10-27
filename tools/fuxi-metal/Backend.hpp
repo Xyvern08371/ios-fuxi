@@ -81,7 +81,7 @@ inline void importCheck(VkResult r,int line=__builtin_LINE()) {
  X(CreatePipelineLayout) X(DestroyPipelineLayout) X(CreateGraphicsPipelines) X(DestroyPipeline) \
  X(CreatePipelineCache) X(DestroyPipelineCache) X(GetPipelineCacheData) \
  X(CmdBindVertexBuffers) X(CmdBindIndexBuffer) X(CmdDrawIndexed) X(CmdSetViewport) X(CmdSetScissor) X(CmdPushConstants) X(CmdBeginRenderPass) X(CmdEndRenderPass) X(CmdBindPipeline) X(CmdDraw) X(CmdCopyImageToBuffer) X(CmdPipelineBarrier) X(CreateFence) X(DestroyFence) X(QueueSubmit) X(WaitForFences)
-struct Buffer { VkBuffer buffer{}; VkDeviceMemory memory{}; void *contents{};void *key{};Buffer *spare{};void *shadowKey() const{return key?key:contents;}bool shadowBacking=false,directUse=false,spareFailed=false,aliased=false; size_t length{}, allocated{},charged{},memoryBytes{},memoryOffset{},references=1;uint32_t memoryType{};bool imported=false,upload=false; };
+struct Buffer { VkBuffer buffer{}; VkDeviceMemory memory{}; void *contents{};void *key{};Buffer *spare{};void *shadowKey() const{return key?key:contents;}bool shadowBacking=false,directUse=false,spareFailed=false,aliased=false; size_t length{}, allocated{},charged{},memoryBytes{},memoryOffset{},references=1;uint32_t memoryType{};bool imported=false,upload=false,poolable=false; };
 // Host ranges a submit's prepare callback will write; absent means unknown (full drain).
 struct PrepareWrite {Buffer *buffer;uint64_t offset,bytes;};
 struct Texture : TextureLevels {VkImage image{};VkDeviceMemory memory{};VkImageView view{};size_t allocated{},charged{},memoryBytes{},references=1;
@@ -177,17 +177,29 @@ class Backend {
  TransientMemory<VkDeviceMemory> textureMemory;SlabMemory<VkDeviceMemory> slabMemory;
 public:
  bool slabsEnabled=!systemTranslationPolicy().noSlab;
+ static constexpr size_t bufferPoolEntries=64,bufferPoolLimit=16u<<20,bufferPoolMaxBuffer=1u<<20;static constexpr uint64_t bufferPoolIdleNs=30000000000ull;
+ bool buffersPooled=!systemTranslationPolicy().noSlab;
  // Two textures overlap in memory only if they share an allocation and (for sub-allocations) an offset range.
  static bool memoryAlias(const Texture *a,const Texture *b){return a->memory==b->memory && (!a->slabbed || !b->slabbed || (a->memOffset<b->memOffset+b->memExtent && b->memOffset<a->memOffset+a->memExtent));}
 private:
  static uint64_t memoryNow(){return std::chrono::duration_cast<std::chrono::nanoseconds>(CacheClock::now().time_since_epoch()).count();}
+ // Small plain host buffers are kept for exact-size reuse (CA recreates the same vertex/uniform sizes every frame); bounded, idle-trimmed, charged against the budget while pooled.
+ struct PooledBuffer {VkBuffer buffer;VkDeviceMemory memory;void *contents;size_t classSize,allocated,memoryBytes,charged;uint32_t memoryType;uint64_t idleSince;};
+ std::vector<PooledBuffer> bufferPool;size_t bufferPoolUsed=0;
+ void freePooledBuffer(const PooledBuffer &e){frameKernelCall([&]{return UnmapMemory(device,e.memory);});DestroyBuffer(device,e.buffer,nullptr);frameKernelCall([&]{FreeMemory(device,e.memory,nullptr);});--liveMemoryObjects;liveMemoryBytes-=e.memoryBytes;limits.release(e.charged);bufferPoolUsed-=e.classSize;bufferPoolBytes=bufferPoolUsed;++bufferPoolTrims;}
+ size_t trimBuffers(uint64_t now,bool all,size_t want=SIZE_MAX){
+  size_t freed=0;for(size_t i=0;i<bufferPool.size() && freed<want;){if(all || want!=SIZE_MAX || now-bufferPool[i].idleSince>bufferPoolIdleNs){freed+=bufferPool[i].charged;auto e=bufferPool[i];bufferPool.erase(bufferPool.begin()+i);freePooledBuffer(e);}else ++i;}
+  return freed;
+ }
  void trimMemoryUnlocked(bool all=false,uint64_t now=memoryNow()){
   if(poisoned)return;
+  trimBuffers(now,all);
   textureMemory.trim(now,all,[&](VkDeviceMemory h,size_t bytes){freePooledUnlocked(h,bytes);});
   slabMemory.trim(now,all,[&](VkDeviceMemory h,size_t bytes){freePooledUnlocked(h,bytes);});
  }
  void freePooledUnlocked(VkDeviceMemory h,size_t bytes){frameKernelCall([&]{FreeMemory(device,h,nullptr);});--liveMemoryObjects;liveMemoryBytes-=bytes;limits.release(bytes);}
  void reserveMemoryUnlocked(size_t bytes){
+  if(bytes>ResourceLimits::budget-limits.used && !poisoned){trimBuffers(0,false,bytes-(ResourceLimits::budget-limits.used));}
   if(bytes>ResourceLimits::budget-limits.used && !poisoned){textureMemory.reclaim(bytes-(ResourceLimits::budget-limits.used),[&](VkDeviceMemory h,size_t n){freePooledUnlocked(h,n);});
    if(bytes>ResourceLimits::budget-limits.used)slabMemory.reclaim(bytes-(ResourceLimits::budget-limits.used),[&](VkDeviceMemory h,size_t n){freePooledUnlocked(h,n);});}
   limits.reserve(bytes);
@@ -204,8 +216,9 @@ private:
  static constexpr size_t aliasScratchLimit=1024*1024;
  struct FrameEntry {std::array<Texture *,8> textures;VkRenderPass render;std::array<uint32_t,8> levels;VkFramebuffer frame;};
  struct ViewEntry {Texture *texture;VkFormat format;std::array<uint32_t,4> components;uint32_t base,count;VkImageView view;};
- std::vector<FrameEntry> frameCache;std::vector<ViewEntry> viewCache;std::unordered_multimap<uint64_t,size_t> viewIndex; // key: texture/format/components/range hash -> viewCache position
- static constexpr size_t frameCacheLimit=128,viewCacheLimit=512;
+ std::vector<FrameEntry> frameCache;std::unordered_multimap<uint64_t,size_t> frameIndex;std::vector<ViewEntry> viewCache;std::unordered_multimap<uint64_t,size_t> viewIndex; // key: texture/format/components/range hash -> viewCache position
+ static constexpr size_t frameCacheLimit=512,viewCacheLimit=512;
+ static uint64_t frameKey(const std::array<Texture *,8> &t,VkRenderPass render,const std::array<uint32_t,8> &levels){uint64_t h=0xcbf29ce484222325ull;for(size_t i=0;i<8;++i)h=((h^uint64_t(uintptr_t(t[i])))*0x100000001b3ull^levels[i])*0x100000001b3ull;return (h^uint64_t(uintptr_t(render)))*0x100000001b3ull;}
  static uint64_t viewKey(const Texture *t,VkFormat format,const std::array<uint32_t,4> &c,uint32_t base,uint32_t count){uint64_t h=0xcbf29ce484222325ull;for(uint64_t x:{uint64_t(uintptr_t(t)),uint64_t(format),uint64_t(c[0])|uint64_t(c[1])<<8|uint64_t(c[2])<<16|uint64_t(c[3])<<24,uint64_t(base)<<32|count})h=(h^x)*0x100000001b3ull;return h;}
  void clearSubmitObjects(SubmitSlot &slot) {
   auto &descriptorPool=slot.descriptorPool;auto &queryPool=slot.queryPool;auto &submitFence=slot.submitFence;auto &commandPool=slot.commandPool;auto &command=slot.command;auto &descriptorSets=slot.descriptorSets;auto &descriptorCapacity=slot.descriptorCapacity;
@@ -219,6 +232,7 @@ private:
   for(auto i=frameCache.begin();i!=frameCache.end();) {
    if((!texture && !render) || (texture && std::find(i->textures.begin(),i->textures.end(),texture)!=i->textures.end()) || (render && i->render==render)){DestroyFramebuffer(device,i->frame,nullptr);i=frameCache.erase(i);}else ++i;
   }
+  frameIndex.clear();for(size_t n=0;n<frameCache.size();++n)frameIndex.emplace(frameKey(frameCache[n].textures,frameCache[n].render,frameCache[n].levels),n);
  }
  void clearViews(Texture *texture=nullptr) {
   for(auto i=viewCache.begin();i!=viewCache.end();) {
@@ -411,7 +425,16 @@ public:
  }
  Buffer *allocateUnlocked(size_t length) {
   if(!length || length>maxBufferLength) throw std::runtime_error("buffer length outside resource limit");
-  auto *b=new Buffer{};b->length=length;
+  size_t classSize=(length+15)&~size_t(15);
+  if(buffersPooled && classSize<=bufferPoolMaxBuffer){
+   for(size_t i=bufferPool.size();i-->0;)if(bufferPool[i].classSize==classSize){
+    auto e=bufferPool[i];bufferPool.erase(bufferPool.begin()+i);bufferPoolUsed-=e.classSize;bufferPoolBytes=bufferPoolUsed;++bufferPoolHits;
+    auto *b=new Buffer{};b->length=length;b->buffer=e.buffer;b->memory=e.memory;b->contents=e.contents;b->key=e.contents;b->allocated=e.allocated;b->memoryBytes=e.memoryBytes;b->charged=e.charged;b->memoryType=e.memoryType;b->poolable=true;
+    memset(b->contents,0,classSize);return b;
+   }
+   ++bufferPoolMisses;
+  }
+  auto *b=new Buffer{};b->length=length;b->poolable=buffersPooled && classSize<=bufferPoolMaxBuffer;
   try {
    VkBufferCreateInfo ci{};ci.sType=VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;ci.size=(length+15)&~size_t(15);
    ci.usage=VK_BUFFER_USAGE_TRANSFER_SRC_BIT|VK_BUFFER_USAGE_TRANSFER_DST_BIT|VK_BUFFER_USAGE_VERTEX_BUFFER_BIT|VK_BUFFER_USAGE_INDEX_BUFFER_BIT|VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT|VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
@@ -511,6 +534,13 @@ public:
  void destroyUnlocked(Buffer *b) {
   if(!b || --b->references) return;
   if(b->spare){auto *s=b->spare;b->spare=nullptr;destroyUnlocked(s);}
+  if(!poisoned && b->poolable && !b->imported && b->buffer && b->memory && b->contents && b->charged){
+   size_t classSize=(b->length+15)&~size_t(15);
+   if(bufferPool.size()<bufferPoolEntries && bufferPoolUsed+classSize<=bufferPoolLimit){
+    bufferPool.push_back({b->buffer,b->memory,b->contents,classSize,b->allocated,b->memoryBytes,b->charged,b->memoryType,memoryNow()});
+    bufferPoolUsed+=classSize;bufferPoolBytes=bufferPoolUsed;delete b;return;
+   }
+  }
   if(!poisoned) {
    if(b->contents) frameKernelCall([&]{return UnmapMemory(device,b->memory);});
    if(b->buffer) DestroyBuffer(device,b->buffer,nullptr);
@@ -969,6 +999,7 @@ public:
   auto textureUse=[&](std::vector<HostUse> &list,Texture *t){if(t){addUse(list,t->memory,t->mapped,t->allocated);bufferUse(list,t->backingBuffer);}};
   const bool renaming=systemTranslationPolicy().shadowRename;
   auto collectUses=[&]{ // uses: every host-mapped allocation, coherent too, for prepare conflicts
+   PhaseTimer phase(SubPhase::uses);
    uses.clear();hostUses.clear();
    auto buffer=[&](Buffer *b,uint8_t kind=1){if(b){bufferUse(uses,b,kind);if(!coherent(b->memoryType))bufferUse(hostUses,b,kind);}};
    auto direct=[&](Buffer *b,uint8_t kind=1){if(b)b->directUse=true;buffer(b,kind);};
@@ -980,7 +1011,7 @@ public:
   auto conflicts=[&]{for(auto &pending:slots)if(pending.busy)for(auto old:pending.hostUses)for(auto use:hostUses)if(aliases(old,use))return true;return false;};
   // A declared prepare waits only for flights using the memory it writes; undeclared drains.
   std::vector<HostUse> prepared;const bool declared=prepare && prepareWrites;
-  auto collectPrepared=[&]{prepared.clear();if(declared)for(auto w:*prepareWrites)if(w.buffer && w.bytes)prepared.push_back({w.buffer->memory,(const uint8_t *)w.buffer->contents+w.offset,w.bytes,1,w.buffer});};
+  auto collectPrepared=[&]{PhaseTimer phase(SubPhase::uses);prepared.clear();if(declared)for(auto w:*prepareWrites)if(w.buffer && w.bytes)prepared.push_back({w.buffer->memory,(const uint8_t *)w.buffer->contents+w.offset,w.bytes,1,w.buffer});};
   collectPrepared();
   // A shadow backing buffer only the GPU reads (never bound directly) can be renamed to a spare storage instead of waiting for the flights reading it.
   auto renameable=[&](Buffer *b){return renaming && b && b->shadowBacking && !b->directUse && !b->imported && !b->upload && !b->spareFailed && b->contents;};
@@ -1064,7 +1095,7 @@ public:
    std::unordered_set<Buffer *> bufferSeen;std::unordered_set<Texture *> textureSeen;bufferSeen.reserve(ops.size()*2+8);textureSeen.reserve(ops.size()*2+8);
    auto addBuffer=[&](Buffer *b){if(b){scanAdd(ScanKind::useProbes,1);if(bufferSeen.insert(b).second)buffers.push_back(b);}};
    auto addTexture=[&](Texture *t){if(t){scanAdd(ScanKind::useProbes,1);if(textureSeen.insert(t).second)textures.push_back(t);}if(t && t->backingBuffer)addBuffer(t->backingBuffer);};
-   for(size_t n=0;n<ops.size();++n){diagnosticOp=n;auto &op=ops[n];addBuffer(op.src);addBuffer(op.dst);addBuffer(op.indices);addTexture(op.texture);addTexture(op.sourceTexture);
+   for(size_t n=0;n<ops.size();++n){PhaseTimer planPhase(SubPhase::plan);diagnosticOp=n;auto &op=ops[n];addBuffer(op.src);addBuffer(op.dst);addBuffer(op.indices);addTexture(op.texture);addTexture(op.sourceTexture);
     if(op.texture && op.texture->shadow && (op.pipeline || op.clearOnly || op.upload || op.sourceTexture || op.generateMips))throw std::runtime_error("read-only linear shadow GPU write refused");
     if(op.texture && op.dstLevel>=op.texture->levels)throw std::runtime_error("destination mip level");
     if(op.texture && op.srcLevel>=(op.sourceTexture?op.sourceTexture:op.texture)->levels)throw std::runtime_error("source mip level");
@@ -1498,10 +1529,10 @@ public:
      auto render=renderPass(op.pipeline,passOp?&*passOp:&op);
      VkFramebufferCreateInfo fi{};fi.sType=VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;fi.renderPass=render;
      fi.attachmentCount=used;fi.pAttachments=compactViews;fi.width=op.texture->levelWidth(op.dstLevel);fi.height=op.texture->levelHeight(op.dstLevel);fi.layers=1;VkFramebuffer frame{};
-     {Measure measure{objectNanos,SubPhase::objects};uint64_t frameProbes=0;auto found=std::find_if(frameCache.begin(),frameCache.end(),[&](const auto &c){++frameProbes;return c.textures==targets && c.render==render && c.levels==levels;});
+     {Measure measure{objectNanos,SubPhase::objects};uint64_t frameProbes=0;auto found=frameCache.end();{auto range=frameIndex.equal_range(frameKey(targets,render,levels));for(auto it=range.first;it!=range.second;++it){++frameProbes;auto &c=frameCache[it->second];if(c.textures==targets && c.render==render && c.levels==levels){found=frameCache.begin()+it->second;break;}}}
       scanAdd(ScanKind::frameProbes,frameProbes);if(found!=frameCache.end())frame=found->frame;
       else {check(CreateFramebuffer(device,&fi,nullptr,&frame));++reuseCounts.frames;++submitObjectCreates;++submitFrameCreates;
-       try {if(frameCache.size()<frameCacheLimit)frameCache.push_back({targets,render,levels,frame});else frames.push_back(frame);}catch(...){DestroyFramebuffer(device,frame,nullptr);throw;}}
+       try {if(frameCache.size()<frameCacheLimit){frameCache.push_back({targets,render,levels,frame});frameIndex.emplace(frameKey(targets,render,levels),frameCache.size()-1);}else frames.push_back(frame);}catch(...){if(!frameCache.empty() && frameCache.back().frame==frame)frameCache.pop_back();DestroyFramebuffer(device,frame,nullptr);throw;}}
      }
      VkRenderPassBeginInfo ri{};ri.sType=VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;ri.renderPass=render;ri.framebuffer=frame;
      ri.renderArea={{0,0},boundaryPerf && passEnd>opIndex?mergeAreas[opIndex]:VkExtent2D{op.areaWidth?op.areaWidth:op.texture->levelWidth(op.dstLevel),op.areaHeight?op.areaHeight:op.texture->levelHeight(op.dstLevel)}};ri.clearValueCount=used;ri.pClearValues=clears;
@@ -1695,11 +1726,11 @@ public:
     }
    }
    // Build/pin retirement before QueueSubmit: allocation failure cannot abandon DMA.
-   auto pinnedBuffers=buffers;auto pinnedTextures=textures;
+   auto pinPhase=std::make_unique<PhaseTimer>(SubPhase::pin);auto pinnedBuffers=buffers;auto pinnedTextures=textures;
    std::vector<Pipeline *> pinnedPipelines;std::vector<Sampler *> pinnedSamplers;
    for(const auto &op:ops){if(op.pipeline && std::find(pinnedPipelines.begin(),pinnedPipelines.end(),op.pipeline)==pinnedPipelines.end())pinnedPipelines.push_back(op.pipeline);
     auto add=[&](Sampler *s){if(s && std::find(pinnedSamplers.begin(),pinnedSamplers.end(),s)==pinnedSamplers.end())pinnedSamplers.push_back(s);};add(op.sampler);for(auto *s:op.samplers)add(s);}
-   auto retired=std::make_shared<bool>(false);
+   pinPhase.reset();auto retired=std::make_shared<bool>(false);
    std::function<void()> finish=[this,&slot,fence,timestamps,pinnedBuffers,pinnedTextures,pinnedPipelines,pinnedSamplers,sampleViews,frames,emptyRenders,aliasBuffer,neutralBuffer,submitQueued,retired] {
     // Fence waits never hold the device/recording mutex. One owner retires each ticket.
     if(*retired)return;*retired=true;

@@ -57,8 +57,8 @@ inline constexpr const char *mergeSplitNames[]={"none","encoder","attachments","
 // are drained into the sample at commit; submit phases accumulate into the current sample. Disabled (no clock reads) unless frame tracing is on.
 enum class EncPhase : size_t {encBegin,encChecks,encEnd,pipeline,texSamp,bufBytes,state,draw,blit,newBuffer,newTexture,iosurface,newOther,cbMisc,count};
 inline constexpr const char *encPhaseNames[]={"enc_begin","enc_checks","enc_end","set_pipeline","set_tex_samp","set_buf_bytes","set_state","draw","blit","new_buffer","new_texture","iosurface","new_other","cb_misc"};
-enum class SubPhase : size_t {other,cmdBegin,cmdEnd,objects,descriptors,passes,barriers,record,queueSubmit,fence,wait,prepare,flush,count};
-inline constexpr const char *subPhaseNames[]={"other","cmd_begin","cmd_end","objects","descriptors","passes","barriers","record","queue_submit","fence","wait","prepare","flush"};
+enum class SubPhase : size_t {other,cmdBegin,cmdEnd,objects,descriptors,passes,barriers,record,queueSubmit,fence,wait,prepare,flush,uses,plan,pin,count};
+inline constexpr const char *subPhaseNames[]={"other","cmd_begin","cmd_end","objects","descriptors","passes","barriers","record","queue_submit","fence","wait","prepare","flush","uses","plan","pin"};
 // Per-frame probe counts of per-draw linear structures: bound-set entries visited, full binding compares, view-cache entries visited, use-list entries visited, frame-cache entries visited.
 enum class ScanKind : size_t {boundSetProbes,boundSetCompares,viewProbes,useProbes,frameProbes,boundSetMax,count};
 inline constexpr const char *scanKindNames[]={"bound_set_probes","bound_set_compares","view_probes","use_list_probes","frame_probes","bound_set_max"};
@@ -234,13 +234,15 @@ public:
  }
  template<size_t N> void phaseLine(FILE *out,const char *title,const char *const (&names)[N],std::array<uint64_t,N> FrameSample::*ns,std::array<uint64_t,N> FrameSample::*calls) {
   size_t n=size_t(std::min<uint64_t>(count,capacity));if(!n)return;
-  bool any=false;for(size_t k=0;k<n && !any;++k)for(size_t i=0;i<N;++i)any|=(samples[k].*calls)[i]!=0;if(!any)return;
-  char line[640];int len=snprintf(line,sizeof line,"FUXI MTL: %s n=%zu (avg/max ms/frame/calls)",title,n);
-  for(size_t i=0;i<N && len>=0 && len<380;++i){
+  char line[640];int len=0;bool started=false,pending=false;
+  auto head=[&](bool cont){len=snprintf(line,sizeof line,"FUXI MTL: %s%s n=%zu (avg/max ms/frame/calls)",title,cont?" cont":"",n);pending=false;};
+  auto flush=[&]{if(pending){if(len>399)len=399;line[len]=0;fprintf(out,"%s\n",line);}pending=false;};
+  for(size_t i=0;i<N;++i){
    uint64_t sum=0,max=0,c=0;for(size_t k=0;k<n;++k){uint64_t v=(samples[k].*ns)[i];sum+=v;max=std::max(max,v);c+=(samples[k].*calls)[i];}
-   if(!c)continue;len+=snprintf(line+len,sizeof line-size_t(len)," %s=%.2f/%.2f/%.1f",names[i],sum/double(n)/1e6,max/1e6,c/double(n));
+   if(!c)continue;if(!started){head(false);started=true;}else if(len>350){flush();head(true);}
+   len+=snprintf(line+len,sizeof line-size_t(len)," %s=%.2f/%.2f/%.1f",names[i],sum/double(n)/1e6,max/1e6,c/double(n));pending=true;
   }
-  if(len>399)len=399;line[len]=0;fprintf(out,"%s\n",line);
+  flush();
  }
  void reportPhases(FILE *out) {
   phaseLine(out,"encode phases",encPhaseNames,&FrameSample::encNs,&FrameSample::encCalls);

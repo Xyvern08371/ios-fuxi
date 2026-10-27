@@ -32,7 +32,18 @@ int main(int argc,char **){
   assert(r->memory==m && texturePoolHits==h2+1 && frameCounts.allocations==allocs && r->charged==classBytes && classBytes>=r->allocated);backend.destroy(q);backend.destroy(r);backend.trimMemory();}
  // Idle storage still counts toward the device budget; imports must never donate memory.
  auto *cached=backend.allocateTexture(80,5,16,16);backend.destroy(cached);assert(texturePoolBytes==bytes);
- backend.trimMemory();backend.destroy(up);backend.destroy(out);assert(!backend.resourceBytes());backend.close();assert(liveMemoryObjects==objects);
+ backend.trimMemory();backend.destroy(up);backend.destroy(out);
+ // Small host buffers: exact-size reuse is zeroed and skips vkAllocateMemory; pooled storage stays charged until trimmed; the pool is bounded.
+ backend.trimMemory();{auto pooled=Backend::bufferPoolEntries;auto h0=bufferPoolHits.load(),m0=bufferPoolMisses.load();auto a0=frameCounts.allocations;
+  auto *x=backend.allocate(1000);memset(x->contents,0x5a,1000);auto *xp=x->contents;backend.destroy(x);assert(backend.resourceBytes()>0 && bufferPoolBytes==1008);
+  auto *y=backend.allocate(1003);assert(y->contents==xp && bufferPoolHits==h0+1 && bufferPoolMisses==m0+1 && frameCounts.allocations==a0+1 && y->length==1003);for(size_t i=0;i<1008;++i)assert(((uint8_t *)y->contents)[i]==0);
+  auto *z=backend.allocate(2000);backend.destroy(y);backend.destroy(z);assert(bufferPoolBytes==1008+2000);
+  backend.trimMemory();assert(!bufferPoolBytes && !backend.resourceBytes());
+  std::vector<Buffer *> many;for(size_t i=0;i<pooled+3;++i)many.push_back(backend.allocate(64));for(auto *b:many)backend.destroy(b);assert(bufferPoolBytes==pooled*64);backend.trimMemory();
+  auto *big=backend.allocate(Backend::bufferPoolMaxBuffer+16);backend.destroy(big);assert(!bufferPoolBytes);
+  backend.buffersPooled=false;auto *np=backend.allocate(64);backend.destroy(np);assert(!bufferPoolBytes);backend.buffersPooled=true;
+ }
+ assert(!backend.resourceBytes());backend.close();assert(liveMemoryObjects==objects);
  // Identity-keyed surface imports share one live texture per mapping/size/layout and die with their last holder.
  if(Backend backend2;backend2.supportsHostImport()){
   constexpr size_t row=4352,w=1080,h=64;size_t allocation=(row*h+65535)&~size_t(65535);void *host=nullptr;assert(!posix_memalign(&host,65536,allocation));memset(host,0,allocation);

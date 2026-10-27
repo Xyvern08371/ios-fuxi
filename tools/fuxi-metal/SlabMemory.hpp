@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <vector>
 namespace fuxi {
+inline std::atomic<uint64_t> bufferPoolHits{0},bufferPoolMisses{0},bufferPoolTrims{0},bufferPoolBytes{0};
 inline std::atomic<uint64_t> slabHits{0},slabGrows{0},slabGrowCold{0},slabGrowFrag{0},slabGrowFull{0},slabGrowRefused{0},slabFrees{0},slabTrims{0},slabBytes{0},slabFreeBytes{0};
 template<class Handle> class SlabMemory {
 public:
