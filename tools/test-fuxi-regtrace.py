@@ -20,7 +20,9 @@ MOCK = r'''
 #include <pthread.h>
 #include <stdlib.h>
 #define FUXI 1
+#ifndef __unused
 #define __unused __attribute__((unused))
+#endif
 #define LCK_GRP_DECLARE(n,s) int n __unused
 #define LCK_MTX_DECLARE(n,g) pthread_mutex_t n=PTHREAD_MUTEX_INITIALIZER
 #define os_atomic_load(p,o) __atomic_load_n(p,__ATOMIC_ACQUIRE)
