@@ -119,8 +119,8 @@ def main():
     end = DRIVER.index('static void fg_thread(')
     body = DRIVER[start:end]
     # Both ring writers kick before the WPTR doorbell.
-    assert re.search(r'fg_dcvs_kick\(\);\n if \(!g3_gw\(0x807, g3_wptr\)\) err = 0x602;', DRIVER)
-    assert re.search(r'fg_dcvs_kick\(\);\n if \(!g3_gw\(0x807,g3_wptr\) \|\| fg_access_failed\) return fg_abi_fault\("client doorbell"\);', BACKEND)
+    assert re.search(r'fg_dcvs_kick\(\);\n if \(!fg_ring_doorbell\(\)\) err = 0x602;', DRIVER)
+    assert re.search(r'fg_dcvs_kick\(\);\n(?: [^\n]*\n)? if \(!fg_ring_doorbell\(\) \|\| fg_access_failed\) return fg_abi_fault\("client doorbell"\);', BACKEND)
     assert 'fuxi_gpu_dcvs.h' in DRIVER and 'fg_dcvs_start();' in DRIVER and 'fgd_decode(requested_level' in DRIVER
     with tempfile.TemporaryDirectory() as d:
         path = Path(d)/'dcvs.c'
