@@ -204,6 +204,24 @@ static void panel120_tests(uint8_t *panel) {
  ticks=fg_scanout_after-1;assert(!fuxi_gpu_scanout_acquire());ticks++;
  assert(fuxi_gpu_scanout_acquire()==1 && fuxi_gpu_scanout_publish()==1 && starts==1);
  ctl[0x1c/4]=0;ticks+=10000;assert(fuxi_gpu_scanout_acquire()==1 && dmaStarts==1); // once
+ // fuxigpuncimport 8192: the panel120 floor is 3/4 period (the 10 ms default exceeds one 8.33 ms period); explicit drain keeps its value.
+ assert(fg_scanout_drain_us==10000 && !fg_abi_start);
+ fg_scanout_arm(0);assert(fg_scanout_after-fg_scanout_started==10000);
+ fg_abi_start=1;fg_scanout_arm(0);assert(fg_scanout_after-fg_scanout_started==6249);
+ fg_scanout_explicit_drain=1;fg_scanout_arm(0);assert(fg_scanout_after-fg_scanout_started==10000);fg_scanout_explicit_drain=0;
+ fg_scanout_te_mode=1;fg_scanout_arm(0);assert(fg_scanout_after-fg_scanout_started==10000);fg_scanout_te_mode=0;
+ fg_abi_start=0;
+ // Measurement: START-to-transfer-done is sampled inside the floor; busy and not-yet-idle samples record nothing.
+ fg_scanout_xfer_n=fg_scanout_xfer_sum=fg_scanout_xfer_max=0;memset(fg_scanout_xfer_hist,0,sizeof(fg_scanout_xfer_hist));
+ fg_scanout_arm(0);ctl[0x1c/4]=1;intf[0x2b0/4]=100;ticks+=3000;fg_scanout_xfer_sample();assert(!fg_scanout_xfer_n && fg_scanout_xfer_open);
+ ctl[0x1c/4]=0;fg_scanout_xfer_sample();assert(!fg_scanout_xfer_n);intf[0x2b0/4]=2400;ticks+=4400;fg_scanout_xfer_sample();
+ assert(fg_scanout_xfer_n==1 && fg_scanout_xfer_sum==7400 && fg_scanout_xfer_max==7400 && fg_scanout_xfer_hist[3]==1 && !fg_scanout_xfer_open);
+ fg_scanout_xfer_sample();assert(fg_scanout_xfer_n==1); // one sample per START
+ // ready-to-START split: each blocked poll is charged for the interval since the previous one.
+ memset(fg_scanout_charge,0,sizeof(fg_scanout_charge));fg_scanout_ready_at=ticks;fg_scanout_charged_at=0;
+ ticks+=100;fg_scanout_charge_to(FG_WHY_XFER);ticks+=50;fg_scanout_charge_to(FG_WHY_FLOOR);
+ assert(fg_scanout_charge[FG_WHY_XFER]==100 && fg_scanout_charge[FG_WHY_FLOOR]==50 && fg_scanout_last_why==FG_WHY_FLOOR);
+ fg_scanout_ready_at=fg_scanout_charged_at=0;
  // Gaps now count 8.333 ms periods, including 16.667ms as two periods.
  ticks=fg_scanout_last_start+8333;assert(fuxi_gpu_scanout_publish()==1);
  ctl[0x1c/4]=0;ticks+=16667;assert(fuxi_gpu_scanout_acquire()==1 && fuxi_gpu_scanout_publish()==1);

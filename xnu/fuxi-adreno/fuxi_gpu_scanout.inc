@@ -48,6 +48,35 @@ static unsigned fg_scanout_te_mode, fg_scanout_te_frame, fg_scanout_te_init, fg_
 static unsigned fg_scanout_te_window, fg_scanout_te_frames, fg_scanout_iv[4];
 static uint64_t fg_scanout_started, fg_scanout_last_start, fg_scanout_window_start;
 static int fg_abi_observe(void);
+static unsigned fg_abi_start; /* fuxigpuncimport bit 8192: panel120 START floor of 3/4 period; the framebuffer polls START retries at 1/64 tick */
+/* Measurement only. xfer: START write to the first poll that sees CTL START clear and the write line idle (quantized by the poll
+ * interval); sampled on every acquire, also inside the floor. r2s: newest back buffer ready to START, split by the reason each
+ * blocked poll returned (the interval since the previous poll is charged to that poll's reason). */
+enum { FG_WHY_RING, FG_WHY_FLOOR, FG_WHY_TE, FG_WHY_XFER };
+static const unsigned fg_scanout_xfer_edges[7] = { 5000, 6000, 7000, 7500, 8000, 9000, 12000 };
+static unsigned fg_scanout_xfer_open, fg_scanout_xfer_n, fg_scanout_xfer_hist[8], fg_scanout_last_why;
+static uint64_t fg_scanout_xfer_sum, fg_scanout_xfer_max, fg_scanout_ready_at, fg_scanout_charged_at, fg_scanout_charge[4], fg_scanout_r2s, fg_scanout_r2s_n;
+static void fg_scanout_charge_to(unsigned why)
+{
+ if (!fg_scanout_ready_at) return;
+ uint64_t now = rsr("cntpct_el0");
+ if (!fg_scanout_charged_at) fg_scanout_charged_at = fg_scanout_ready_at;
+ if (now > fg_scanout_charged_at) fg_scanout_charge[why] += now - fg_scanout_charged_at;
+ fg_scanout_charged_at = now; fg_scanout_last_why = why;
+}
+static int fg_scanout_read(unsigned pa, unsigned *value);
+static void fg_scanout_xfer_sample(void)
+{
+ unsigned line, start;
+ if (!fg_scanout_xfer_open || !fg_scanout_read(FG_SCAN_INTF+0x2b0, &line) || !fg_scanout_read(FG_SCAN_CTL+0x1c, &start)) return;
+ if ((start & 1) || ((line & 65535) != 0 && (line & 65535) < 2400)) return;
+ uint64_t hz = rsr("cntfrq_el0"), us = (rsr("cntpct_el0") - fg_scanout_started)*1000000/hz;
+ unsigned bin = 0;
+ while (bin < 7 && us >= fg_scanout_xfer_edges[bin]) bin++;
+ fg_scanout_xfer_hist[bin]++; fg_scanout_xfer_n++; fg_scanout_xfer_sum += us;
+ if (us > fg_scanout_xfer_max) fg_scanout_xfer_max = us;
+ fg_scanout_xfer_open = 0;
+}
 static unsigned fg_scanout_double_active, fg_scanout_double_initialized, fg_scanout_front;
 static unsigned fg_scanout_back_ready, fg_scanout_flips, fg_scanout_ready_drops, fg_scanout_retries;
 static unsigned fg_scanout_current_match, fg_scanout_current_mismatch, fg_scanout_reentries;
@@ -195,9 +224,14 @@ static void fg_scanout_arm(unsigned count)
 {
  uint64_t now = rsr("cntpct_el0"), hz = rsr("cntfrq_el0");
  fg_scanout_te_frame = count >> 16;
- fg_scanout_after = now + hz*fg_scanout_drain_us/1000000;
+ unsigned drain = fg_scanout_drain_us;
+ /* panel120 default floor (10 ms) exceeds the 8.33 ms period: a START finishing its transfer just before a TE waited out the floor
+  * and missed that TE. Bit 8192 lowers it to 3/4 period (the transfer-done and TE checks still gate every START). */
+ if (fg_abi_start && fg_scanout_panel120_active && !fg_scanout_explicit_drain && !fg_scanout_te_mode && drain == FG_SCAN_DRAIN_US/2)
+  drain = fg_scanout_period_us*3/4;
+ fg_scanout_after = now + hz*drain/1000000;
  fg_scanout_timeout = fg_scanout_after + hz/10;
- fg_scanout_started = now;
+ fg_scanout_started = now; fg_scanout_xfer_open = 1;
 }
 /* Preserve other pending flush bits; VIG0 is CTL_FLUSH bit0. */
 static int fg_scanout_address(unsigned pa)
@@ -448,14 +482,15 @@ static int fg_scanout_acquire(unsigned publication)
   if (!fg_scanout_read(0xae05014, &src) || src != fg_scanout_pa(fg_scanout_front))
    return fg_scanout_stop("double SRC0 changed");
  }
- if (fg_busy) { fg_scanout_wait_ring++; return 0; }
+ if (fg_busy) { fg_scanout_wait_ring++; if (publication) fg_scanout_charge_to(FG_WHY_RING); return 0; }
  if (fg_scanout_double_active && !publication) {
   if (fg_scanout_back_ready && !fg_scanout_triple_requested) return 0;
   fg_scanout_copy = fg_scanout_target();
   fg_scanout_writable = 1;
   return 1;
  }
- if (rsr("cntpct_el0") < fg_scanout_after) { fg_scanout_wait_floor++; return 0; }
+ fg_scanout_xfer_sample();
+ if (rsr("cntpct_el0") < fg_scanout_after) { fg_scanout_wait_floor++; if (publication) fg_scanout_charge_to(FG_WHY_FLOOR); return 0; }
  if (fg_scanout_te_mode) {
   unsigned count;
   if (!fg_scanout_read(FG_SCAN_INTF+0x298, &count)) return fg_scanout_stop("read te count");
@@ -474,7 +509,7 @@ static int fg_scanout_acquire(unsigned publication)
     fg_scanout_after = fg_scanout_started + hz*fallback/1000000;
     fg_scanout_timeout = fg_scanout_after + hz/10;
    }
-   fg_scanout_wait_te++;
+   fg_scanout_wait_te++; if (publication) fg_scanout_charge_to(FG_WHY_TE);
    return 0;
   }
  }
@@ -487,7 +522,7 @@ static int fg_scanout_acquire(unsigned publication)
    printf("FUXI SCANOUT: drain timeout wr=%#x rd=%#x start=%#x\n", line, rd, start);
    return fg_scanout_stop("transfer drain timeout");
   }
-  fg_scanout_wait_xfer++;
+  fg_scanout_wait_xfer++; if (publication) fg_scanout_charge_to(FG_WHY_XFER);
   return 0;
  }
  if (fg_scanout_panel120_requested && !fg_scanout_panel120_attempted) {
@@ -581,6 +616,7 @@ static int fg_scanout_publish(void)
  if (!fg_scanout_read(FG_SCAN_INTF+0x2b4, &ar) || (ar & 0x80000000u) ||
      !fg_scanout_read(FG_SCAN_CTL+0x1c, &start) || (start & 1))
   return fg_scanout_stop("publish transfer status");
+ fg_scanout_charge_to(fg_scanout_last_why); /* the last wait ran until this poll */
  __asm__ volatile("dsb sy" ::: "memory");
  fg_scanout_writable = 0;
  if (fg_scanout_double_active && !fg_scanout_address(fg_scanout_pa(fg_scanout_triple_requested ? fg_scanout_ready : fg_scanout_front ^ 1u)))
@@ -606,6 +642,8 @@ static int fg_scanout_publish(void)
   fg_scanout_iv[gap <= tick + tick/8 ? 0 : gap <= 2*tick + tick/8 ? 1 : gap <= 3*tick + tick/8 ? 2 : 3]++;
  }
  fg_scanout_last_start = now;
+ if (fg_scanout_ready_at) { fg_scanout_r2s += now - fg_scanout_ready_at; fg_scanout_r2s_n++; }
+ fg_scanout_ready_at = fg_scanout_charged_at = 0;
  fg_scanout_te_frames = count >> 16;
  if (++fg_scanout_starts % 600 == 0) {
   uint64_t span = now - fg_scanout_window_start;
@@ -617,6 +655,22 @@ static int fg_scanout_publish(void)
       fg_scanout_wait_ring, fg_scanout_wait_floor, fg_scanout_wait_xfer, fg_scanout_wait_te,
       fg_scanout_drain_us, fg_scanout_te_mode, te_dhz/10, te_dhz%10,
       fg_scanout_iv[0], fg_scanout_iv[1], fg_scanout_iv[2], fg_scanout_iv[3]);
+  {
+   uint64_t n = fg_scanout_xfer_n ? fg_scanout_xfer_n : 1, r = fg_scanout_r2s_n ? fg_scanout_r2s_n : 1, cum = 0;
+   unsigned p50 = 0;
+   for (unsigned i = 0; i < 8; i++) { cum += fg_scanout_xfer_hist[i]; if (cum*2 >= n) { p50 = i < 7 ? fg_scanout_xfer_edges[i] : 0; break; } }
+   printf("FUXI SCANOUT: xfer_done_us n=%u avg=%llu p50<%u max=%llu hist<5/6/7/7.5/8/9/12ms/more=%u/%u/%u/%u/%u/%u/%u/%u"
+       " ready_to_start_us n=%llu avg=%llu floor=%llu xfer=%llu te=%llu ring=%llu start_bit=%u\n",
+       fg_scanout_xfer_n, (unsigned long long)(fg_scanout_xfer_sum/n), p50, (unsigned long long)fg_scanout_xfer_max,
+       fg_scanout_xfer_hist[0], fg_scanout_xfer_hist[1], fg_scanout_xfer_hist[2], fg_scanout_xfer_hist[3],
+       fg_scanout_xfer_hist[4], fg_scanout_xfer_hist[5], fg_scanout_xfer_hist[6], fg_scanout_xfer_hist[7],
+       (unsigned long long)fg_scanout_r2s_n, (unsigned long long)(fg_scanout_r2s*1000000/hz/r),
+       (unsigned long long)(fg_scanout_charge[FG_WHY_FLOOR]*1000000/hz/r), (unsigned long long)(fg_scanout_charge[FG_WHY_XFER]*1000000/hz/r),
+       (unsigned long long)(fg_scanout_charge[FG_WHY_TE]*1000000/hz/r), (unsigned long long)(fg_scanout_charge[FG_WHY_RING]*1000000/hz/r), fg_abi_start);
+   fg_scanout_xfer_n = 0; fg_scanout_xfer_sum = fg_scanout_xfer_max = 0; fg_scanout_r2s = fg_scanout_r2s_n = 0;
+   for (unsigned i = 0; i < 8; i++) fg_scanout_xfer_hist[i] = 0;
+   for (unsigned i = 0; i < 4; i++) fg_scanout_charge[i] = 0;
+  }
   if (fg_scanout_double_active) {
    unsigned current, expected = fg_scanout_pa(fg_scanout_front);
    if (!fg_scanout_read(0xae050a4, &current)) return fg_scanout_stop("read current SRC0");
@@ -648,6 +702,7 @@ int fuxi_gpu_scanout_publish(void)
   if (fg_scanout_back_ready && fg_scanout_triple_requested) fg_scanout_ready_drops++;
   fg_scanout_ready = fg_scanout_triple_requested ? fg_scanout_copy : fg_scanout_front ^ 1u;
   fg_scanout_back_ready = 1;
+  fg_scanout_ready_at = rsr("cntpct_el0"); fg_scanout_charged_at = 0;
  }
  return fg_scanout_publish();
 }

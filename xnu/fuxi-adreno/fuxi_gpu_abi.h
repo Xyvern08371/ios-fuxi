@@ -31,6 +31,7 @@ void fuxi_gpu_abi_sched_stats(uint32_t ibs[4], uint32_t wptr[4], uint32_t stall[
 int fuxi_gpu_abi_queue_enabled(void);
 int fuxi_gpu_abi_roimport(void);
 int fuxi_gpu_abi_pace(void);
+int fuxi_gpu_abi_start(void);
 /* Queued submits, deepest chain, queue refusals for a waiting present, refusals for a full chain/ring. */
 void fuxi_gpu_abi_queue_stats(uint32_t q[6]);
 void fuxi_gpu_abi_publish(void);

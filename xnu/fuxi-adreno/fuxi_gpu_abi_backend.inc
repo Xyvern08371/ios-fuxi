@@ -25,6 +25,7 @@ static unsigned fg_abi_host_handoff, fg_abi_ncimport, fg_abi_unstick, fg_abi_coh
 #define FG_ABI_QUEUE_MAX 4u
 static uint32_t fg_abi_q_stats[6]; /* queued, deepest, refused for a present, full, refused by the hold, hold expired */
 static unsigned fg_abi_hold;
+static unsigned fg_abi_start;
 static uint64_t fg_abi_hold_since;
 /* Ticks the last fuxi_gpu_abi_map spent after taking the GPU lock (the caller's total minus this is the wait for that lock). */
 static uint64_t fg_abi_map_work;
@@ -346,7 +347,7 @@ static int fg_abi_init(void)
 {
  unsigned bits=0;
  (void)PE_parse_boot_argn("fuxigpuncimport",&bits,sizeof(bits));
- fg_abi_ncimport=bits&1; fg_wptr_fence=(bits>>1)&1; fg_abi_unstick=(bits>>2)&1; fg_abi_cohtest=(bits>>6)&1; fg_abi_tlbpages=(bits>>7)&1; fg_abi_mapwait=(bits>>8)&1; fg_abi_queue=(bits>>9)&1; fg_abi_roimport=(bits>>10)&1; fg_abi_pace=(bits>>11)&1; fg_abi_hold=(bits>>12)&1; fg_abi_hold_since=0; fg_abi_present_wait=0; memset(fg_abi_q_stats,0,sizeof(fg_abi_q_stats));
+ fg_abi_ncimport=bits&1; fg_wptr_fence=(bits>>1)&1; fg_abi_unstick=(bits>>2)&1; fg_abi_cohtest=(bits>>6)&1; fg_abi_tlbpages=(bits>>7)&1; fg_abi_mapwait=(bits>>8)&1; fg_abi_queue=(bits>>9)&1; fg_abi_roimport=(bits>>10)&1; fg_abi_pace=(bits>>11)&1; fg_abi_hold=(bits>>12)&1; fg_abi_start=(bits>>13)&1; fg_abi_hold_since=0; fg_abi_present_wait=0; memset(fg_abi_q_stats,0,sizeof(fg_abi_q_stats));
  fg_abi_coh=fg_abi_coh_tries=0;
  for (unsigned i=0;i<sizeof(fg_abi_used)/sizeof(fg_abi_used[0]);i++) fg_abi_used[i]=0;
  /* 772 4K pages: root, two L2s, kernel runtime L3, 768 client L3s.
@@ -734,6 +735,7 @@ int fuxi_gpu_abi_poll(uint64_t fence)
 int fuxi_gpu_abi_queue_enabled(void) { FG_GUARD; return fg_abi_queue; }
 int fuxi_gpu_abi_roimport(void) { FG_GUARD; return fg_abi_roimport; }
 int fuxi_gpu_abi_pace(void) { FG_GUARD; return fg_abi_pace; }
+int fuxi_gpu_abi_start(void) { FG_GUARD; return fg_abi_start; }
 void fuxi_gpu_abi_queue_stats(uint32_t q[6]) { FG_GUARD; memcpy(q,fg_abi_q_stats,sizeof(fg_abi_q_stats)); }
 /* Window counters for the SWEET FB stats line (fuxi_gpu_abi_stats_log); a snapshot, not reset. */
 void fuxi_gpu_abi_sched_stats(uint32_t ibs[4], uint32_t wptr[4], uint32_t stall[8])

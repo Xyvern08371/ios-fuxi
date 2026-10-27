@@ -258,6 +258,7 @@ extern "C" void fuxi_display_kick(void);
 extern "C" void fuxi_gpu_abi_stats_log(void);
 extern "C" void fuxi_gpu_abi_sched_log(void);
 extern "C" int fuxi_gpu_abi_pace(void);
+extern "C" int fuxi_gpu_abi_start(void);
 #endif
 
 /* NativeMetal c6d29ca (MIT): prioritize the path carrying frames to screen.
@@ -569,7 +570,7 @@ sweet_fb_rearm(AppleCLCD *fb, IOTimerEventSource *sender)
   bool active = fb->fGpuPending || fb->fPublicationPending || fuxi_gpu_scanout_pending() || (!fb->fScanoutHeld &&
       (fb->fPowerOff ? fb->fFadeStep == 0 : fb->fDirty));
   /* fuxigpuncimport bit 2048: poll the in-flight scanout copy at 1/64 tick so its surface lease is released at retire. */
-  uint64_t poll = now + fb->fTickAbs/(fb->fGpuPending && fuxi_gpu_abi_pace() ? 64 : 16);
+  uint64_t poll = now + fb->fTickAbs/((fb->fGpuPending && fuxi_gpu_abi_pace()) || ((fb->fPublicationPending || fuxi_gpu_scanout_pending()) && fuxi_gpu_abi_start()) ? 64 : 16);
   if (fb->fVsyncTE) {
    if (fb->fTeValid) {
     deadline = fb->fTeNext;
