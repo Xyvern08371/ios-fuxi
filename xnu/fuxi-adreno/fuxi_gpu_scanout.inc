@@ -148,7 +148,7 @@ static int fg_scanout_write(unsigned pa, unsigned value)
  * START-bit-clear ("clear"), the first write-line idle after it was active ("lineend", 0 when never seen active) and "done" = the
  * later of clear and lineend, the same condition acquire uses. The worker only stores results; accounting runs under FG_GUARD at the
  * next publish, so a window is consistent. Read-only MMIO, no behaviour change. Not yet observed on device. */
-static unsigned fg_abi_probe, fg_abi_spin;
+static unsigned fg_abi_probe, fg_abi_spin, fg_abi_mid;
 /* Opt-in (fuxigpuncimport bit 32768), panel120 + double/triple only. The 1080x2400 transfer runs ~8.0 ms from the TE edge in an 8.3 ms
  * period, so a START catches the next TE only if written in the ~0.3 ms between transfer-done and that TE. The first version woke a
  * fixed 93% of a period after the START write, but the transfer begins at the next TE after the START, up to a period later, so it woke
@@ -391,6 +391,87 @@ static void fg_scanout_spin_kick(int fresh)
  fg_scanout_spin_replanned = 0;
  fg_scanout_spin_serial = fg_scanout_starts; fg_scanout_spin_c0 = fg_scanout_last_count;
  fg_scanout_spin_plan(e, e - fg_scanout_last_start);
+}
+/* Opt-in (fuxigpuncimport bit 65536), panel120 only: START anywhere in the tear-safe part of the TE period instead of only at the TE.
+ * Facts used: SYNC_THRESH (+0x29c) low 16 bits are the tear-check start threshold (4 after ABL): a START waits for the next TE unless the
+ * read pointer (INT_COUNT_VAL low 16, which reloads to VSYNC_INIT_VAL at each TE and counts the 2684 lines of a period) is within that
+ * many lines of the reload (observed: START to transfer start averages ~4.4 ms). Tear model, line k read at r_k = k*b and written at
+ * w_k = s + k*a after the TE, s = START delay, writer a = 7.92 ms/2400 lines, reader b between 7.3 ms/2400 and 8.28 ms/2400 (not
+ * measured): the current frame is consistent (all old) when s >= max(0, 2399*(b-a)) (<= ~0.36 ms), and the next frame is all new when
+ * s <= P - max(0, 2399*(a-b)) (>= ~7.7 ms). So with a margin the safe window is 160..2420 lines after the TE (0.5..7.5 ms). Raising the
+ * threshold to 2420 lets the hardware itself hold a START outside the upper bound, and software blocks the lower part (5..159 lines,
+ * ~0.5 ms) and anything above the upper bound; a START at <= 4 lines is the hardware's own case. Blocking never lasts more than two
+ * periods. The first 8 in-window STARTs are verified: if the write line does not go active within 200 us of the START the hardware is
+ * still waiting for the TE (gate not opened by the threshold), and after 4 such results the threshold is restored (state 3, off).
+ * The reader/writer speeds and the threshold semantics are not measured: not yet observed on device. */
+#define FG_SCAN_MID_LO 160u
+#define FG_SCAN_MID_HI 2420u
+#define FG_SCAN_MID_CALIB 8u
+static unsigned fg_scanout_mid_state, fg_scanout_mid_old, fg_scanout_mid_new, fg_scanout_mid_imm, fg_scanout_mid_held, fg_scanout_mid_calib;
+static unsigned fg_scanout_mid_wait, fg_scanout_mid_forced, fg_scanout_mid_hist[7], fg_scanout_mid_g1[7]; /* state: 0 off, 1 verify, 2 confirmed, 3 disabled */
+static uint64_t fg_scanout_mid_block_t;
+static unsigned fg_scanout_mid_since(unsigned count) { return ((count & 0xffffu) - fg_scanout_te_init) & 0xffffu; }
+static unsigned fg_scanout_mid_bucket(unsigned since)
+{
+ return since <= 4 ? 0 : since < FG_SCAN_MID_LO ? 1 : since < 600 ? 2 : since < 1200 ? 3 : since < 1800 ? 4 : since <= FG_SCAN_MID_HI ? 5 : 6;
+}
+static void fg_scanout_mid_setup(void)
+{
+ unsigned old, want, back;
+ if (!fg_abi_mid || fg_scanout_mid_state || !fg_scanout_panel120_active) return;
+ if (!fg_scanout_read(FG_SCAN_INTF+0x29c, &old)) return;
+ want = (old & 0xffff0000u) | FG_SCAN_MID_HI;
+ if (!fg_scanout_write(FG_SCAN_INTF+0x29c, want) || !fg_scanout_read(FG_SCAN_INTF+0x29c, &back) || back != want) {
+  (void)fg_scanout_write(FG_SCAN_INTF+0x29c, old);
+  fg_scanout_mid_state = 3;
+  printf("FUXI SCANOUT: mid_start threshold write refused old=%#x want=%#x; off\n", old, want);
+  return;
+ }
+ fg_scanout_mid_old = old; fg_scanout_mid_new = want; fg_scanout_mid_state = 1;
+ printf("FUXI SCANOUT: mid_start threshold %#x -> %#x (START window %u..%u lines after TE, software blocks 5..%u and above)\n",
+     old, want, FG_SCAN_MID_LO, FG_SCAN_MID_HI, FG_SCAN_MID_LO-1);
+}
+/* 1 = a START may be issued now. */
+static int fg_scanout_mid_allow(void)
+{
+ unsigned count, since;
+ if (fg_scanout_mid_state != 1 && fg_scanout_mid_state != 2) return 1;
+ if (!fg_scanout_read(FG_SCAN_INTF+0x298, &count)) return 1;
+ since = fg_scanout_mid_since(count);
+ if (since <= 4 || since >= 4000 || (since >= FG_SCAN_MID_LO && since <= FG_SCAN_MID_HI)) { fg_scanout_mid_block_t = 0; return 1; }
+ uint64_t now = rsr("cntpct_el0");
+ if (!fg_scanout_mid_block_t) fg_scanout_mid_block_t = now;
+ else if (now - fg_scanout_mid_block_t > 2*rsr("cntfrq_el0")*fg_scanout_period_us/1000000) { fg_scanout_mid_forced++; fg_scanout_mid_block_t = 0; return 1; }
+ fg_scanout_mid_wait++;
+ return 0;
+}
+/* After a START: histogram of the read line, and the verification of the first in-window STARTs. */
+static void fg_scanout_mid_account(unsigned count, unsigned gap1)
+{
+ unsigned since, b;
+ if (!fg_abi_mid || !fg_scanout_panel120_active) return;
+ since = fg_scanout_mid_since(count); b = fg_scanout_mid_bucket(since);
+ fg_scanout_mid_hist[b]++; if (gap1) fg_scanout_mid_g1[b]++;
+ if (fg_scanout_mid_state != 1 || since < FG_SCAN_MID_LO || since > FG_SCAN_MID_HI) return;
+ uint64_t limit = rsr("cntpct_el0") + rsr("cntfrq_el0")*200/1000000;
+ unsigned line, immediate = 0;
+ while (fg_scanout_read(FG_SCAN_INTF+0x2b0, &line)) {
+  line &= 0xffffu;
+  if (line != 0 && line < 2400) { immediate = 1; break; }
+  if (rsr("cntpct_el0") >= limit) break;
+  delay(5);
+ }
+ if (immediate) fg_scanout_mid_imm++; else fg_scanout_mid_held++;
+ fg_scanout_mid_calib++;
+ if (fg_scanout_mid_held >= FG_SCAN_MID_CALIB/2) {
+  (void)fg_scanout_write(FG_SCAN_INTF+0x29c, fg_scanout_mid_old);
+  fg_scanout_mid_state = 3;
+  printf("FUXI SCANOUT: mid_start hardware still waits for the TE (immediate=%u held=%u); threshold restored to %#x, off\n",
+      fg_scanout_mid_imm, fg_scanout_mid_held, fg_scanout_mid_old);
+ } else if (fg_scanout_mid_imm >= FG_SCAN_MID_CALIB/2) {
+  fg_scanout_mid_state = 2;
+  printf("FUXI SCANOUT: mid_start confirmed: in-window STARTs begin writing at once (immediate=%u held=%u)\n", fg_scanout_mid_imm, fg_scanout_mid_held);
+ }
 }
 static void fg_scanout_probe_kick(unsigned te_frame)
 {
@@ -836,6 +917,7 @@ static int fg_scanout_acquire(unsigned publication)
    unsigned count;
    if (!fg_scanout_read(FG_SCAN_INTF+0x298, &count)) return fg_scanout_stop("panel120 read te count");
    fg_scanout_arm(count);
+   fg_scanout_mid_setup();
    /* Drop the mixed-rate diagnostic window and wait with the new gates. */
    fg_scanout_window_start = rsr("cntpct_el0");
    fg_scanout_te_window = count >> 16;
@@ -923,6 +1005,7 @@ static int fg_scanout_publish(void)
  if (!fg_scanout_read(FG_SCAN_INTF+0x2b4, &ar) || (ar & 0x80000000u) ||
      !fg_scanout_read(FG_SCAN_CTL+0x1c, &start) || (start & 1))
   return fg_scanout_stop("publish transfer status");
+ if (fg_abi_mid && !fg_scanout_mid_allow()) return 2; /* outside the tear-safe part of the period: the caller retries */
  fg_scanout_charge_to(fg_scanout_last_why); /* the last wait ran until this poll */
  __asm__ volatile("dsb sy" ::: "memory");
  fg_scanout_writable = 0;
@@ -946,8 +1029,10 @@ static int fg_scanout_publish(void)
  fg_scanout_probe_kick(count >> 16);
  uint64_t now = rsr("cntpct_el0"), hz = rsr("cntfrq_el0");
  /* START-to-START gaps in actual panel periods: <=1, <=2, <=3, longer. */
+ unsigned gap1 = 0;
  if (fg_scanout_last_start) {
   uint64_t gap = now - fg_scanout_last_start, tick = hz*fg_scanout_period_us/1000000;
+  gap1 = gap <= tick + tick/8;
   fg_scanout_iv[gap <= tick + tick/8 ? 0 : gap <= 2*tick + tick/8 ? 1 : gap <= 3*tick + tick/8 ? 2 : 3]++;
  }
  fg_scanout_last_start = now;
@@ -965,6 +1050,15 @@ static int fg_scanout_publish(void)
       fg_scanout_drain_us, fg_scanout_te_mode, te_dhz/10, te_dhz%10,
       fg_scanout_iv[0], fg_scanout_iv[1], fg_scanout_iv[2], fg_scanout_iv[3]);
   fg_scanout_probe_report();
+  if (fg_abi_mid) {
+   unsigned *h = fg_scanout_mid_hist, *g = fg_scanout_mid_g1;
+   printf("FUXI SCANOUT: mid_start state=%u thresh=%#x->%#x imm=%u held=%u blocked_polls=%u forced=%u"
+       " read_line_since_te<=4/<160/<600/<1200/<1800/<=2420/more starts=%u/%u/%u/%u/%u/%u/%u gap1=%u/%u/%u/%u/%u/%u/%u\n",
+       fg_scanout_mid_state, fg_scanout_mid_old, fg_scanout_mid_new, fg_scanout_mid_imm, fg_scanout_mid_held, fg_scanout_mid_wait, fg_scanout_mid_forced,
+       h[0], h[1], h[2], h[3], h[4], h[5], h[6], g[0], g[1], g[2], g[3], g[4], g[5], g[6]);
+   for (unsigned i = 0; i < 7; i++) h[i] = g[i] = 0;
+   fg_scanout_mid_wait = fg_scanout_mid_forced = 0;
+  }
   if (fg_abi_spin) {
    unsigned *st = fg_scanout_spin_stat, pus = (unsigned)(fg_scanout_ph_p*1000000/hz);
    printf("FUXI SCANOUT: te_start spin wakes=%u published=%u no_back_buffer=%u expired_or_raced=%u\n",
@@ -1025,6 +1119,7 @@ static int fg_scanout_publish(void)
   fg_scanout_te_window = fg_scanout_te_frames;
  }
  __asm__ volatile("dsb sy" ::: "memory");
+ fg_scanout_mid_account(count, gap1);
  fg_scanout_arm(count);
  fg_scanout_spin_kick(1);
  return 1;

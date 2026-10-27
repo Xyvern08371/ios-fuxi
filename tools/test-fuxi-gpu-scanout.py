@@ -168,6 +168,7 @@ static void probe_script(void) {uint64_t t=ticks-base;
  if(t>=1500 && t<8000)intf[0x2b0/4]=300; // active
  if(t>=8000){ctl[0x1c/4]=0;intf[0x2b0/4]=2400;}}
 // TE-referenced spin model: the transfer starts at the edge phE (count phC -> phC+1), the line is active for 8000 us, the next edge is 8333 us later.
+static void mid_script(void) {if(ticks-base>=50)intf[0x2b0/4]=300;}
 static uint64_t phE,phSkew,phLine;static unsigned phC,phHold;
 static void phase_script(void) {
  uint64_t t=ticks;unsigned c=phC+(t>=phE)+(t>=phE+8333);
@@ -697,6 +698,39 @@ static void double_tests(uint8_t *panel) {
  assert(!fuxi_gpu_scanout_acquire());ticks+=20000;assert(fuxi_gpu_scanout_acquire()==-1 && !starts);
  puts("PASS: actual double ownership, initialization, overlap, deferred publish/TE/retirement, SRC0/flush/START order, sampling, CPU fallback and stop restoration");
 }
+static void mid_tests(uint8_t *panel) {
+ triple_setup(panel);
+ // fuxigpuncimport 65536: START anywhere in the tear-safe part of the period; the hardware start threshold is widened and the low part blocked in software.
+ {
+  unsigned keepP=fg_scanout_panel120_active,keepInit=fg_scanout_te_init,keepStarts=fg_scanout_starts,keepMatch=fg_scanout_current_match,keepMismatch=fg_scanout_current_mismatch,keepTe=fg_scanout_te_frames,keepCount=intf[0x298/4];
+  fg_abi_mid=1;fg_scanout_panel120_active=1;fg_scanout_period_us=8333;fg_scanout_te_init=0x960;fg_scanout_mid_state=0;fg_scanout_mid_imm=fg_scanout_mid_held=fg_scanout_mid_calib=fg_scanout_mid_wait=fg_scanout_mid_forced=0;
+  memset(fg_scanout_mid_hist,0,sizeof(fg_scanout_mid_hist));memset(fg_scanout_mid_g1,0,sizeof(fg_scanout_mid_g1));fg_scanout_mid_block_t=0;
+  intf[0x29c/4]=0x40004;intf[0x298/4]=(7u<<16)|0x960;
+  fg_scanout_mid_setup();
+  assert(fg_scanout_mid_state==1 && fg_scanout_mid_old==0x40004 && intf[0x29c/4]==(0x40000u|2420));
+  #define SINCE(n) (intf[0x298/4]=(7u<<16)|(0x960u+(n)))
+  SINCE(3);assert(fg_scanout_mid_allow()==1);SINCE(0);assert(fg_scanout_mid_allow()==1);
+  SINCE(160);assert(fg_scanout_mid_allow()==1);SINCE(2420);assert(fg_scanout_mid_allow()==1);SINCE(4500);assert(fg_scanout_mid_allow()==1);
+  SINCE(100);assert(fg_scanout_mid_allow()==0 && fg_scanout_mid_wait==1);SINCE(2421);assert(fg_scanout_mid_allow()==0 && fg_scanout_mid_wait==2);
+  ticks+=2*8333+10;assert(fg_scanout_mid_allow()==1 && fg_scanout_mid_forced==1); // never blocks for more than two periods
+  SINCE(1000);assert(fg_scanout_mid_allow()==1 && !fg_scanout_mid_block_t);
+  // A START in the blocked part is refused before any register is written; in the window it is issued and verified.
+  unsigned te=10;
+  #define START_AT(n) (te++,ticks+=20000,ctl[0x1c/4]=0,intf[0x2b0/4]=2400,fg_scanout_writable=1,intf[0x298/4]=(te<<16)|(0x960u+(n)))
+  START_AT(100);assert(fuxi_gpu_scanout_publish()==2 && fg_scanout_mid_wait>=3);
+  START_AT(1000);base=ticks;probeScript=mid_script;
+  assert(fuxi_gpu_scanout_publish()==1);probeScript=0;
+  assert(fg_scanout_mid_imm==1 && fg_scanout_mid_held==0 && fg_scanout_mid_hist[3]==1 && fg_scanout_mid_state==1);
+  // The hardware keeps waiting for the TE (line does not go active): four such results restore the threshold and switch the mode off.
+  for(unsigned i=0;i<4;i++){START_AT(1000);assert(fuxi_gpu_scanout_publish()==1);}
+  assert(fg_scanout_mid_held==4 && fg_scanout_mid_state==3 && intf[0x29c/4]==0x40004 && fg_scanout_mid_hist[3]==5);
+  #undef START_AT
+  SINCE(100);assert(fg_scanout_mid_allow()==1); // off: no software block
+  #undef SINCE
+  fg_abi_mid=0;fg_scanout_mid_state=0;fg_scanout_period_us=16667;fg_scanout_panel120_active=keepP;fg_scanout_te_init=keepInit;fg_scanout_back_ready=0;
+  fg_scanout_starts=keepStarts;fg_scanout_current_match=keepMatch;fg_scanout_current_mismatch=keepMismatch;fg_scanout_te_frames=keepTe;intf[0x298/4]=keepCount;ctl[0x1c/4]=1;intf[0x2b0/4]=2400;
+ }
+}
 int main(void) {
  te_estimator_tests();
  reset();assert(fuxi_gpu_scanout_acquire()==1 && fuxi_gpu_scanout_publish()==0);
@@ -782,6 +816,7 @@ int main(void) {
  panel120_tests(panel);
  triple_tests(panel);
  double_tests(panel);
+ mid_tests(panel);
  free(source);free(panel);
  puts("PASS: actual scanout gate, delayed transfer/fence/START ordering, busy reservation, timeout/MMIO/AR fail-close, TE gate/stall fallback/window summary, full crop/alpha/tail pixel oracle");
 }
