@@ -32,11 +32,13 @@ using task_t=unsigned;using IOOptionBits=unsigned;
 constexpr task_t kernel_task=99;
 constexpr int kIOReturnSuccess=0,kIOReturnBadArgument=1,kIOReturnNoResources=2,
  kIOReturnNoMemory=3,kIOReturnBusy=4,kIOReturnIOError=5;
-constexpr unsigned kIODirectionNone=0,kIODirectionInOut=3,kIOMemoryMapperNone=8,kIOMemoryPersistent=16,
+constexpr unsigned kIODirectionNone=0,kIODirectionOut=2,kIODirectionInOut=3,kIOMapReadOnly=4096,kIOMemoryMapperNone=8,kIOMemoryPersistent=16,
  kIOMapAnywhere=32,kIOMapDefaultCache=0;
 #define bzero(p,n) memset(p,0,n)
 static task_t caller=7;
 static task_t current_task() {return caller;}
+static int roEnabled;static unsigned lastPrepareDir,lastMapRo,wireOut;
+static int fuxi_gpu_abi_roimport() {return roEnabled;}
 static unsigned descriptors,maps,completes,prepares,fail,unmaps,waits;
 static bool busy,undrained;
 static bool connected=true;
@@ -58,12 +60,14 @@ struct IOMemoryDescriptor {
  void retain() {refs++;}
  void release() {assert(refs);if(!--refs)delete this;}
  static IOMemoryDescriptor *withAddressRange(uint64_t a,uint64_t n,unsigned options,task_t task) {
-  assert(task==7 && options==(kIODirectionInOut|kIOMemoryMapperNone|kIOMemoryPersistent));
+  assert(task==7 && (options==(kIODirectionInOut|kIOMemoryMapperNone|kIOMemoryPersistent) || options==(kIODirectionOut|kIOMemoryMapperNone|kIOMemoryPersistent)));
   // Model holes, inaccessible/read-only mappings and entry allocation failure.
-  if(fail==1 || a!=0x100000)return nullptr;
+  if(fail==1 || a<0x100000)return nullptr;
+  if(fail==17 && (options&3)==kIODirectionInOut)return nullptr; // read-only region: write access refused
+  if(fail==18 && n>16384)return nullptr; // hole in the middle
   auto *m=new IOMemoryDescriptor;m->length=n;return m;
  }
- IOReturn prepare() {prepares++;if(fail==2)return kIOReturnBadArgument;wired++;return 0;}
+ IOReturn prepare(unsigned dir=kIODirectionInOut) {lastPrepareDir=dir;prepares++;if(fail==2)return kIOReturnBadArgument;wired++;return 0;}
  IOReturn complete() {assert(wired);wired--;completes++;return 0;}
  uint64_t getLength() {return fail==3?length-1:length;}
  uint64_t getPhysicalSegment(uint64_t off,IOByteCount *n,unsigned flags) {
@@ -82,7 +86,7 @@ struct IOMemoryMap {
  IOMemoryMap(IOMemoryDescriptor *m):md(m) {maps++;md->retain();}
  int wireRange(unsigned options,uint64_t off,uint64_t n) {
   assert(!off && n==md->length);
-  if(options==kIODirectionInOut) {assert(!wired);if(fail==13)return 1;wired=true;}
+  if(options==kIODirectionInOut || options==kIODirectionOut) {assert(!wired);if(fail==13)return 1;wired=true;wireOut+=options==kIODirectionOut;}
   else {assert(!options && wired);if(fail==14)return 1;wired=false;}
   return 0;
  }
@@ -91,7 +95,8 @@ struct IOMemoryMap {
  uint64_t getLength() {return fail==11?md->length-1:md->length;}
 };
 IOMemoryMap *IOMemoryDescriptor::createMappingInTask(task_t task,uint64_t a,unsigned options) {
- assert(wired && task==kernel_task && !a && options==(kIOMapAnywhere|kIOMapDefaultCache));
+ assert(wired && task==kernel_task && !a && (options&~kIOMapReadOnly)==(kIOMapAnywhere|kIOMapDefaultCache));
+ lastMapRo=!!(options&kIOMapReadOnly);
  return fail==9?nullptr:new IOMemoryMap(this);
 }
 struct IOBufferMemoryDescriptor {void release(){assert(false);}};
@@ -140,6 +145,15 @@ int main() {
  request.bytes=32768;fail=16;segLookups=0;unsigned before_=completes;
  assert(c.importHost(request,out)!=0 && segLookups==1 && !c.wired_ && !c.bos_[0].handle);empty();assert(completes==before_+1);
  fail=0;
+ // Read-only region: refused with the probe bitmap unless bit 1024 enables the read-only import.
+ out={};fail=17;roEnabled=0;assert(c.importHost(request,out)==kIOReturnNoMemory && !out.handle && !c.wired_);empty();
+ fail=18;assert(c.importHost(request,out)==kIOReturnNoMemory);empty();
+ fail=17;roEnabled=1;lastMapRo=0;wireOut=0;
+ assert(!c.importHost(request,out) && out.handle && c.bos_[0].importRo && lastPrepareDir==kIODirectionOut && lastMapRo && wireOut==1);
+ fail=0;assert(!c.drop(c.bos_[0]));empty();
+ fail=18;assert(c.importHost(request,out)==kIOReturnNoMemory);empty();
+ roEnabled=0;fail=0;lastMapRo=1;
+ assert(!c.importHost(request,out) && !c.bos_[0].importRo && lastPrepareDir==kIODirectionInOut && !lastMapRo);assert(!c.drop(c.bos_[0]));empty();
  fail=0;caller=8;assert(c.importHost(request,out)==kIOReturnBadArgument);empty();caller=7;
  c.task_=kernel_task;assert(c.importHost(request,out)==kIOReturnBadArgument);c.task_=7;
  c.wired_=FG_ABI_MAX_WIRED_BYTES-16384;assert(c.importHost(request,out)==kIOReturnNoResources);c.wired_=0;

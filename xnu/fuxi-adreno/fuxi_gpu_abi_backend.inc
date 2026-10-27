@@ -20,7 +20,7 @@ static thread_call_data_t fg_client_watchdog;
  * list. Serialize cache handoff with the same GPU lock as submit/retirement.
  * The user client owns these prepared kernel mappings until successful unmap. */
 static struct { uint64_t iova, bytes; uintptr_t source; unsigned permissions; } fg_abi_imports[FG_ABI_MAX_IMPORTS];
-static unsigned fg_abi_host_handoff, fg_abi_ncimport, fg_abi_unstick, fg_abi_cohtest, fg_abi_tlbpages, fg_abi_mapwait, fg_abi_queue;
+static unsigned fg_abi_host_handoff, fg_abi_ncimport, fg_abi_unstick, fg_abi_cohtest, fg_abi_tlbpages, fg_abi_mapwait, fg_abi_queue, fg_abi_roimport, fg_abi_pace;
 /* Queue mode (bit 512): jobs in flight are seq-completed, at most this many; stats: queued, deepest chain, refused for a waiting present, refused full. */
 #define FG_ABI_QUEUE_MAX 4u
 static uint32_t fg_abi_q_stats[4];
@@ -344,7 +344,7 @@ static int fg_abi_init(void)
 {
  unsigned bits=0;
  (void)PE_parse_boot_argn("fuxigpuncimport",&bits,sizeof(bits));
- fg_abi_ncimport=bits&1; fg_wptr_fence=(bits>>1)&1; fg_abi_unstick=(bits>>2)&1; fg_abi_cohtest=(bits>>6)&1; fg_abi_tlbpages=(bits>>7)&1; fg_abi_mapwait=(bits>>8)&1; fg_abi_queue=(bits>>9)&1; fg_abi_present_wait=0; memset(fg_abi_q_stats,0,sizeof(fg_abi_q_stats));
+ fg_abi_ncimport=bits&1; fg_wptr_fence=(bits>>1)&1; fg_abi_unstick=(bits>>2)&1; fg_abi_cohtest=(bits>>6)&1; fg_abi_tlbpages=(bits>>7)&1; fg_abi_mapwait=(bits>>8)&1; fg_abi_queue=(bits>>9)&1; fg_abi_roimport=(bits>>10)&1; fg_abi_pace=(bits>>11)&1; fg_abi_present_wait=0; memset(fg_abi_q_stats,0,sizeof(fg_abi_q_stats));
  fg_abi_coh=fg_abi_coh_tries=0;
  for (unsigned i=0;i<sizeof(fg_abi_used)/sizeof(fg_abi_used[0]);i++) fg_abi_used[i]=0;
  /* 772 4K pages: root, two L2s, kernel runtime L3, 768 client L3s.
@@ -718,6 +718,8 @@ int fuxi_gpu_abi_poll(uint64_t fence)
  return fence<=fg_abi_completed ? 0 : 1;
 }
 int fuxi_gpu_abi_queue_enabled(void) { FG_GUARD; return fg_abi_queue; }
+int fuxi_gpu_abi_roimport(void) { FG_GUARD; return fg_abi_roimport; }
+int fuxi_gpu_abi_pace(void) { FG_GUARD; return fg_abi_pace; }
 void fuxi_gpu_abi_queue_stats(uint32_t q[4]) { FG_GUARD; memcpy(q,fg_abi_q_stats,sizeof(fg_abi_q_stats)); }
 /* Window counters for the SWEET FB stats line (fuxi_gpu_abi_stats_log); a snapshot, not reset. */
 void fuxi_gpu_abi_sched_stats(uint32_t ibs[4], uint32_t wptr[4], uint32_t stall[8])

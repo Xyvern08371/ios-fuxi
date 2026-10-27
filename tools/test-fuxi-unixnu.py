@@ -347,6 +347,8 @@ static unsigned abiStatsLogs;
 static void fuxi_gpu_abi_stats_log(void) {abiStatsLogs++;}
 static unsigned abiSchedLogs;
 static void fuxi_gpu_abi_sched_log(void) {abiSchedLogs++;}
+static int abiPace;
+static int fuxi_gpu_abi_pace(void) {return abiPace;}
 struct OSArray {
  std::vector<void *> objects;
  unsigned getCount(){return objects.size();}

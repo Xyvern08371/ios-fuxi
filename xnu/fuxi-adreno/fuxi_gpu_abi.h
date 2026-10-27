@@ -29,6 +29,8 @@ int fuxi_gpu_abi_available(void);
 void fuxi_gpu_abi_sched_stats(uint32_t ibs[4], uint32_t wptr[4], uint32_t stall[8]);
 /* fuxigpuncimport bit 512: submits queue behind a running job (in-order ring, one TTBR switch per chain). */
 int fuxi_gpu_abi_queue_enabled(void);
+int fuxi_gpu_abi_roimport(void);
+int fuxi_gpu_abi_pace(void);
 /* Queued submits, deepest chain, queue refusals for a waiting present, refusals for a full chain/ring. */
 void fuxi_gpu_abi_queue_stats(uint32_t q[4]);
 void fuxi_gpu_abi_publish(void);

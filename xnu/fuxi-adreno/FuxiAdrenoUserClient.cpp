@@ -97,6 +97,7 @@ class FuxiAdrenoUserClient : public IOUserClient {
   IOBufferMemoryDescriptor *memory;
   IOMemoryDescriptor *importMemory;
   IOMemoryMap *importMap;
+  bool importRo;
   FuxiAdrenoBoView *view;
   uint64_t handle, bytes, allocated, iova;
   uint32_t token, leases, metadataBytes;
@@ -294,8 +295,21 @@ class FuxiAdrenoUserClient : public IOUserClient {
   if (!b) return refuse(3,kIOReturnNoResources,0);
   IOMemoryDescriptor *memory=IOMemoryDescriptor::withAddressRange(r.address,r.bytes,
       kIODirectionInOut|kIOMemoryMapperNone|kIOMemoryPersistent,task_);
-  if (!memory) return refuse(4,kIOReturnNoMemory,0);
-  if (memory->prepare()!=kIOReturnSuccess) { memory->release(); return refuse(5,kIOReturnBadArgument,0); }
+  bool ro=false;
+  if (!memory) {
+   /* withAddressRange hides the VM error (memory entry creation: hole, read-only or max-protection mismatch).
+    * Probe with the same flags: detail bit0 first page, bit1 last page, bit2 whole range read-only (kIODirectionOut). */
+   uint64_t detail=0, page=NativeAdrenoAbiHostPageBytes, flags=kIOMemoryMapperNone|kIOMemoryPersistent;
+   IOMemoryDescriptor *p=IOMemoryDescriptor::withAddressRange(r.address,page,kIODirectionInOut|flags,task_);
+   if (p) { detail|=1; p->release(); }
+   p=IOMemoryDescriptor::withAddressRange(r.address+r.bytes-page,page,kIODirectionInOut|flags,task_);
+   if (p) { detail|=2; p->release(); }
+   if (fuxi_gpu_abi_roimport()) memory=IOMemoryDescriptor::withAddressRange(r.address,r.bytes,kIODirectionOut|flags,task_);
+   else { p=IOMemoryDescriptor::withAddressRange(r.address,r.bytes,kIODirectionOut|flags,task_); if (p) { detail|=4; p->release(); } }
+   if (!memory) return refuse(4,kIOReturnNoMemory,detail);
+   ro=true;
+  }
+  if (memory->prepare(ro ? kIODirectionOut : kIODirectionInOut)!=kIOReturnSuccess) { memory->release(); return refuse(5,kIOReturnBadArgument,0); }
   bool valid=memory->getLength()==r.bytes;
   uint64_t why=valid ? 0 : (6ULL<<56);
   /* One segment lookup per physical run (UniXNU Adreno740 pattern); the cache-class predicate stays per 16K page. */
@@ -310,17 +324,17 @@ class FuxiAdrenoUserClient : public IOUserClient {
     if (!fuxi_adreno_host_page_ok(pa+k)) { valid=false; why=(7ULL<<56)|(off+k); break; }
   }
   // DefaultCache inherits the memory entry's actual policy (WB or Normal NC).
-  IOMemoryMap *mapping=valid ? memory->createMappingInTask(kernel_task,0,kIOMapAnywhere|kIOMapDefaultCache) : nullptr;
+  IOMemoryMap *mapping=valid ? memory->createMappingInTask(kernel_task,0,kIOMapAnywhere|kIOMapDefaultCache|(ro ? kIOMapReadOnly : 0)) : nullptr;
   if (!mapping || !mapping->getVirtualAddress() || mapping->getLength()!=r.bytes) {
    if (mapping) mapping->release();
    memory->complete(); memory->release(); return refuse(valid ? 8 : (why>>56),kIOReturnBadArgument,why&((1ULL<<56)-1));
   }
   // Fault/wire the kernel alias as well: pmap lookup and watchdog cache
   // maintenance must never depend on a pageable/demand-faulted KVA mapping.
-  if (mapping->wireRange(kIODirectionInOut,0,r.bytes)!=kIOReturnSuccess) {
+  if (mapping->wireRange(ro ? kIODirectionOut : kIODirectionInOut,0,r.bytes)!=kIOReturnSuccess) {
    mapping->release(); memory->complete(); memory->release(); return refuse(9,kIOReturnNoMemory,0);
   }
-  b->importMemory=memory; b->importMap=mapping; b->bytes=b->allocated=r.bytes;
+  b->importMemory=memory; b->importMap=mapping; b->importRo=ro; b->bytes=b->allocated=r.bytes;
   b->handle=nextHandle_++; wired_+=r.bytes; out.handle=b->handle;
   bound(*b);
   return kIOReturnSuccess;
@@ -374,7 +388,7 @@ class FuxiAdrenoUserClient : public IOUserClient {
    uint64_t tMap=mach_absolute_time(), tTry;
    do {
     tTry=mach_absolute_time();
-    s=b->importMemory ? fuxi_gpu_abi_map_import(r.iova,b->importMap->getVirtualAddress(),b->bytes,r.permissions) :
+    s=b->importMemory ? fuxi_gpu_abi_map_import(r.iova,b->importMap->getVirtualAddress(),b->bytes,b->importRo ? r.permissions&~2u : r.permissions) :
         fuxi_gpu_abi_map(r.iova,(uintptr_t)b->memory->getBytesNoCopy(),b->bytes,r.permissions,r.writeback,r.shareability);
     if (s!=1 || mach_absolute_time()>=deadline) break;
     abiPause();
