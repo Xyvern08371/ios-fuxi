@@ -68,8 +68,9 @@ enum {
  * row is 256-aligned (all its own surfaces are). MaterialKit snapshot surfaces ask
  * for CGBitmapGetAlignedBytesPerRow (32-byte) rows, so CARenderServerSnapshot
  * left them unrendered and the opaque App Library background stayed black.
- * Explicit rows are a minimum (clients query the row back); sweetsurfrow=0 keeps
- * the requested value. */
+ * Explicit rows are a minimum (clients query the row back), and the allocation
+ * covers the height padded to 4 rows that a Turnip linear import requires;
+ * sweetsurfrow=0 keeps the requested layout. */
 #define SWEET_SURFACE_GPU_ROW_ALIGN     256
 #define SWEET_SURFACE_TIMESTAMPS        0x800   /* offset in the state page */
 #define SWEET_SURFACE_STATE_USE         0x18
@@ -601,11 +602,16 @@ sweet_surface_layout(SweetSurface *s, OSDictionary *props)
 	if (s->bytesPerRow < (uint64_t)sweet_div_up(s->width, s->elementWidth) * s->bytesPerElement) {
 		return kIOReturnBadArgument;
 	}
-	if (s->bytesPerElement == 4 && props->getObject("IOSurfacePlaneInfo") == NULL &&
-	    (s->bytesPerRow & (SWEET_SURFACE_GPU_ROW_ALIGN - 1)) != 0 && sweet_surface_gpu_rows()) {
-		s->bytesPerRow = (s->bytesPerRow + SWEET_SURFACE_GPU_ROW_ALIGN - 1) & ~(uint32_t)(SWEET_SURFACE_GPU_ROW_ALIGN - 1);
+	uint32_t rows = sweet_div_up(s->height, s->elementHeight);
+	if (s->bytesPerElement == 4 && props->getObject("IOSurfacePlaneInfo") == NULL && sweet_surface_gpu_rows()) {
+		if ((s->bytesPerRow & (SWEET_SURFACE_GPU_ROW_ALIGN - 1)) != 0) {
+			s->bytesPerRow = (s->bytesPerRow + SWEET_SURFACE_GPU_ROW_ALIGN - 1) & ~(uint32_t)(SWEET_SURFACE_GPU_ROW_ALIGN - 1);
+		}
+		/* Turnip sizes a linear image's last level for a height padded to 4 rows
+		 * (blit over-fetch), so a 1065x282 import needs 284 rows of memory. */
+		rows = (rows + 3) & ~3u;
 	}
-	end = (uint64_t)s->offset + (uint64_t)s->bytesPerRow * sweet_div_up(s->height, s->elementHeight);
+	end = (uint64_t)s->offset + (uint64_t)s->bytesPerRow * rows;
 
 	OSArray *planes = OSDynamicCast(OSArray, props->getObject("IOSurfacePlaneInfo"));
 	s->planeCount = 0;
