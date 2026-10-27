@@ -814,7 +814,7 @@ int fuxi_gpu_copy(unsigned slot, uint64_t generation, uintptr_t source, uint64_t
  fg_magic = magic;
  fg_submit_time = mach_absolute_time();
  fg_scanout_stamps.submitted = fg_submit_time; fg_scanout_stamps.fence = 0;
- fg_busy = 1;
+ fg_busy = 1; fg_abi_present_wait = 0; /* the copy owns the GPU now; the client hold (bit 4096) ends */
  return 2; /* submitted; source is owned until poll retires this fence */
 }
 #include "fuxi_gpu_abi_backend.inc"

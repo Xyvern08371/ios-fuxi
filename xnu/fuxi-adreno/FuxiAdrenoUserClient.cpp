@@ -636,8 +636,8 @@ extern "C" void fuxi_gpu_abi_sched_log(void)
  uint32_t ibs[4], wptr[4], stall[8];
  fuxi_gpu_abi_sched_stats(ibs,wptr,stall);
  if (!ibs[0]) return;
- uint32_t q[4]; fuxi_gpu_abi_queue_stats(q);
- if (q[0] || q[2] || q[3]) IOLog("FUXI GPU ABI: queue queued %u deepest %u refused present %u full %u\n",q[0],q[1],q[2],q[3]);
+ uint32_t q[6]; fuxi_gpu_abi_queue_stats(q);
+ if (q[0] || q[2] || q[3] || q[4] || q[5]) IOLog("FUXI GPU ABI: queue queued %u deepest %u refused present %u full %u held %u hold_expired %u\n",q[0],q[1],q[2],q[3],q[4],q[5]);
  IOLog("FUXI GPU ABI: submits %u ibs %u max %u over16 %u peak_bos %u wptr writes %u dropped %u repeated %u stuck %u stall kicks %u drains %u acks %u/%u kick_ok %u drain_ok %u snaps %u\n",
      ibs[0],ibs[1],ibs[2],ibs[3],peakBos,wptr[0],wptr[1],wptr[2],wptr[3],stall[0],stall[2],stall[3],stall[4],stall[5],stall[6],stall[7]);
 }

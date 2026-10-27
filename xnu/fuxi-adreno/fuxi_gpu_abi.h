@@ -32,7 +32,7 @@ int fuxi_gpu_abi_queue_enabled(void);
 int fuxi_gpu_abi_roimport(void);
 int fuxi_gpu_abi_pace(void);
 /* Queued submits, deepest chain, queue refusals for a waiting present, refusals for a full chain/ring. */
-void fuxi_gpu_abi_queue_stats(uint32_t q[4]);
+void fuxi_gpu_abi_queue_stats(uint32_t q[6]);
 void fuxi_gpu_abi_publish(void);
 #ifdef __cplusplus
 }

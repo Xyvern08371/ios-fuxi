@@ -561,7 +561,7 @@ int main(void) {
  }
  /* Queue mode (fuxigpuncimport 512): a submit behind a running client job appends to the in-order ring. */
  {
-  uint64_t sz[1]={4096},ad[1]={va},f1=0,f2=0,f3=0,f4=0,v2=0x30100000;uint32_t q[4];
+  uint64_t sz[1]={4096},ad[1]={va},f1=0,f2=0,f3=0,f4=0,v2=0x30100000;uint32_t q[6];
   uint32_t ttbrG=(uint32_t)G3_PT,ttbrC=(uint32_t)FG_ABI_PT;
   #define QSTART() do { seed();ncimportArg=512;assert(fg_abi_init() && fg_abi_queue && fuxi_gpu_abi_queue_enabled());assert(!fuxi_gpu_abi_map(va,source,bytes,3,0,2)); } while(0)
   #define DONE_UP_TO(n) g_wr(G3_FENCE_PA,FG_ABI_FENCE_OFF+4,(n))
@@ -601,6 +601,19 @@ int main(void) {
   assert(fuxi_gpu_abi_submit(ad,sz,1,&f2)==1);fuxi_gpu_abi_queue_stats(q);assert(q[2]==1 && fg_abi_seq==1);
   complete();assert(!fuxi_gpu_abi_poll(1) && !fg_client_busy && !fg_abi_present_wait && sregs[(g_cb(g3_bank)+0x20)/4]==ttbrG);
   assert(!fuxi_gpu_abi_submit(ad,sz,1,&f2) && f2==2);
+  /* Present hold (bit 4096): the waiting present keeps the idle GPU after the chain retires; the copy ends the hold, 4 ms bounds it. */
+  seed();ncimportArg=512|4096;assert(fg_abi_init() && fg_abi_queue && fg_abi_hold);assert(!fuxi_gpu_abi_map(va,source,bytes,3,0,2));
+  assert(!fuxi_gpu_abi_submit(ad,sz,1,&f1) && !fuxi_gpu_abi_submit(ad,sz,1,&f2));fg_abi_present_wait=1;
+  assert(fuxi_gpu_abi_submit(ad,sz,1,&f3)==1);fuxi_gpu_abi_queue_stats(q);assert(q[4]==1 && fg_abi_seq==2);
+  DONE_UP_TO(1);assert(fuxi_gpu_abi_poll(2)==1 && fg_abi_present_wait);
+  complete();assert(!fuxi_gpu_abi_poll(2) && !fg_client_busy && fg_abi_present_wait && sregs[(g_cb(g3_bank)+0x20)/4]==ttbrG); /* idle, hold kept */
+  assert(fuxi_gpu_abi_submit(ad,sz,1,&f3)==1);fuxi_gpu_abi_queue_stats(q);assert(q[4]==2 && fg_abi_seq==2);
+  fg_abi_present_wait=0;assert(!fuxi_gpu_abi_submit(ad,sz,1,&f3) && f3==3); /* the copy was submitted: clients flow again */
+  complete();assert(!fuxi_gpu_abi_poll(3));
+  fg_abi_present_wait=1;ticks+=1000;assert(fuxi_gpu_abi_submit(ad,sz,1,&f4)==1);
+  ticks+=4001;assert(!fuxi_gpu_abi_submit(ad,sz,1,&f4) && f4==4 && !fg_abi_present_wait);fuxi_gpu_abi_queue_stats(q);assert(q[5]==1); /* the present went away */
+  complete();assert(!fuxi_gpu_abi_poll(4));
+  /* Without the bit the flag still clears at retirement. */
   QSTART();
   assert(!fuxi_gpu_abi_submit(ad,sz,1,&f1) && !fuxi_gpu_abi_submit(ad,sz,1,&f2));
   fg_busy=1;assert(fuxi_gpu_abi_submit(ad,sz,1,&f3)==1);fg_busy=0;fg_scanout_reserved=1;assert(fuxi_gpu_abi_submit(ad,sz,1,&f3)==1);fg_scanout_reserved=0;
