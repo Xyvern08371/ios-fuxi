@@ -1054,7 +1054,7 @@ public:
       if(src->format!=dst->format)throw std::runtime_error("texture copy format mismatch");
       // Snapshot all same-image/memory copies, including disjoint rectangles and
       // view-relative mips. Never issue an overlapping vkCmdCopyImage.
-      aliasCopies[n]=src==dst || src->memory==dst->memory || hostRangesOverlap(src->mapped,src->allocated,dst->mapped,dst->allocated);
+      aliasCopies[n]=src==dst || memoryAlias(src,dst) || hostRangesOverlap(src->mapped,src->allocated,dst->mapped,dst->allocated);
       if(aliasCopies[n])aliasBytes=std::max(aliasBytes,width*height*depth*pixel);
      }
      auto *transferBuffer=op.upload?op.src:op.sourceTexture?nullptr:op.dst;
