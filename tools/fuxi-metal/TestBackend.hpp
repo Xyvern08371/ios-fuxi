@@ -20,7 +20,7 @@
 #include "DrawSafety.hpp"
 #include "BackboardGate.hpp"
 namespace fuxi {
-struct Buffer {void *contents;size_t length,allocated;bool upload=false;};
+struct Buffer {void *contents;size_t length,allocated;bool upload=false;void *shadowKey() const{return contents;}};
 struct PrepareWrite {Buffer *buffer;uint64_t offset,bytes;};
 struct Texture : TextureLevels {size_t allocated{},charged{};uint32_t format=80;Buffer *backingBuffer{};size_t backingOffset{},backingRow{};bool shadow=false;std::vector<uint8_t> pixels{};
  size_t offset(uint32_t level) const {size_t o=0;for(uint32_t l=0;l<level;++l)o+=levelWidth(l)*levelHeight(l)*levelDepth(l)*metalTexelBytes(format);return o;}
