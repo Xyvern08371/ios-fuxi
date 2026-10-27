@@ -399,7 +399,7 @@
   }
   IOReturn drop(Bo &b) {
    if (b.iova) {
-@@ -93,50 +215,61 @@
+@@ -93,50 +215,62 @@
     b.view->release(); /* view owns the matched prepare + backing retain */
     b.memory->release();
    }
@@ -419,10 +419,14 @@
    if (!b) return kIOReturnNoResources;
    uint64_t mask=((UINT64_C(1)<<FG_ABI_PA_BITS)-1)&~((UINT64_C(1)<<r.align_log2)-1);
    IOOptionBits options=kIODirectionInOut|kIOMemoryMapperNone|kIOMemoryKernelUserShared|kIOMapWriteCombineCache;
-   /* Contiguous-first, with a wired scattered fallback unless required. */
+-  /* Contiguous-first, with a wired scattered fallback unless required. */
+-  IOBufferMemoryDescriptor *memory=IOBufferMemoryDescriptor::inTaskWithPhysicalMask(
+-      kernel_task,options|kIOMemoryPhysicallyContiguous,allocated,mask);
++  /* Contiguous-first only when required or at most 1 MiB: a failed large contiguous search scans all
++   * of RAM and runs zone_gc (observed 50-58 ms per attempt), and nothing maps large GPU pages. */
 +  uint64_t tMem=mach_absolute_time();
-   IOBufferMemoryDescriptor *memory=IOBufferMemoryDescriptor::inTaskWithPhysicalMask(
-       kernel_task,options|kIOMemoryPhysicallyContiguous,allocated,mask);
++  IOBufferMemoryDescriptor *memory=r.contiguous || allocated<=FG_ABI_CONTIG_TRY_BYTES ?
++      IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,options|kIOMemoryPhysicallyContiguous,allocated,mask) : NULL;
    if (!memory && !r.contiguous) memory=IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,options,allocated,mask);
    if (!memory) return kIOReturnNoMemory;
    if (memory->prepare()!=kIOReturnSuccess) { memory->release(); return kIOReturnNoMemory; }
@@ -476,7 +480,7 @@
    out.handle=b->handle;
    return kIOReturnSuccess;
   }
-@@ -144,36 +277,70 @@
+@@ -144,36 +278,70 @@
    * COW resolution, before wiring. Never translate a user VA with kernel_pmap,
    * change its WIMG/cache mode, or manufacture a physical descriptor alias. */
   IOReturn importHost(const NativeAdrenoAbiBoImport &r, NativeAdrenoAbiBoAllocReply &out) {
@@ -563,7 +567,7 @@
    return kIOReturnSuccess;
   }
   IOReturn run(unsigned method, const void *in, void *out) {
-@@ -188,7 +355,15 @@
+@@ -188,7 +356,15 @@
     return kIOReturnSuccess;
    }
    if (method==NativeAdrenoMethodWaitFence) {
@@ -580,7 +584,7 @@
    }
    if (method==NativeAdrenoMethodBoCpuUnmap) {
     const auto &r=*static_cast<const NativeAdrenoAbiBoCpuUnmap *>(in);
-@@ -214,12 +389,19 @@
+@@ -214,12 +390,19 @@
      return kIOReturnBadArgument;
     uint64_t deadline; clock_interval_to_deadline(150,NSEC_PER_MSEC,&deadline);
     int s;
@@ -602,7 +606,7 @@
     if (s) return s==1 ? kIOReturnBusy : kIOReturnBadArgument;
     b->iova=r.iova; static_cast<NativeAdrenoAbiBoMapReply *>(out)->iova=r.iova; return kIOReturnSuccess;
    }
-@@ -231,9 +413,12 @@
+@@ -231,9 +414,12 @@
    }
    if (method==NativeAdrenoMethodSubmit) {
     const auto &r=*static_cast<const NativeAdrenoAbiSubmit *>(in);
@@ -618,7 +622,7 @@
     for (unsigned i=0;i<r.buffer_count;i++) {
      const auto &ib=r.buffers[i]; Bo *b=find(ib.handle);
      if (!b || !b->iova || !fg_abi_ib_valid(b->iova,b->bytes,ib.iova,ib.bytes)) return kIOReturnBadArgument;
-@@ -246,7 +431,7 @@
+@@ -246,7 +432,7 @@
      if (!s) { if (!firstFence_) firstFence_=fence; lastFence_=fence; static_cast<NativeAdrenoAbiSubmitReply *>(out)->fence=fence; return kIOReturnSuccess; }
      if (s<0) return kIOReturnIOError;
      if (mach_absolute_time()>=deadline) return kIOReturnBusy;
@@ -627,7 +631,7 @@
     }
    }
    if (method==NativeAdrenoMethodSetMetadata || method==NativeAdrenoMethodGetMetadata) {
-@@ -254,8 +439,9 @@
+@@ -254,8 +440,9 @@
     if (!b || r.reserved || r.bytes>64) return kIOReturnBadArgument;
     if (method==NativeAdrenoMethodSetMetadata) { bcopy(r.text,b->metadata,r.bytes); b->metadataBytes=r.bytes; }
     else {
@@ -638,7 +642,7 @@
      bcopy(b->metadata,reply.text,reply.bytes);
     }
     return kIOReturnSuccess;
-@@ -277,25 +463,45 @@
+@@ -277,25 +464,45 @@
   bool initWithTask(task_t task, void *securityID, UInt32 type) override {
    if (!IOUserClient::initWithTask(task,securityID,type)) return false;
    task_=task; task_reference(task_);
@@ -689,7 +693,7 @@
   }
   IOReturn clientMemoryForType(UInt32 token, IOOptionBits *options, IOMemoryDescriptor **memory) override {
    if (!options || !memory) return kIOReturnBadArgument;
-@@ -304,7 +510,9 @@
+@@ -304,7 +511,9 @@
    if (live_) for (auto &b:bos_) if (b.handle && b.token==token && b.leases) {
     b.view->retain(); *memory=b.view; *options=kIOMapAnywhere|kIOMapWriteCombineCache; break;
    }
@@ -700,7 +704,7 @@
   }
   IOReturn clientClose() override {
    if (!lock_) return kIOReturnSuccess;
-@@ -321,24 +529,40 @@
+@@ -321,24 +530,40 @@
     IOLockLock(openLock); connected=false; IOLockUnlock(openLock);
    }
    IOLockUnlock(lock_);
@@ -744,7 +748,7 @@
    if (!handler) return kIOReturnBadArgument;
    *handler=nullptr;
    if (type!=0x4147 && type!=0) return kIOReturnUnsupported;
-@@ -351,10 +575,40 @@
+@@ -351,10 +576,40 @@
    *handler=uc; return kIOReturnSuccess;
   }
  };
@@ -787,7 +791,7 @@
   auto *service=new NativeAdrenoGpuPublished;
   if (!openLock || !service) { if (service) service->release(); return; }
   if (!service->init() || !service->attach(IOService::getPlatform()) || !service->start(IOService::getPlatform())) {
-@@ -362,7 +616,29 @@
+@@ -362,7 +617,29 @@
   }
   service->setName("NativeAdrenoGpu");
   service->setProperty("NativeAdrenoABI",(uint64_t)NativeAdrenoAbiVersion,32);

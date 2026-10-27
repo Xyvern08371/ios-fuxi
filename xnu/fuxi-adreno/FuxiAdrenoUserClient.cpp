@@ -228,10 +228,11 @@ class FuxiAdrenoUserClient : public IOUserClient {
   if (!b) return kIOReturnNoResources;
   uint64_t mask=((UINT64_C(1)<<FG_ABI_PA_BITS)-1)&~((UINT64_C(1)<<r.align_log2)-1);
   IOOptionBits options=kIODirectionInOut|kIOMemoryMapperNone|kIOMemoryKernelUserShared|kIOMapWriteCombineCache;
-  /* Contiguous-first, with a wired scattered fallback unless required. */
+  /* Contiguous-first only when required or at most 1 MiB: a failed large contiguous search scans all
+   * of RAM and runs zone_gc (observed 50-58 ms per attempt), and nothing maps large GPU pages. */
   uint64_t tMem=mach_absolute_time();
-  IOBufferMemoryDescriptor *memory=IOBufferMemoryDescriptor::inTaskWithPhysicalMask(
-      kernel_task,options|kIOMemoryPhysicallyContiguous,allocated,mask);
+  IOBufferMemoryDescriptor *memory=r.contiguous || allocated<=FG_ABI_CONTIG_TRY_BYTES ?
+      IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,options|kIOMemoryPhysicallyContiguous,allocated,mask) : NULL;
   if (!memory && !r.contiguous) memory=IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,options,allocated,mask);
   if (!memory) return kIOReturnNoMemory;
   if (memory->prepare()!=kIOReturnSuccess) { memory->release(); return kIOReturnNoMemory; }

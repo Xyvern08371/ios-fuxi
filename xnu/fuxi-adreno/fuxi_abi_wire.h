@@ -12,6 +12,7 @@
 /* Internal quotas, independent of the unchanged per-object wire limit. */
 #define FG_ABI_MAX_BOS 1024u
 #define FG_ABI_MAX_WIRED_BYTES (UINT64_C(768) << 20)
+#define FG_ABI_CONTIG_TRY_BYTES (UINT64_C(1) << 20)
 #define FG_ABI_MAX_IMPORTS 512u
 /* Exact direct-selector wire lengths. */
 static inline unsigned fg_abi_input_size(unsigned method)

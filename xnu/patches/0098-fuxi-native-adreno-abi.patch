@@ -3290,7 +3290,7 @@
 +#endif
 --- a/bsd/dev/fuxi_abi_wire.h
 +++ b/bsd/dev/fuxi_abi_wire.h
-@@ -0,0 +1,125 @@
+@@ -0,0 +1,126 @@
 +/* SPDX-License-Identifier: MIT
 + * A7xx framing adapted from UniXNU NativeAdrenoRing.cpp.
 + * Copyright (c) 2026 NativeAdreno contributors. See LICENSE.NativeAdreno.
@@ -3305,6 +3305,7 @@
 +/* Internal quotas, independent of the unchanged per-object wire limit. */
 +#define FG_ABI_MAX_BOS 1024u
 +#define FG_ABI_MAX_WIRED_BYTES (UINT64_C(768) << 20)
++#define FG_ABI_CONTIG_TRY_BYTES (UINT64_C(1) << 20)
 +#define FG_ABI_MAX_IMPORTS 512u
 +/* Exact direct-selector wire lengths. */
 +static inline unsigned fg_abi_input_size(unsigned method)
@@ -3664,7 +3665,7 @@
 +#endif
 --- a/iokit/Kernel/arm/fuxi_abi_wire.h
 +++ b/iokit/Kernel/arm/fuxi_abi_wire.h
-@@ -0,0 +1,125 @@
+@@ -0,0 +1,126 @@
 +/* SPDX-License-Identifier: MIT
 + * A7xx framing adapted from UniXNU NativeAdrenoRing.cpp.
 + * Copyright (c) 2026 NativeAdreno contributors. See LICENSE.NativeAdreno.
@@ -3679,6 +3680,7 @@
 +/* Internal quotas, independent of the unchanged per-object wire limit. */
 +#define FG_ABI_MAX_BOS 1024u
 +#define FG_ABI_MAX_WIRED_BYTES (UINT64_C(768) << 20)
++#define FG_ABI_CONTIG_TRY_BYTES (UINT64_C(1) << 20)
 +#define FG_ABI_MAX_IMPORTS 512u
 +/* Exact direct-selector wire lengths. */
 +static inline unsigned fg_abi_input_size(unsigned method)
