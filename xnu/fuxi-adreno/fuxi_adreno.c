@@ -693,6 +693,30 @@ static void fg_clean(uintptr_t source, unsigned pitch, unsigned sx, unsigned sy,
  }
  if (end) CleanPoC_DcacheRegion_Force(begin, end-begin);
 }
+/* CP_RB_WPTR as a fenced register write (NativeAdreno Adreno740 NativeAdrenoRing::writeWptr, MIT). The GMU drops a CPU write to a GPU
+ * register that arrives while the GPU domain is not ready and flags it in GMU_AHB_FENCE_STATUS (0x23b13, bit 0; _CLR at 0x23b14, written
+ * 7). Their i491 saw a fence stall on nearly every submission until WPTR was written again. Opt-in (fuxigpuncimport bit 1): one GMU
+ * read per doorbell, then the same value again (at most 200 times). Default off: the plain write, as before. Not yet observed on device. */
+#define FG_GMU_AHB_FENCE_STATUS (GPU_GMU_CORE+0x9313*4)
+#define FG_GMU_AHB_FENCE_CLR (GPU_GMU_CORE+0x9314*4)
+static unsigned fg_wptr_fence;
+static unsigned fg_wptr_stats[4]; /* writes, writes dropped at least once, repeated writes, writes still dropped after 200 tries */
+static int fg_ring_doorbell(void)
+{
+ fg_wptr_stats[0]++;
+ if (!g3_gw(0x807, g3_wptr)) return 0;
+ if (!fg_wptr_fence) return 1;
+ for (unsigned tries = 0;; tries++) {
+  __asm__ volatile("dsb sy" ::: "memory");
+  uint32_t status = g3_read(FG_GMU_AHB_FENCE_STATUS);
+  if (fg_access_failed) return 0;
+  if (!(status & 1)) { if (tries) fg_wptr_stats[1]++; return 1; }
+  if (!g3_write(FG_GMU_AHB_FENCE_CLR, 7)) return 0;
+  if (tries == 200) { fg_wptr_stats[3]++; return 1; }
+  fg_wptr_stats[2]++;
+  if (!g3_gw(0x807, g3_wptr)) return 0;
+ }
+}
 /* Called once per display tick; never sleeps, spins for completion or submits.
  * A completed fence wins over a late timer/deadline. */
 int fuxi_gpu_poll(struct fg_times *t)
@@ -772,7 +796,7 @@ int fuxi_gpu_copy(unsigned slot, uint64_t generation, uintptr_t source, uint64_t
  __asm__ volatile("dsb sy" ::: "memory");
  fg_deadline = rsr("cntpct_el0") + rsr("cntfrq_el0")/10; /* six ticks */
  fg_dcvs_kick();
- if (!g3_gw(0x807, g3_wptr)) err = 0x602;
+ if (!fg_ring_doorbell()) err = 0x602;
  if (fg_force == 2) err = 0x6ff;
  t->submit += mach_absolute_time()-start;
  if (err || fg_access_failed) {

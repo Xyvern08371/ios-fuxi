@@ -521,3 +521,42 @@ newer than our pinned `fb6aad6`, BSD-2-Clause-Patent. Checked against metal2vulk
 | OS-image shader priming, linked visible functions, zeroed constants | Not ported. It needs compute pipelines, function constants, linked functions and libraries over 4 MiB, which `Frontend.mm` refuses by design; it also spends CPU on all 166 OS libraries while frames run. `fuxigpucache=1` already persists the artifacts and Vulkan pipeline cache of pipelines actually used. A future seeding pass should replay recorded pipeline descriptors instead. |
 
 Test: `tools/test-fuxi-patch-stack.py`.
+
+## Adreno740 2026-10-24..26 submission and ring port
+
+Offline port of the recent Adreno740 (`NativeAdreno`, MIT) submission and ring
+work into `xnu/fuxi-adreno/`, synchronized into 0098/0100/0106 by the sync
+tools. The upstream history could not be read in this session (only its current
+files), so the commits below are named by subject and file; record exact hashes
+at the next authorized review. No device was touched: every device effect is
+**not yet observed**.
+
+| Source (repo `Adreno740`, MIT, path) | Result |
+| --- | --- |
+| `NativeAdrenoHandleIndex.h` ("find objects through a handle index") | Adapted as `FuxiHandleIndex.h` (header and `LICENSE.NativeAdreno` kept). The user client looked a BO up by walking all 1024 slots for every selector and every IB; it now uses an open-addressing index (2048 cells, backward-shift delete) plus a free-slot hint. Slot choice is unchanged (lowest free). The BO cap stays 1024; the `peak_bos` log field says whether it must grow. |
+| "a whole frame of up to 128 IBs in one submission" | Applied. `NativeAdrenoAbiMaxBuffers` 16 -> 128, `NativeAdrenoAbiSubmit` 3104 bytes, `FG_ABI_FRAME_WORDS` 581. Because the backend resets the CP context every submit, a frame split into chunks of 16 lost state between them; one record keeps it atomic. Turnip is built against this header (`-Dtu-darwin-abi-dir`), so the upstream KMD chunking and `mesa-fuxi-smoke.patch` (which refuses `total > NativeAdrenoAbiMaxBuffers`) follow the new constant with no patch change. The kernel image and the root's libvulkan are updated separately, so the old 416-byte record (up to 16 IBs) is still accepted for method 5 only; any other size is refused. |
+| "write WPTR as a fenced register and keep the ring's register window alive" | Fenced write applied, opt-in `fuxigpuncimport` bit 1 (value 2). After writing CP_RB_WPTR, read GMU `AHB_FENCE_STATUS` (dword 0x23b13, bit 0); if set, write `_CLR` (0x23b14) = 7 and write WPTR again, at most 200 times. Default off keeps the single plain write. "Keep the window alive": already true, all `fg_windows` are mapped in `kernel_map` for the lifetime of the driver. |
+| "reset BR/BV context state when the submitting client changes" | Already have, as a superset: `fg_abi_frame` emits the CP context reset on every submit, and the present path resets its own. Skipping it for consecutive submits of one client is a possible later optimization, not done. |
+| Fence-stall handling (bus drain, WPTR re-issue, snapshots) | Applied, opt-in `fuxigpuncimport` bit 2 (value 4). A job pending 30 ms gets a CP/SMMU/IB snapshot, an ASID TLB invalidate and the same WPTR again; at 60 ms the GPU bus is drained (GBIF halt, wait for ack, release); the existing 100 ms deadline is still fatal. A job that completes after a stage is counted. The snapshot (without the recovery) is also appended to the fatal hang dump. |
+| "stop emptying the GPU TLB on every submission" | **Not applicable.** Their table is one table: a map fills only invalid leaves, unmap invalidates, and tables above the leaves never change, so nothing needs a flush at submit. Here the client page table (`FG_ABI_PT`) and the present table (`G3_PT`) are different roots under the same ASID, and each submit swaps TTBR between them; the same ASID would otherwise serve stale entries of the other root, so the invalidate stays. Unmap keeps its own. Untested ideas: a separate ASID per root, or restoring `G3_PT` lazily. |
+
+`fuxigpuncimport` is one bitmask parsed at one site (1 import cache handoff, 2
+fenced WPTR, 4 stall recovery, 64 coherent-import self-test, 128 ranged TLBIVAL);
+the value `1` behaves exactly as before and no cmdline bytes are added.
+
+New log fields. `FUXI GPU STALL:` lines (only with bit 2, or on the fatal
+path): `pending 30 ms ...`, CP/RBBM state, IB1/IB2 base and remaining, SMMU
+fault record, and 16 words under BR-IB1, BV-IB1 and BV-IB2 (`unread N` counts
+words outside the mapped range; `seq a/b` with a > b means the buffer was
+mapped after the submission). The 600-frame stats window adds one line when any
+submit ran: `FUXI GPU ABI: submits N ibs N max N over16 N peak_bos N wptr writes
+N dropped N repeated N stuck N stall kicks N drains N acks N/N kick_ok N
+drain_ok N snaps N`. `over16` growing proves the 128-IB record is in use.
+
+Tests: `test-fuxi-metal.py` (wire sizes and 1..128-IB PM4 decode, 128-IB frame
+across the ring wrap, fenced WPTR off/on/retry bound, stall stages and
+snapshots, bitmask parsing), `test-fuxi-gpu-k1.py` (handle index after churn,
+128-IB and legacy 416-byte records through the real user client),
+`test-fuxi-hostimport.py`, `test-fuxi-adreno.py` (fenced doorbell compiled into
+the present path), `test-fuxi-unixnu.py`. `test-fuxi-turnip-submit.py` (native
+macOS) was updated by inspection only.

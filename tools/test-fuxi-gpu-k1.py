@@ -54,7 +54,8 @@ static int fuxi_gpu_abi_status(uint64_t *f,uint64_t *s) {*f=*s=0;if(!statusRc){*
 static int fuxi_gpu_abi_poll(uint64_t) {return 0;}
 static int fuxi_gpu_abi_map(uint64_t,uintptr_t,uint64_t,unsigned,unsigned,unsigned) {return 0;}
 static int fuxi_gpu_abi_map_import(uint64_t,uintptr_t,uint64_t,unsigned) {return 0;}
-static int fuxi_gpu_abi_submit(const uint64_t *,const uint64_t *,unsigned,uint64_t *) {return -1;}
+static int submitRc=-1;static unsigned submitCount,submitCalls;static uint64_t submitLast;
+static int fuxi_gpu_abi_submit(const uint64_t *,const uint64_t *b,unsigned n,uint64_t *f) {submitCalls++;submitCount=n;submitLast=b[n-1];*f=submitCalls;return submitRc;}
 static uint64_t mach_absolute_time() {return 0;}
 static constexpr unsigned NSEC_PER_MSEC=1000000;
 static void clock_interval_to_deadline(unsigned,unsigned,uint64_t *d) {*d=1;}
@@ -74,9 +75,10 @@ struct IOExternalMethodArguments {
 '''
 TEST = r'''
 };
+static unsigned inputOverride;
 static IOReturn call(Client &c,unsigned method,const void *in,void *out) {
  IOExternalMethodArguments a;
- a.structureInputSize=fg_abi_input_size(method);a.structureInput=in;
+ a.structureInputSize=inputOverride?inputOverride:fg_abi_input_size(method);a.structureInput=in;
  a.structureOutputSize=fg_abi_output_size(method);a.structureOutput=out;
  return c.externalMethod(method,&a,nullptr,nullptr,nullptr);
 }
@@ -180,8 +182,51 @@ int main() {
  unsigned calls=0;for(unsigned i=1;i<=16;i++)calls+=statCount[i];
  assert(calls && calls==statCount[FG_ABI_STAT_LOCK] && statCount[6]>=2 && statCount[2]>1024);
  assert(statCount[FG_ABI_STAT_WALK]>=statCount[FG_ABI_STAT_ZERO] && statCount[FG_ABI_STAT_ZERO]>1024);
- puts("PASS: actual methods 7/8 dispatch/errors/lengths, 1024 BO allocation/refusal/reuse/close, shared wired quota, metadata refusal and CPU leases");
+ // Handle index: every live handle resolves to its slot after churn, stale and zero handles do not, freed slots are reused lowest first.
+ {
+  Client d;d.live_=true;NativeAdrenoAbiBoAlloc one{4096,12,0};NativeAdrenoAbiBoAllocReply r[40];
+  for(unsigned i=0;i<40;i++) {assert(!call(d,2,&one,&r[i]));assert(d.find(r[i].handle)==&d.bos_[i]);}
+  NativeAdrenoAbiBoFree rel{};
+  for(unsigned i=0;i<40;i+=3) {rel.handle=r[i].handle;assert(!call(d,4,&rel,nullptr));assert(!d.find(r[i].handle));}
+  for(unsigned i=0;i<40;i++) assert(!!d.find(r[i].handle)==(i%3!=0));
+  assert(!d.find(0) && !d.find(UINT64_MAX) && !d.find(r[39].handle+100));
+  NativeAdrenoAbiBoAllocReply again;assert(!call(d,2,&one,&again) && d.find(again.handle)==&d.bos_[0] && d.liveBos_==27);
+  for(unsigned i=0;i<FG_ABI_MAX_BOS;i++) { NativeAdrenoAbiBoAllocReply x;IOReturn s=call(d,2,&one,&x);if(s) {assert(s==kIOReturnNoResources && d.liveBos_==FG_ABI_MAX_BOS);break;}assert(d.find(x.handle));}
+  for(unsigned i=0;i<FG_ABI_MAX_BOS;i++) if(d.bos_[i].handle) assert(d.find(d.bos_[i].handle)==&d.bos_[i]);
+  assert(peakBos>=FG_ABI_MAX_BOS);
+  assert(!d.clientClose() && !d.liveBos_);
+ }
+ // A frame of 128 IBs is one accepted record; the 416-byte record of the 16-IB layout still works for up to 16.
+ {
+  Client d;d.live_=true;NativeAdrenoAbiBoAlloc one{65536,12,0};NativeAdrenoAbiBoAllocReply h;
+  assert(!call(d,2,&one,&h));Client::Bo *b=d.find(h.handle);b->iova=0x20000000;
+  static union {NativeAdrenoAbiSubmit s;char raw[sizeof(NativeAdrenoAbiSubmit)];} big;
+  memset(&big,0,sizeof(big));
+  for(unsigned i=0;i<NativeAdrenoAbiMaxBuffers;i++) big.s.buffers[i]={h.handle,0x20000000+i*256,256};
+  NativeAdrenoAbiSubmitReply sr{};submitRc=0;submitCalls=0;
+  big.s.buffer_count=128;assert(!call(d,5,&big,&sr) && submitCount==128 && submitLast==256 && sr.fence==1);
+  big.s.buffer_count=129;assert(call(d,5,&big,&sr)==kIOReturnBadArgument && submitCalls==1);
+  big.s.buffer_count=0;assert(call(d,5,&big,&sr)==kIOReturnBadArgument);
+  inputOverride=FG_ABI_SUBMIT_V1_BYTES;
+  big.s.buffer_count=16;assert(!call(d,5,&big,&sr) && submitCount==16 && submitCalls==2);
+  big.s.buffer_count=17;assert(call(d,5,&big,&sr)==kIOReturnBadArgument && submitCalls==2); /* the record holds 16: never read past it */
+  inputOverride=FG_ABI_SUBMIT_V1_BYTES+1;big.s.buffer_count=1;assert(call(d,5,&big,&sr)==kIOReturnBadArgument);
+  inputOverride=sizeof(NativeAdrenoAbiSubmit)-1;assert(call(d,5,&big,&sr)==kIOReturnBadArgument);
+  inputOverride=FG_ABI_SUBMIT_V1_BYTES;NativeAdrenoAbiBoFree rel{h.handle};assert(call(d,4,&rel,nullptr)==kIOReturnBadArgument); /* method 4 is not a submit: only 5 takes 416 */
+  inputOverride=0;submitRc=-1;b->iova=0;assert(!d.clientClose());
+ }
+ puts("PASS: actual methods 7/8 dispatch/errors/lengths, 1024 BO allocation/refusal/reuse/close, handle index after churn, 128-IB and legacy 416-byte submit records, shared wired quota, metadata refusal and CPU leases");
 }
+'''
+
+
+HANDLE_STUBS = r'''
+#include <new>
+#include <cstddef>
+#define IONewZero(T,n) (new (std::nothrow) T[n]())
+#define IODelete(p,T,n) delete[] (p)
+static unsigned peakBos;
+#include "FuxiHandleIndex.h"
 '''
 
 
@@ -202,10 +247,11 @@ def main():
     # The real waitUnlocked must release the client lock around the sleep loop.
     wait += ' IOReturn spin(uint64_t,uint64_t) {spins++;waits++;lastSpinDepth=lockDepth;if(spinKill)*spinKill=false;return 0;}\n'
     prefix = prefix.replace('static void IOLockLock(int *){}','static int lockDepth;static void IOLockLock(int *){lockDepth++;}').replace('static void IOLockUnlock(int *){}','static void IOLockUnlock(int *){lockDepth--;}')
-    model = prefix+EXTRA+helper+'struct Client {\n'+bo+r'''
+    model = prefix+EXTRA+HANDLE_STUBS+helper+'struct Client {\n'+bo+r'''
  /* The kernel allocates the table in initWithTask; the model owns it inline. */
  Bo storage_[MaxBos]={};
- Client(){bos_={storage_,storage_+MaxBos};}
+ Client(){bos_={storage_,storage_+MaxBos};assert(index_.allocate());}
+ ~Client(){index_.release();}
  task_t task_=7;uint64_t nextHandle_=1,wired_=0,lastFence_=0,firstFence_=0;
  uint32_t nextToken_=1;bool queues_[8]={true};
  int *lock_=&clientLock;bool live_=true;int pid_=0;

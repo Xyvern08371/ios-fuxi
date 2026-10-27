@@ -12,7 +12,7 @@
  * rather than ignored. */
 enum {
     NativeAdrenoAbiVersion = 2,
-    NativeAdrenoAbiMaxBuffers = 16,
+    NativeAdrenoAbiMaxBuffers = 128,   /* a frame's IBs in one atomic submission (Adreno740 MIT); 16 before */
     NativeAdrenoAbiHostPageBytes = 16384,
     NativeAdrenoAbiMaxBoBytesShift = 28, /* 256MiB per object */
     NativeAdrenoMethodQuery = 1,
@@ -56,8 +56,9 @@ struct NativeAdrenoAbiBoAllocReply {
  * call BoImport). Reply is NativeAdrenoAbiBoAllocReply. The original CPU cache
  * policy is preserved; no CPU-map token is issued. Kernel cleans/invalidates
  * imported mappings before submit and invalidates after retirement/drain.
- * fuxigpuncimport=1 instead cleans GPU-writable imports once at map time;
- * it requires NO CPU writes until unmap, including between submissions.
+ * fuxigpuncimport is a bitmask: bit 0 (1) cleans GPU-writable imports once at map time (below);
+ * bit 1 (2) writes CP_RB_WPTR as a fenced register; bit 2 (4) recovers a stalled job (see docs-lanes/unixnu-port.md).
+ * With bit 0 it requires NO CPU writes until unmap, including between submissions.
  * Completion/drained-fault invalidation is retained for CPU readers.
  * GPU access uses Normal NC, outer-shareable SMMU leaves. Caller must keep the
  * original allocation alive and externally synchronize CPU/other GPU access.
@@ -160,7 +161,7 @@ static_assert(sizeof(NativeAdrenoAbiBoAlloc) == 16, "ABI alloc layout");
 static_assert(sizeof(NativeAdrenoAbiBoMap) == 32, "ABI map layout");
 static_assert(sizeof(NativeAdrenoAbiBoImport) == 16, "ABI import layout");
 static_assert(sizeof(NativeAdrenoAbiSubmitBuffer) == 24, "ABI buffer layout");
-static_assert(sizeof(NativeAdrenoAbiSubmit) == 416, "ABI submit layout");
+static_assert(sizeof(NativeAdrenoAbiSubmit) == 32 + 24 * NativeAdrenoAbiMaxBuffers, "ABI submit layout");
 static_assert(sizeof(NativeAdrenoAbiBoCpuMap) == 8, "ABI cpu map layout");
 static_assert(sizeof(NativeAdrenoAbiBoCpuMapReply) == 16, "ABI cpu map reply layout");
 static_assert(sizeof(NativeAdrenoAbiBoCpuUnmap) == 16, "ABI cpu unmap layout");

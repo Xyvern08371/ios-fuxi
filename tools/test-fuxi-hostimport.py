@@ -188,16 +188,27 @@ int main() {
 '''
 
 
+HANDLE_STUBS = r'''
+#include <new>
+#include <cstddef>
+#define IONewZero(T,n) (new (std::nothrow) T[n]())
+#define IODelete(p,T,n) delete[] (p)
+static unsigned peakBos;
+#include "FuxiHandleIndex.h"
+'''
+
+
 def main():
     source = (ROOT/'xnu/fuxi-adreno/FuxiAdrenoUserClient.cpp').read_text()
     helper = (ROOT/'xnu/fuxi-adreno/fuxi_adreno_host.c').read_text()
     helper = helper[helper.index('bool fuxi_adreno_host_page_ok('):helper.index('#endif')]
     bo = source[source.index(' struct Bo {'):source.index(' task_t task_')]
     close = method(source, 'clientClose').replace(' override', '').replace('openLock);', '&openLock);')
-    model = PREFIX + helper + 'struct Client {\n enum {MaxBos=FG_ABI_MAX_BOS};\n' + bo + r'''
+    model = PREFIX + HANDLE_STUBS + helper + 'struct Client {\n enum {MaxBos=FG_ABI_MAX_BOS};\n' + bo + r'''
  /* The kernel allocates the table in initWithTask; the model owns it inline. */
  Bo storage_[MaxBos]={};
- Client(){bos_={storage_,storage_+MaxBos};}
+ Client(){bos_={storage_,storage_+MaxBos};assert(index_.allocate());}
+ ~Client(){index_.release();}
  task_t task_=7;uint64_t nextHandle_=1,wired_=0,lastFence_=1;
  int *lock_=&clientLock;bool live_=true;int pid_=0;
  void terminate(){}

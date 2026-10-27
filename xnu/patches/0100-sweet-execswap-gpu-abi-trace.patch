@@ -112,6 +112,67 @@
 + base = base ? base+1 : path;
 + return s->name && strcmp(base, s->name) == 0 ? s->path : NULL;
 +}
+--- a/iokit/Kernel/arm/FuxiHandleIndex.h
++++ b/iokit/Kernel/arm/FuxiHandleIndex.h
+@@ -0,0 +1,58 @@
++/* SPDX-License-Identifier: MIT
++ * Open-addressing handle index adapted from Adreno740 NativeAdrenoHandleIndex.h (UniXNU contributors, MIT).
++ * Copyright (c) 2026 NativeAdreno contributors. See LICENSE.NativeAdreno.
++ *
++ * Handle -> slot of a fixed table whose handles are never 0: open addressing over twice the slots with linear probing, deletion by
++ * backward shift (no tombstones), so a lookup is a few probes instead of a walk over every slot. The includer provides IONewZero and
++ * IODelete (IOLib.h in the kernel). */
++#ifndef FUXI_HANDLE_INDEX_H
++#define FUXI_HANDLE_INDEX_H
++#include <stddef.h>
++#include <stdint.h>
++template<size_t Slots> class FuxiHandleIndex {
++ enum : size_t {Size=Slots*2,Mask=Size-1};
++ static_assert(Slots && !(Size&Mask),"power of two");
++ struct Cell {uint64_t key;uint32_t value;};
++ Cell *cells_=nullptr;
++ static size_t home(uint64_t key) {return (size_t)((key*UINT64_C(0x9e3779b97f4a7c15))>>40)&Mask;}
++public:
++ bool allocate() {
++  if (!cells_) cells_=IONewZero(Cell,Size);
++  return cells_!=nullptr;
++ }
++ void release() {if (cells_) IODelete(cells_,Cell,Size);cells_=nullptr;}
++ /* UINT32_MAX: not present. */
++ uint32_t find(uint64_t key) const {
++  if (!cells_ || !key) return UINT32_MAX;
++  for (size_t i=home(key),n=0;n<Size;i=(i+1)&Mask,++n) {
++   if (!cells_[i].key) return UINT32_MAX;
++   if (cells_[i].key==key) return cells_[i].value;
++  }
++  return UINT32_MAX;
++ }
++ /* At most Slots keys are ever present, so a free cell always exists. */
++ void insert(uint64_t key,uint32_t value) {
++  if (!cells_ || !key) return;
++  size_t i=home(key);
++  while (cells_[i].key && cells_[i].key!=key) i=(i+1)&Mask;
++  cells_[i]={key,value};
++ }
++ void erase(uint64_t key) {
++  if (!cells_ || !key) return;
++  size_t i=home(key);
++  for (size_t n=0;;i=(i+1)&Mask,++n) {
++   if (n==Size || !cells_[i].key) return;
++   if (cells_[i].key==key) break;
++  }
++  /* Pull back each later cell of the run whose home is not cyclically inside (i, j]. */
++  for (size_t j=i;;) {
++   j=(j+1)&Mask;
++   if (!cells_[j].key) break;
++   const size_t k=home(cells_[j].key);
++   if (i<=j ? (i<k && k<=j) : (i<k || k<=j)) continue;
++   cells_[i]=cells_[j];i=j;
++  }
++  cells_[i]={0,0};
++ }
++};
++#endif
 --- a/iokit/Kernel/arm/FuxiAdrenoUserClient.cpp
 +++ b/iokit/Kernel/arm/FuxiAdrenoUserClient.cpp
 @@ -1,4 +1,4 @@
@@ -120,7 +181,7 @@
   * ABI and framing credit: UniXNU NativeAdreno contributors (MIT).
   * See NativeAdrenoABI.h and LICENSE.NativeAdreno for copied material.
   */
-@@ -8,41 +8,88 @@
+@@ -8,41 +8,91 @@
  #include <IOKit/IOPlatformExpert.h>
  #include <IOKit/IOUserClient.h>
  #include <IOKit/IOBufferMemoryDescriptor.h>
@@ -166,7 +227,10 @@
 -OSDefineMetaClassAndStructors(FuxiAdrenoBoView,IOGeneralMemoryDescriptor)
 +OSDefineMetaClassAndStructors(FuxiAdrenoBoView,IOSubMemoryDescriptor)
  
++#include "FuxiHandleIndex.h"
  static IOLock *openLock;
++/* Most BOs live at once in any client this boot (logged with the stats line; decides whether FG_ABI_MAX_BOS must grow). */
++static unsigned peakBos;
 +/* Per-call timing for the periodic SWEET FB stats line (fuxi_gpu_abi_stats_log). */
 +static IOLock *statLock;
 +static fg_abi_stat stats[FG_ABI_STATS];
@@ -222,7 +286,7 @@
   struct Bo {
    IOBufferMemoryDescriptor *memory;
    IOMemoryDescriptor *importMemory;
-@@ -51,10 +98,40 @@
+@@ -51,31 +101,102 @@
    uint64_t handle, bytes, allocated, iova;
    uint32_t token, leases, metadataBytes;
    char metadata[64];
@@ -236,6 +300,23 @@
 + };
 + Bo *boTable_ = nullptr;
 + BoRange bos_ = {};
++ /* handle -> slot (Adreno740 NativeAdrenoHandleIndex, MIT): every selector that names a BO and every IB of a submit looked it up by
++  * walking all slots. freeHint_ is the lowest slot that may be free. inBytes_ is the structure input size of the call in flight. */
++ FuxiHandleIndex<MaxBos> index_;
++ unsigned liveBos_ = 0, freeHint_ = 0, inBytes_ = 0;
++ Bo *freeSlot() {
++  for (unsigned i=freeHint_;i<MaxBos;i++) if (!bos_[i].handle) { freeHint_=i; return &bos_[i]; }
++  return nullptr;
++ }
++ void bound(Bo &b) {
++  index_.insert(b.handle,(uint32_t)(&b-bos_.first));
++  if (++liveBos_>peakBos) peakBos=liveBos_;
++ }
++ void unbound(Bo &b) {
++  index_.erase(b.handle);
++  --liveBos_;
++  if ((unsigned)(&b-bos_.first)<freeHint_) freeHint_=(unsigned)(&b-bos_.first);
++ }
   task_t task_ = TASK_NULL;
   IOLock *lock_ = nullptr;
 - bool live_ = false;
@@ -265,7 +346,11 @@
   uint64_t nextHandle_ = 1, wired_ = 0, lastFence_ = 0, firstFence_ = 0;
   uint32_t nextToken_ = 1;
   bool queues_[8] = {true};
-@@ -64,18 +141,42 @@
+  Bo *find(uint64_t handle) {
+-  for (auto &b:bos_) if (handle && b.handle==handle) return &b;
+-  return nullptr;
++  uint32_t i=index_.find(handle);
++  return i<MaxBos && bos_[i].handle==handle ? &bos_[i] : nullptr;
   }
   IOReturn wait(uint64_t fence, uint64_t ns) {
    if (!fence || !firstFence_ || fence<firstFence_ || fence>lastFence_) return kIOReturnBadArgument;
@@ -312,17 +397,27 @@
   }
   IOReturn drop(Bo &b) {
    if (b.iova) {
-@@ -99,7 +200,8 @@
+@@ -93,15 +214,16 @@
+    b.view->release(); /* view owns the matched prepare + backing retain */
+    b.memory->release();
+   }
++  unbound(b);
+   bzero(&b,sizeof(b));
+   return kIOReturnSuccess;
+  }
   IOReturn allocate(const NativeAdrenoAbiBoAlloc &r, NativeAdrenoAbiBoAllocReply &out) {
    if (!fg_abi_alloc_valid(r.bytes,r.align_log2,r.contiguous)) return kIOReturnBadArgument;
    uint64_t allocated=(r.bytes+16383)&~UINT64_C(16383);
 -  if (allocated>FG_ABI_MAX_BYTES-wired_ || nextToken_==UINT32_MAX) return kIOReturnNoResources;
+-  Bo *b=nullptr;
+-  for (auto &candidate:bos_) if (!candidate.handle) { b=&candidate; break; }
 +  if (wired_>FG_ABI_MAX_WIRED_BYTES || allocated>FG_ABI_MAX_WIRED_BYTES-wired_ ||
 +      nextToken_==UINT32_MAX || nextHandle_==UINT64_MAX) return kIOReturnNoResources;
-   Bo *b=nullptr;
-   for (auto &candidate:bos_) if (!candidate.handle) { b=&candidate; break; }
++  Bo *b=freeSlot();
    if (!b) return kIOReturnNoResources;
-@@ -111,26 +213,31 @@
+   uint64_t mask=((UINT64_C(1)<<FG_ABI_PA_BITS)-1)&~((UINT64_C(1)<<r.align_log2)-1);
+   IOOptionBits options=kIODirectionInOut|kIOMemoryMapperNone|kIOMemoryKernelUserShared|kIOMapWriteCombineCache;
+@@ -111,32 +233,38 @@
    if (!memory && !r.contiguous) memory=IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,options,allocated,mask);
    if (!memory) return kIOReturnNoMemory;
    if (memory->prepare()!=kIOReturnSuccess) { memory->release(); return kIOReturnNoMemory; }
@@ -366,7 +461,14 @@
    if (!valid) {
     if (view) view->release();
     memory->complete(); memory->release(); return kIOReturnNoMemory;
-@@ -144,33 +251,50 @@
+   }
+   b->memory=memory; b->view=view; b->bytes=r.bytes; b->allocated=allocated;
+   b->handle=nextHandle_++; b->token=nextToken_++; wired_+=allocated;
++  bound(*b);
+   out.handle=b->handle;
+   return kIOReturnSuccess;
+  }
+@@ -144,36 +272,53 @@
    * COW resolution, before wiring. Never translate a user VA with kernel_pmap,
    * change its WIMG/cache mode, or manufacture a physical descriptor alias. */
   IOReturn importHost(const NativeAdrenoAbiBoImport &r, NativeAdrenoAbiBoAllocReply &out) {
@@ -383,12 +485,13 @@
    if (current_task()!=task_ || task_==kernel_task || !fg_abi_import_valid(r.address,r.bytes))
 -   return kIOReturnBadArgument;
 -  if (r.bytes>FG_ABI_MAX_BYTES-wired_) return kIOReturnNoResources;
+-  Bo *b=nullptr;
+-  for (auto &candidate:bos_) if (!candidate.handle) { b=&candidate; break; }
+-  if (!b) return kIOReturnNoResources;
 +   return refuse(1,kIOReturnBadArgument,0);
 +  if (wired_>FG_ABI_MAX_WIRED_BYTES || r.bytes>FG_ABI_MAX_WIRED_BYTES-wired_ ||
 +      nextHandle_==UINT64_MAX) return refuse(2,kIOReturnNoResources,wired_);
-   Bo *b=nullptr;
-   for (auto &candidate:bos_) if (!candidate.handle) { b=&candidate; break; }
--  if (!b) return kIOReturnNoResources;
++  Bo *b=freeSlot();
 +  if (!b) return refuse(3,kIOReturnNoResources,0);
    IOMemoryDescriptor *memory=IOMemoryDescriptor::withAddressRange(r.address,r.bytes,
        kIODirectionInOut|kIOMemoryMapperNone|kIOMemoryPersistent,task_);
@@ -427,7 +530,11 @@
    }
    b->importMemory=memory; b->importMap=mapping; b->bytes=b->allocated=r.bytes;
    b->handle=nextHandle_++; wired_+=r.bytes; out.handle=b->handle;
-@@ -188,7 +312,15 @@
++  bound(*b);
+   return kIOReturnSuccess;
+  }
+  IOReturn run(unsigned method, const void *in, void *out) {
+@@ -188,7 +333,15 @@
     return kIOReturnSuccess;
    }
    if (method==NativeAdrenoMethodWaitFence) {
@@ -444,7 +551,7 @@
    }
    if (method==NativeAdrenoMethodBoCpuUnmap) {
     const auto &r=*static_cast<const NativeAdrenoAbiBoCpuUnmap *>(in);
-@@ -218,7 +350,7 @@
+@@ -218,7 +371,7 @@
      s=b->importMemory ? fuxi_gpu_abi_map_import(r.iova,b->importMap->getVirtualAddress(),b->bytes,r.permissions) :
          fuxi_gpu_abi_map(r.iova,(uintptr_t)b->memory->getBytesNoCopy(),b->bytes,r.permissions,r.writeback,r.shareability);
      if (s!=1 || mach_absolute_time()>=deadline) break;
@@ -453,16 +560,21 @@
     } while (true);
     if (s) return s==1 ? kIOReturnBusy : kIOReturnBadArgument;
     b->iova=r.iova; static_cast<NativeAdrenoAbiBoMapReply *>(out)->iova=r.iova; return kIOReturnSuccess;
-@@ -232,7 +364,7 @@
+@@ -231,9 +384,10 @@
+   }
    if (method==NativeAdrenoMethodSubmit) {
     const auto &r=*static_cast<const NativeAdrenoAbiSubmit *>(in);
-    if (!r.buffer_count || r.buffer_count>16 || r.reserved || r.queue>=8 || !queues_[r.queue]) return kIOReturnBadArgument;
+-   if (!r.buffer_count || r.buffer_count>16 || r.reserved || r.queue>=8 || !queues_[r.queue]) return kIOReturnBadArgument;
 -   if (r.wait_fence) { IOReturn s=wait(r.wait_fence,r.wait_timeout_ns); if (s) return s; }
+-   uint64_t iova[16], bytes[16];
++   /* A record of the 16-IB layout (416 bytes) from an older Turnip holds only 16 buffers: never read past the bytes the caller gave. */
++   if (!r.buffer_count || r.buffer_count>fg_abi_submit_capacity(inBytes_) || r.reserved || r.queue>=8 || !queues_[r.queue]) return kIOReturnBadArgument;
 +   if (r.wait_fence) { IOReturn s=waitUnlocked(r.wait_fence,r.wait_timeout_ns); if (s) return s; }
-    uint64_t iova[16], bytes[16];
++   uint64_t iova[NativeAdrenoAbiMaxBuffers], bytes[NativeAdrenoAbiMaxBuffers];
     for (unsigned i=0;i<r.buffer_count;i++) {
      const auto &ib=r.buffers[i]; Bo *b=find(ib.handle);
-@@ -246,7 +378,7 @@
+     if (!b || !b->iova || !fg_abi_ib_valid(b->iova,b->bytes,ib.iova,ib.bytes)) return kIOReturnBadArgument;
+@@ -246,7 +400,7 @@
      if (!s) { if (!firstFence_) firstFence_=fence; lastFence_=fence; static_cast<NativeAdrenoAbiSubmitReply *>(out)->fence=fence; return kIOReturnSuccess; }
      if (s<0) return kIOReturnIOError;
      if (mach_absolute_time()>=deadline) return kIOReturnBusy;
@@ -471,7 +583,7 @@
     }
    }
    if (method==NativeAdrenoMethodSetMetadata || method==NativeAdrenoMethodGetMetadata) {
-@@ -254,8 +386,9 @@
+@@ -254,8 +408,9 @@
     if (!b || r.reserved || r.bytes>64) return kIOReturnBadArgument;
     if (method==NativeAdrenoMethodSetMetadata) { bcopy(r.text,b->metadata,r.bytes); b->metadataBytes=r.bytes; }
     else {
@@ -482,7 +594,7 @@
      bcopy(b->metadata,reply.text,reply.bytes);
     }
     return kIOReturnSuccess;
-@@ -277,25 +410,43 @@
+@@ -277,25 +432,45 @@
   bool initWithTask(task_t task, void *securityID, UInt32 type) override {
    if (!IOUserClient::initWithTask(task,securityID,type)) return false;
    task_=task; task_reference(task_);
@@ -491,6 +603,7 @@
 +  diagnostic_=execswapTest && type==0x4147 && !strncmp(name,"fuxi-gpu-abi-",13);
 +  boTable_=IONewZero(Bo,MaxBos);
 +  if (!boTable_) return false;
++  if (!index_.allocate()) return false;
 +  bos_={boTable_,boTable_+MaxBos};
    lock_=IOLockAlloc(); return lock_!=nullptr;
   }
@@ -513,12 +626,14 @@
 +  if (!a || selector<1 || selector>16) { abiTrace("invalid",pid_,kIOReturnUnsupported); return kIOReturnUnsupported; }
    if (a->scalarInputCount || a->scalarOutputCount || a->asyncWakePort ||
        a->structureInputDescriptor || a->structureOutputDescriptor ||
-       a->structureInputSize!=fg_abi_input_size(selector) || a->structureOutputSize!=fg_abi_output_size(selector) ||
+-      a->structureInputSize!=fg_abi_input_size(selector) || a->structureOutputSize!=fg_abi_output_size(selector) ||
 -      (a->structureInputSize && !a->structureInput) || (a->structureOutputSize && !a->structureOutput)) return kIOReturnBadArgument;
++      !fg_abi_input_ok(selector,a->structureInputSize) || a->structureOutputSize!=fg_abi_output_size(selector) ||
 +      (a->structureInputSize && !a->structureInput) || (a->structureOutputSize && !a->structureOutput)) { abiTrace(abiStep(selector),pid_,kIOReturnBadArgument); return kIOReturnBadArgument; }
    IOLockLock(lock_);
 +  uint64_t t1=mach_absolute_time();
    if (a->structureOutputSize) bzero(a->structureOutput,a->structureOutputSize);
++  inBytes_=a->structureInputSize;
    IOReturn s=live_ ? run(selector,a->structureInput,a->structureOutput) : kIOReturnNotOpen;
 -  IOLockUnlock(lock_); return s;
 +  abiTrace(abiStep(selector),pid_,s);
@@ -530,7 +645,7 @@
   }
   IOReturn clientMemoryForType(UInt32 token, IOOptionBits *options, IOMemoryDescriptor **memory) override {
    if (!options || !memory) return kIOReturnBadArgument;
-@@ -304,7 +455,9 @@
+@@ -304,7 +479,9 @@
    if (live_) for (auto &b:bos_) if (b.handle && b.token==token && b.leases) {
     b.view->retain(); *memory=b.view; *options=kIOMapAnywhere|kIOMapWriteCombineCache; break;
    }
@@ -541,7 +656,7 @@
   }
   IOReturn clientClose() override {
    if (!lock_) return kIOReturnSuccess;
-@@ -321,24 +474,39 @@
+@@ -321,24 +498,40 @@
     IOLockLock(openLock); connected=false; IOLockUnlock(openLock);
    }
    IOLockUnlock(lock_);
@@ -554,6 +669,7 @@
    if (lock_) IOLockFree(lock_);
 +  /* Quarantined BOs keep their own references; only the table goes. */
 +  if (boTable_) { IODelete(boTable_,Bo,MaxBos); boTable_=nullptr; bos_={}; }
++  index_.release();
    if (task_!=TASK_NULL) { task_deallocate(task_); task_=TASK_NULL; }
    IOUserClient::free();
   }
@@ -584,7 +700,7 @@
    if (!handler) return kIOReturnBadArgument;
    *handler=nullptr;
    if (type!=0x4147 && type!=0) return kIOReturnUnsupported;
-@@ -351,10 +519,36 @@
+@@ -351,10 +544,36 @@
    *handler=uc; return kIOReturnSuccess;
   }
  };
@@ -623,7 +739,7 @@
   auto *service=new NativeAdrenoGpuPublished;
   if (!openLock || !service) { if (service) service->release(); return; }
   if (!service->init() || !service->attach(IOService::getPlatform()) || !service->start(IOService::getPlatform())) {
-@@ -362,6 +556,16 @@
+@@ -362,7 +581,27 @@
   }
   service->setName("NativeAdrenoGpu");
   service->setProperty("NativeAdrenoABI",(uint64_t)NativeAdrenoAbiVersion,32);
@@ -640,3 +756,14 @@
   service->registerService(); /* retained for boot lifetime */
   IOLog("FUXI GPU ABI: NativeAdrenoGpuPublished v2 HostImport 16K, open 0x4147, root only, watchdog 100 ms\n");
  }
++/* The scheduling counters of the backend, once per stats window: IBs per submission (the 128-IB record is working when over16 grows),
++ * the most BOs live at once, fenced WPTR writes (fuxigpuncimport bit 1) and the stall recovery stages (bit 2). Silent without a submit. */
++extern "C" void fuxi_gpu_abi_sched_log(void)
++{
++ uint32_t ibs[4], wptr[4], stall[8];
++ fuxi_gpu_abi_sched_stats(ibs,wptr,stall);
++ if (!ibs[0]) return;
++ IOLog("FUXI GPU ABI: submits %u ibs %u max %u over16 %u peak_bos %u wptr writes %u dropped %u repeated %u stuck %u stall kicks %u drains %u acks %u/%u kick_ok %u drain_ok %u snaps %u\n",
++     ibs[0],ibs[1],ibs[2],ibs[3],peakBos,wptr[0],wptr[1],wptr[2],wptr[3],stall[0],stall[2],stall[3],stall[4],stall[5],stall[6],stall[7]);
++}
+ #endif

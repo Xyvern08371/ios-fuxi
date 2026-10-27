@@ -20,10 +20,23 @@ static thread_call_data_t fg_client_watchdog;
  * list. Serialize cache handoff with the same GPU lock as submit/retirement.
  * The user client owns these prepared kernel mappings until successful unmap. */
 static struct { uint64_t iova, bytes; uintptr_t source; unsigned permissions; } fg_abi_imports[FG_ABI_MAX_IMPORTS];
-static unsigned fg_abi_host_handoff, fg_abi_ncimport, fg_abi_cohtest, fg_abi_tlbpages;
-/* fuxigpuncimport is a bitmask: 1 NC-import map-time clean, 64 coherent-import self-test (skips the per-submit
- * clean/retire invalidate only if it proves the GPU path coherent), 128 ranged TLBIVAL for a small unmap. Default 0. */
+static unsigned fg_abi_host_handoff, fg_abi_ncimport, fg_abi_unstick, fg_abi_cohtest, fg_abi_tlbpages;
+/* fuxigpuncimport is a bitmask, default 0: 1 NC-import map-time clean; 2 fenced WPTR (fg_ring_doorbell); 4 stall recovery
+ * (fg_abi_unstick_step); 64 coherent-import self-test (skips the per-submit clean/retire invalidate only if it proves the GPU path
+ * coherent); 128 ranged TLBIVAL for a small unmap. Parsed once in fg_abi_init. */
 static unsigned fg_abi_coh, fg_abi_coh_tries; /* coh: 0 untested, 1 proven coherent, 2 refused */
+/* The submit record holds up to NativeAdrenoAbiMaxBuffers IBs; one frame is then one ring prologue and one CP context reset. */
+_Static_assert(FG_ABI_FRAME_WORDS+8 < 8192, "one frame must fit the idle ring");
+static uint32_t fg_abi_words[FG_ABI_FRAME_WORDS];
+/* IBs per submission: submissions, IBs, the most in one, submissions with more than 16 (one frame was several before the 128-IB record). */
+static uint32_t fg_abi_ibs[4];
+/* Stall recovery: kicks, fence of the last stalled job, bus drains, GBIF client/arbiter halt acks of the last drain, jobs that completed
+ * after a kick, jobs that completed after a drain, snapshots taken. */
+static uint32_t fg_abi_stall_stats[8];
+static unsigned fg_abi_stage, fg_abi_stall_lines;
+/* Kernel mapping of every mapped range (diagnostics only: the words under a stalled IB), and the map sequence of each. */
+static struct { uint64_t iova, bytes; uintptr_t source; uint32_t seq; } fg_abi_maps[FG_ABI_MAX_BOS];
+static uint32_t fg_abi_map_seq, fg_abi_submit_map_seq;
 static uint64_t fg_abi_cleaned, fg_abi_skipped, fg_abi_invalidated;
 static void fg_abi_cache_region(uintptr_t source, uint64_t bytes, int complete)
 {
@@ -75,6 +88,25 @@ void fuxi_gpu_import_stats(uint64_t *cleaned, uint64_t *skipped, uint64_t *inval
   *mapped+=fg_abi_imports[i].bytes; ++*imports;
  }
 }
+static void fg_abi_map_note(uint64_t iova, uint64_t bytes, uintptr_t source)
+{
+ ++fg_abi_map_seq;
+ for (unsigned i=0;i<FG_ABI_MAX_BOS;i++) if (!fg_abi_maps[i].iova) {
+  fg_abi_maps[i].iova=iova; fg_abi_maps[i].bytes=bytes; fg_abi_maps[i].source=source; fg_abi_maps[i].seq=fg_abi_map_seq;
+  return;
+ }
+}
+static void fg_abi_map_forget(uint64_t iova, uint64_t bytes)
+{
+ for (unsigned i=0;i<FG_ABI_MAX_BOS;i++) if (fg_abi_maps[i].iova==iova && fg_abi_maps[i].bytes==bytes) fg_abi_maps[i].iova=0;
+}
+/* The mapping that holds a GPU address, or NULL. */
+static const typeof(fg_abi_maps[0]) *fg_abi_map_at(uint64_t iova)
+{
+ for (unsigned i=0;i<FG_ABI_MAX_BOS;i++)
+  if (fg_abi_maps[i].iova && iova>=fg_abi_maps[i].iova && iova-fg_abi_maps[i].iova<fg_abi_maps[i].bytes) return &fg_abi_maps[i];
+ return NULL;
+}
 static volatile uint64_t *fg_abi_leaf(uint64_t iova)
 {
  unsigned chunk = (unsigned)((iova-FG_ABI_VA_START)>>21);
@@ -118,6 +150,47 @@ static int fg_abi_switch(uint64_t root)
  return !g4_tlb(tlb) && !fg_access_failed &&
      g3_sr(cb+0x20)==(uint32_t)ttbr && g3_sr(cb+0x24)==(uint32_t)(ttbr>>32);
 }
+/* 16 words of the mapped range that holds `at`, from `start` (clamped to the range): the CP stops on a bad word a few before the one it
+ * reports (NativeAdreno peekIb/peekFetch, MIT). Fault-contained reads of the BO's kernel mapping; no register access. */
+static void fg_abi_peek(const char *tag, uint64_t at, uint64_t start)
+{
+ const typeof(fg_abi_maps[0]) *m=fg_abi_map_at(at);
+ if (!m) { printf("FUXI GPU STALL: %s IB %#llx not in a mapped range\n",tag,(unsigned long long)at); return; }
+ if (start<m->iova || start>at) start=m->iova;
+ uint64_t room=(m->iova+m->bytes-start)/4;
+ uint32_t w[16]; unsigned bad=0;
+ for (unsigned i=0;i<16;i++) {
+  uint64_t v=0;
+  if (i>=room || fuxi_gpu_access(m->source+(start-m->iova)+4*i,&v,0,0)) { w[i]=0xdeadbeef; bad++; } else w[i]=(uint32_t)v;
+ }
+ printf("FUXI GPU STALL: %s at %#llx from %#llx map %#llx seq %u/%u unread %u: %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x\n",
+     tag,(unsigned long long)at,(unsigned long long)start,(unsigned long long)m->iova,m->seq,fg_abi_submit_map_seq,bad,
+     w[0],w[1],w[2],w[3],w[4],w[5],w[6],w[7],w[8],w[9],w[10],w[11],w[12],w[13],w[14],w[15]);
+}
+/* The CP's state for a job that stopped advancing (NativeAdreno NativeAdrenoSubmit::noteStall, MIT): RBBM_STATUS..3 and INT_0, CP_HW_FAULT,
+ * CP_STATUS_1, CP_PROTECT_STATUS, the BR thread's RPTR/WPTR, IB1 base/remaining/initial size, IB2 base/remaining, the BV thread's RPTR,
+ * IB1 base lo, IB1 and IB2 remaining and IB2 base; the SMMU context bank's fault record; and the words under the IBs. Read only. A
+ * mapping whose sequence (seq a/b: a) is above the submission's (b) was mapped after it, so its memory was freed and reused under the
+ * GPU. Offsets are NativeAdreno's; not checked on this device (not yet observed). */
+static void fg_abi_snapshot(const char *why)
+{
+ static const unsigned regs[]={0x210,0x211,0x212,0x213,0x201,0x821,0x825,0x824,0x806,0x807,0x928,0x929,0x92a,0x943,0x92b,0x92c,0x92d,
+     0xa66,0xa6d,0xa70,0xa74,0xa71,0xa72};
+ uint32_t v[sizeof(regs)/sizeof(regs[0])];
+ for (unsigned i=0;i<sizeof(regs)/sizeof(regs[0]);i++) v[i]=g3_gr(regs[i]);
+ unsigned cb=g_cb(g3_bank);
+ printf("FUXI GPU STALL: %s seq %u rbbm %08x %08x %08x %08x int %08x hwfault %08x cpst1 %08x prot %08x rptr %x wptr %x\n",why,fg_abi_seq,
+     v[0],v[1],v[2],v[3],v[4],v[5],v[6],v[7],v[8],v[9]);
+ printf("FUXI GPU STALL: ib1 %08x:%08x rem %x init %x ib2 %08x:%08x rem %x bv rptr %x ib1 lo %08x rem %x ib2 %08x:%08x rem %x\n",
+     v[11],v[10],v[12],v[13],v[15],v[14],v[16],v[17],v[18],v[19],v[22],v[21],v[20]);
+ printf("FUXI GPU STALL: smmu fsr %08x far %08x:%08x fsynr0 %08x\n",g3_sr(cb+0x58),g3_sr(cb+0x64),g3_sr(cb+0x60),g3_sr(cb+0x68));
+ const uint64_t ib1=(uint64_t)v[11]<<32|v[10], bv1=(uint64_t)v[11]<<32|v[18], bv2=(uint64_t)v[22]<<32|v[21];
+ const uint32_t reached=v[13]>=v[12] ? v[13]-v[12] : 0;
+ const uint64_t br=ib1+4ull*(reached ? reached-1 : 0);
+ fg_abi_peek("BR-IB1",br,br-48);
+ fg_abi_peek("BV-IB1",bv1,bv1-48);
+ fg_abi_peek("BV-IB2",bv2,bv2-48);
+}
 /* One bounded, read-only snapshot before isolation destroys CP/SMMU evidence.
  * GPU offsets are A6XX/A7XX dwords from Mesa a6xx.xml; SMMU offsets are
  * bytes (same context-bank registers as g3_diagnostics). No indexed-port
@@ -144,6 +217,7 @@ static void fg_abi_hang_dump(const char *why)
      g3_bank,g3_sr(cb+0x24),g3_sr(cb+0x20),g3_sr(cb+0x58),
      g3_sr(cb+0x64),g3_sr(cb+0x60),g3_sr(cb+0x68),g3_sr(cb+0x6c),g3_sr(0x48));
  printf("FUXI GPU HANG: MMIO-access-failed %u; isolating\n",fg_access_failed);
+ fg_abi_snapshot("hang");
 }
 static int fg_abi_fault(const char *why)
 {
@@ -155,6 +229,45 @@ static int fg_abi_fault(const char *why)
  if (fg_abi_drained) fg_abi_import_cache(1);
  fg_client_busy = 0;
  return fg_abi_drained ? -1 : -2;
+}
+static void fg_abi_stall_log(const char *what)
+{
+ if (fg_abi_stall_lines<24) { fg_abi_stall_lines++; printf("FUXI GPU STALL: %s seq %u\n",what,fg_abi_seq); }
+}
+/* The job that stalled completed after a recovery stage (1 kick, 2 bus drain). */
+static void fg_abi_stall_done(void)
+{
+ fg_abi_stall_stats[fg_abi_stage==1 ? 5 : 6]++;
+ fg_abi_stall_log(fg_abi_stage==1 ? "completed after WPTR kick" : "completed after bus drain");
+ fg_abi_stage=0;
+}
+/* Opt-in stall recovery (fuxigpuncimport bit 2; NativeAdreno noteStall, MIT), staged by how long the job has been pending (ordinary jobs
+ * take about 5 ms; the 100 ms deadline below still ends the job): at 30 ms snapshot the CP, drop the ASID's translations and give WPTR
+ * again (harmless when the CP already saw it); at 60 ms drain the bus the way a6xx does before a reset, then release the halt (the
+ * isolation path keeps its halt). Returns nonzero when a register access failed. Not yet observed on device. */
+static int fg_abi_unstick_step(void)
+{
+ const uint64_t freq=rsr("cntfrq_el0"), pending=rsr("cntpct_el0")-(fg_client_deadline-freq/10);
+ if (fg_abi_stage==0 && pending>=freq*30/1000) {
+  fg_abi_stage=1; fg_abi_stall_stats[0]++; fg_abi_stall_stats[1]=fg_abi_seq;
+  fg_abi_stall_log("pending 30 ms: snapshot, TLB drop, WPTR kick");
+  if (fg_abi_stall_stats[7]<8) { fg_abi_stall_stats[7]++; fg_abi_snapshot("30ms"); }
+  uint32_t tlb[128]={0};
+  if (g4_tlb(tlb) || fg_access_failed) return 1;
+  if (!fg_ring_doorbell() || fg_access_failed) return 1;
+ }
+ if (fg_abi_stage==1 && pending>=freq*60/1000) {
+  uint64_t ack[2]={0,0};
+  fg_abi_stage=2; fg_abi_stall_stats[2]++;
+  fg_abi_stall_log("pending 60 ms: bus drain");
+  if (!g3_gw(0x3c45,1)) return 1;
+  for (unsigned i=0;i<1000 && !(ack[0]&1);i++) { ack[0]=g3_gr(0x3c46); if (!(ack[0]&1)) delay(1); }
+  if (!g3_gw(0x3c45,3)) return 1;
+  for (unsigned i=0;i<1000 && !(ack[1]&2);i++) { ack[1]=g3_gr(0x3c46); if (!(ack[1]&2)) delay(1); }
+  if (!g3_gw(0x3c45,0) || fg_access_failed) return 1;
+  fg_abi_stall_stats[3]=(uint32_t)ack[0]&1; fg_abi_stall_stats[4]=((uint32_t)ack[1]>>1)&1;
+ }
+ return 0;
 }
 /* No spinning: one observation. The watchdog runs even if the client exits,
  * never waits, or asks WaitFence(timeout_ns=0) indefinitely. */
@@ -168,6 +281,7 @@ static int fg_abi_observe(void)
      g3_gr(0x806)==g3_wptr && g3_gr(0x807)==g3_wptr && !(g3_gr(0x210)&~1u)) {
   if (!fg_abi_switch(G3_PT)) return fg_abi_fault("client restore TTBR");
   fg_abi_import_cache(1); /* before fence success, even without a user wait */
+  if (fg_abi_stage) fg_abi_stall_done();
   fg_abi_completed = fg_abi_seq;
   fg_client_busy = 0;
   return 0;
@@ -176,6 +290,7 @@ static int fg_abi_observe(void)
   fg_abi_timed_out=1; (void)fg_abi_fault("client fence deadline (100 ms)");
   return fg_abi_drained ? -3 : -4;
  }
+ if (fg_abi_unstick && fg_abi_unstick_step()) return fg_abi_fault("client stall recovery access");
  return 1;
 }
 static void fg_abi_watch(thread_call_param_t arg, thread_call_param_t unused)
@@ -192,7 +307,7 @@ static int fg_abi_init(void)
 {
  unsigned bits=0;
  (void)PE_parse_boot_argn("fuxigpuncimport",&bits,sizeof(bits));
- fg_abi_ncimport=bits&1; fg_abi_cohtest=(bits>>6)&1; fg_abi_tlbpages=(bits>>7)&1;
+ fg_abi_ncimport=bits&1; fg_wptr_fence=(bits>>1)&1; fg_abi_unstick=(bits>>2)&1; fg_abi_cohtest=(bits>>6)&1; fg_abi_tlbpages=(bits>>7)&1;
  fg_abi_coh=fg_abi_coh_tries=0;
  for (unsigned i=0;i<sizeof(fg_abi_used)/sizeof(fg_abi_used[0]);i++) fg_abi_used[i]=0;
  /* 772 4K pages: root, two L2s, kernel runtime L3, 768 client L3s.
@@ -359,6 +474,7 @@ static int fg_abi_map_locked(uint64_t iova, uintptr_t source, uint64_t bytes,
   fg_abi_used_put(fg_abi_pg(iova+off),1);
  }
  __asm__ volatile("dsb sy" ::: "memory");
+ fg_abi_map_note(iova,bytes,source);
  /* Root is inactive; TLBI is mandatory before its next doorbell. */
  return 0;
 }
@@ -402,7 +518,7 @@ static int fg_abi_unmap_locked(uint64_t iova, uint64_t bytes)
  if (fg_abi_live && !fg_abi_poisoned && fg_abi_range(iova,bytes)) (void)fg_abi_wait_idle();
  if (fg_abi_poisoned) {
   if (!fg_abi_drained) return -2;
-  fg_abi_import_remove(iova,bytes); return 0;
+  fg_abi_import_remove(iova,bytes); fg_abi_map_forget(iova,bytes); return 0;
  }
  if (!fg_abi_live || !fg_abi_range(iova,bytes)) return -1;
  if (fg_client_busy) return 1;
@@ -419,6 +535,7 @@ static int fg_abi_unmap_locked(uint64_t iova, uint64_t bytes)
  int terr=fg_abi_tlbpages && bytes/4096<=FG_ABI_TLB_PAGE_LIMIT ? fg_abi_tlb_pages(iova,bytes) : g4_tlb(tlb);
  if (terr || fg_access_failed) return fg_abi_fault("client unmap TLB sync");
  fg_abi_import_remove(iova,bytes);
+ fg_abi_map_forget(iova,bytes);
  return 0;
 }
 static int fg_abi_submit_locked(const uint64_t *iovas, const uint64_t *sizes,
@@ -430,9 +547,10 @@ static int fg_abi_submit_locked(const uint64_t *iovas, const uint64_t *sizes,
  if (idle) return idle<0 ? -1 : 1;
  if (g3_faulted() || g3_gr(0x806)!=g3_wptr || g3_gr(0x807)!=g3_wptr || (g3_gr(0x210)&~1u))
   return fg_abi_fault("client pre-submit idle/fault");
- uint32_t words[160];
+ uint32_t *words=fg_abi_words; /* serialized by the GPU lock; too large for the kernel stack at 128 IBs */
  unsigned n=fg_abi_frame(words,iovas,sizes,count,G3_FENCE_VA+FG_ABI_FENCE_OFF,fg_abi_seq,fg_abi_seq+1,1);
  if (!n) return -1;
+ fg_abi_ibs[0]++; fg_abi_ibs[1]+=count; if (count>fg_abi_ibs[2]) fg_abi_ibs[2]=count; if (count>16) fg_abi_ibs[3]++;
  if (!fg_abi_switch(FG_ABI_PT)) return fg_abi_fault("client install TTBR");
  /* Ordinary BOs are NC on both sides. Imports preserve CPU attributes and
   * need an explicit PoC handoff; IO-coherent XNU helpers may be no-ops here.
@@ -446,7 +564,8 @@ static int fg_abi_submit_locked(const uint64_t *iovas, const uint64_t *sizes,
  fg_client_deadline=rsr("cntpct_el0")+rsr("cntfrq_el0")/10;
  fg_client_busy=1;
  fg_dcvs_kick();
- if (!g3_gw(0x807,g3_wptr) || fg_access_failed) return fg_abi_fault("client doorbell");
+ fg_abi_stage=0; fg_abi_submit_map_seq=fg_abi_map_seq;
+ if (!fg_ring_doorbell() || fg_access_failed) return fg_abi_fault("client doorbell");
  *fence=++fg_abi_seq;
  uint64_t deadline;
  clock_interval_to_deadline(2,NSEC_PER_MSEC,&deadline);
@@ -526,4 +645,10 @@ int fuxi_gpu_abi_poll(uint64_t fence)
  int err=fg_abi_observe();
  if (err<0) return err;
  return fence<=fg_abi_completed ? 0 : 1;
+}
+/* Window counters for the SWEET FB stats line (fuxi_gpu_abi_stats_log); a snapshot, not reset. */
+void fuxi_gpu_abi_sched_stats(uint32_t ibs[4], uint32_t wptr[4], uint32_t stall[8])
+{
+ FG_GUARD;
+ memcpy(ibs,fg_abi_ibs,sizeof(fg_abi_ibs)); memcpy(wptr,fg_wptr_stats,sizeof(fg_wptr_stats)); memcpy(stall,fg_abi_stall_stats,sizeof(fg_abi_stall_stats));
 }

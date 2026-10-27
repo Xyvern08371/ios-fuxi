@@ -43,9 +43,16 @@ int main() {
  assert((max|0xfff)-min+1==0x300000);
  assert(info.chip_id==0x43050a01 && info.gmem_base==min &&
      info.gmem_bytes==(max|0xfff)-min+1 && info.gmem_bytes==3u*1024*1024);
- const unsigned is[]={0,0,16,32,8,416,16,0,0,80,80,8,8,8,16,0,16};
+ const unsigned is[]={0,0,16,32,8,3104,16,0,0,80,80,8,8,8,16,0,16};
  const unsigned os[]={0,24,8,8,0,8,0,8,16,0,80,8,0,16,0,64,8};
  for(unsigned s=1;s<=16;s++) {assert(fg_abi_input_size(s)==is[s]);assert(fg_abi_output_size(s)==os[s]);}
+ /* The 16-IB record (416 bytes) of an older Turnip is still a valid submit; nothing else is. */
+ static_assert(NativeAdrenoAbiMaxBuffers==128 && sizeof(NativeAdrenoAbiSubmit)==3104,"128 IBs");
+ assert(fg_abi_input_ok(5,3104) && fg_abi_input_ok(5,416) && !fg_abi_input_ok(5,417) && !fg_abi_input_ok(5,32) && !fg_abi_input_ok(5,0));
+ assert(!fg_abi_input_ok(4,416) && fg_abi_input_ok(4,8));
+ for(unsigned m=1;m<=16;m++) if(m!=5) assert(fg_abi_input_ok(m,is[m]) && !fg_abi_input_ok(m,is[m]+1));
+ assert(fg_abi_submit_capacity(3104)==128 && fg_abi_submit_capacity(416)==16 && !fg_abi_submit_capacity(0) && !fg_abi_submit_capacity(31) && !fg_abi_submit_capacity(32));
+ assert(FG_ABI_FRAME_WORDS==581 && FG_ABI_SUBMIT_V1_BYTES==32+24*16);
  assert(!fg_abi_range(0x1ffff000,4096)); assert(!fg_abi_range(0x80000000,4096));
  assert(fg_abi_range(0x7ffff000,4096)); assert(!fg_abi_range(0x7ffff000,8192));
  assert(!fg_abi_range(UINT64_MAX-4095,8192)); assert(!fg_abi_range(0x20000000,0));
@@ -63,11 +70,11 @@ int main() {
  assert(!fg_abi_ib_valid(0x20000000,4096,0x20000000,0));
  assert(!fg_abi_ib_valid(0x20000000,4096,0x20000001,4));
  assert(!fg_abi_ib_valid(0x20000000,4096,UINT64_MAX-3,8));
- uint64_t va[16],bytes[16]; uint32_t w[160];
- for(unsigned i=0;i<16;i++) {va[i]=0x20000000+i*4096;bytes[i]=4096;}
- for(unsigned reset=0;reset<2;reset++) for(unsigned count=1;count<=16;count++) {
+ uint64_t va[128],bytes[128]; uint32_t w[FG_ABI_FRAME_WORDS];
+ for(unsigned i=0;i<128;i++) {va[i]=0x20000000+i*4096;bytes[i]=4096;}
+ for(unsigned reset=0;reset<2;reset++) for(unsigned count=1;count<=128;count++) {
   unsigned n=fg_abi_frame(w,va,bytes,count,0x10029080,13,14,reset);
-  assert(n==11+26*reset+count*4+31+1 && n<=160);
+  assert(n==11+26*reset+count*4+31+1 && n<=FG_ABI_FRAME_WORDS && (count<128 || reset==0 || n==FG_ABI_FRAME_WORDS));
   unsigned at=0,op=0,len=0,ibs=0,bv=0,br=0,sram=0,resets=0,ifpc=0,thread=0,waitBv=0;
   /* Independent decoder asserts ordering and address/value pairs. */
   while(at<n) {
@@ -94,10 +101,10 @@ int main() {
   assert(w[n-1]==fg_abi_pkt7(0x26,0));
  }
  assert(!fg_abi_frame(w,va,bytes,0,0x10029080,0,1,1));
- assert(!fg_abi_frame(w,va,bytes,17,0x10029080,0,1,1));
+ assert(!fg_abi_frame(w,va,bytes,129,0x10029080,0,1,1));
  assert(!fg_abi_frame(w,va,bytes,1,0x10029080,0,0,1));
  bytes[0]=0; assert(!fg_abi_frame(w,va,bytes,1,0x10029080,0,1,1));
- puts("PASS: all 16 wire layouts/selectors, bounds/overflow/flags, independent PM4 decode, reset/SRAM/IFPC/BV/BR/IB framing");
+ puts("PASS: all 16 wire layouts/selectors, 128-IB and legacy 416-byte submit sizes, bounds/overflow/flags, independent PM4 decode of 1..128 IB frames, reset/SRAM/IFPC/BV/BR/IB framing");
 }
 '''
 BACKEND_PREFIX = r'''
@@ -159,10 +166,11 @@ static unsigned state=1,drains,drainGood=1,fault,tlbs,failTlb,doorbells,enqueued
 static uint32_t regs[0x10000],sregs[0x1000],ring[8192];
 static unsigned highReads,rollover;
 static unsigned readFault,sreadFault,writeFail,writeCount,logLines,dumpLines,hangLines;
-static char lastLog[256],hangLog[16][256];
+static char lastLog[512],hangLog[16][256],stallLog[40][512];static unsigned stallLines;
 static int trace(const char *fmt,...) {
  va_list ap;va_start(ap,fmt);vsnprintf(lastLog,sizeof(lastLog),fmt,ap);va_end(ap);
- logLines++;if(strstr(lastLog,"init regs"))dumpLines++;if(strstr(lastLog,"FUXI GPU HANG:")){assert(hangLines<16);strcpy(hangLog[hangLines++],lastLog);}return 0;
+ logLines++;if(strstr(lastLog,"init regs"))dumpLines++;if(strstr(lastLog,"FUXI GPU HANG:")){assert(hangLines<16);strcpy(hangLog[hangLines++],lastLog);}
+ if(strstr(lastLog,"FUXI GPU STALL:")){assert(stallLines<40);strcpy(stallLog[stallLines++],lastLog);}return 0;
 }
 #define printf trace
 static unsigned g_cb(unsigned bank) {return bank*0x100;}
@@ -171,11 +179,28 @@ static uint32_t g3_gr(unsigned reg) {assert(reg<0x10000);if(reg==readFault)fg_ac
   if(rollover && (rollover==2 || highReads==1))return highReads;
  }
  return regs[reg];}
-static int g3_gw(unsigned reg,uint32_t value) {if(++writeCount==writeFail) {fg_access_failed=1;return 0;} regs[reg]=value; if(reg==0x807) doorbells++; return 1;}
 static uint32_t g3_sr(unsigned reg) {if(sreadFault)fg_access_failed=1;return sregs[reg/4];}
 static int g3_sw(unsigned reg,uint32_t value) {assert(!fg_busy);sregs[reg/4]=value;return 1;}
 static void g_zero(uint64_t pa,unsigned bytes) {assert(pa>=G_MEM && pa+bytes<=G_MEM+G_MEM_SIZE);memset((void *)G_PTR(pa),0,bytes);}
-static uint32_t g3_read(uint64_t pa) {return *(uint32_t *)G_PTR(pa);}
+#define GPU_GMU_CORE 0x03d6a000ULL
+static uint32_t gmuRegs[0x10000];
+static unsigned fenceDrops,fenceStuck,gmuReads,gmuWrites;
+static uint32_t g3_read(uint64_t pa) {
+ if(pa>=GPU_GMU_CORE && pa<GPU_GMU_CORE+0x40000) {gmuReads++;return gmuRegs[(pa-GPU_GMU_CORE)/4];}
+ return *(uint32_t *)G_PTR(pa);
+}
+static int g3_write(uint64_t pa,uint32_t v) {
+ assert(pa>=GPU_GMU_CORE && pa<GPU_GMU_CORE+0x40000);gmuWrites++;
+ if(pa==GPU_GMU_CORE+0x9314*4) {assert(v==7);gmuRegs[0x9313]=fenceStuck?1:0;return 1;}
+ assert(0);return 0;
+}
+#define IBSRC 0x100000UL /* the pmap model maps any low address; reads of it are served from ibMemory */
+static uint8_t ibMemory[16384];
+static unsigned fuxi_gpu_access(uintptr_t va,uint64_t *v,unsigned wr,unsigned wide) {
+ assert(!wr && !wide);
+ if(va<IBSRC || va+4>IBSRC+sizeof(ibMemory)) return 1;
+ uint32_t x;memcpy(&x,ibMemory+(va-IBSRC),4);*v=x;return 0;
+}
 static void g_wr(uint64_t pa,unsigned off,uint32_t value) {*(uint32_t *)G_PTR(pa+off)=value;}
 static int g3_faulted(void) {return fault;}
 static int g4_tlb(uint32_t *d) {(void)d;tlbs++;return failTlb;}
@@ -188,6 +213,8 @@ static unsigned fg_access(uint64_t pa,uint64_t *v,unsigned wr,unsigned wide) {
 }
 static void gpu_model(void);
 static void delay(unsigned n) {(void)n;delays++;if(fg_client_busy && cohMode) gpu_model();}
+static int g3_gw(unsigned reg,uint32_t value) {if(++writeCount==writeFail) {fg_access_failed=1;return 0;} regs[reg]=value; if(reg==0x807) {doorbells++;if(fenceDrops) {fenceDrops--;gmuRegs[0x9313]=1;} else if(fenceStuck) gmuRegs[0x9313]=1;} return 1;}
+//FENCED_DOORBELL//
 static int fg_isolate(void) {assert(hangLines==16);drains++;if(fg_suspends!=UINT64_MAX)fg_suspends++;return drainGood;}
 static void fg_fail(const char *why,unsigned code) {(void)why;(void)code;if(state==1 && fg_faults!=UINT64_MAX)fg_faults++;state=2;}
 static int fuxi_gpu_ready(void) {return state==1;}
@@ -211,6 +238,10 @@ static void seed(void) {
  memset(fg_abi_imports,0,sizeof(fg_abi_imports));fg_abi_host_handoff=fg_abi_ncimport=ncimportArg=0;fg_abi_coh=fg_abi_coh_tries=0;memset(fg_abi_coh_page,0,sizeof(fg_abi_coh_page));
  fg_abi_cleaned=fg_abi_skipped=fg_abi_invalidated=0;
  readFault=sreadFault=writeFail=writeCount=logLines=hangLines=0;
+ memset(gmuRegs,0,sizeof(gmuRegs));fenceDrops=fenceStuck=gmuReads=gmuWrites=stallLines=0;
+ fg_wptr_fence=fg_abi_unstick=fg_abi_stage=fg_abi_stall_lines=0;memset(fg_wptr_stats,0,sizeof(fg_wptr_stats));
+ memset(fg_abi_ibs,0,sizeof(fg_abi_ibs));memset(fg_abi_stall_stats,0,sizeof(fg_abi_stall_stats));
+ memset(fg_abi_maps,0,sizeof(fg_abi_maps));fg_abi_map_seq=fg_abi_submit_map_seq=0;
 }
 static void reset(void) {
  seed();
@@ -460,7 +491,7 @@ int main(void) {
  // only initial map clean replaces per-submit clean. Completion still IVACs writable imports (not the read-only one).
  for(unsigned arg=0;arg<2;arg++) {
   seed();ncimportArg=arg;assert(fg_abi_init());
-  assert(fg_abi_ncimport==(arg==1) && !fg_abi_cohtest && !fg_abi_tlbpages);
+  assert(fg_abi_ncimport==(arg==1) && fg_wptr_fence==(arg==2) && !fg_abi_unstick && !fg_abi_cohtest && !fg_abi_tlbpages);
   assert(!fuxi_gpu_abi_map_import(va,source,32768,3));
   assert(!(*fg_abi_leaf(va)&(1u<<2)) && ((*fg_abi_leaf(va)>>8)&3)==2);
   assert(!fuxi_gpu_abi_map_import(va+0x10000,source+65536,16384,1));
@@ -571,6 +602,101 @@ int main(void) {
  puts("PASS: coherent self-test (pass skips maintenance; stale/partial/hang/fault/busy/occupied stay on the clean+invalidate path; probe window left unmapped)");
 
 
+ /* One 128-IB frame is one submission: a single prologue, 128 IB packets, one doorbell, across the ring wrap. */
+ {
+  reset();
+  uint64_t many[129],lens[129];for(unsigned i=0;i<129;i++) {many[i]=0x20000000+i*4096;lens[i]=4096;}
+  unsigned start=8100;g3_wptr=regs[0x806]=regs[0x807]=start;
+  assert(fuxi_gpu_abi_submit(many,lens,129,&fence)==-1 && !doorbells && fg_client_busy==0 && g3_wptr==start);
+  assert(!fuxi_gpu_abi_submit(many,lens,128,&fence) && fence==1 && doorbells==1);
+  assert(regs[0x807]==((start+FG_ABI_FRAME_WORDS)&8191) && g3_wptr==regs[0x807]);
+  unsigned ibs=0,at=0;
+  while(at<FG_ABI_FRAME_WORDS) {
+   uint32_t h=ring[(start+at)&8191];unsigned type=h>>28,len=type==7?h&0x3fff:h&0x7f;
+   if(type==7 && ((h>>16)&0x7f)==0x3f) {assert(len==3 && ring[(start+at+1)&8191]==many[ibs]);ibs++;}
+   at+=len+1;
+  }
+  assert(at==FG_ABI_FRAME_WORDS && ibs==128);
+  assert(fg_abi_ibs[0]==1 && fg_abi_ibs[1]==128 && fg_abi_ibs[2]==128 && fg_abi_ibs[3]==1);
+  complete();assert(!fuxi_gpu_abi_poll(fence));
+  assert(!fuxi_gpu_abi_submit(many,lens,3,&fence) && fg_abi_ibs[0]==2 && fg_abi_ibs[1]==131 && fg_abi_ibs[2]==128 && fg_abi_ibs[3]==1);
+  uint32_t a[4],b[4],c[8];fuxi_gpu_abi_sched_stats(a,b,c);assert(a[0]==2 && a[1]==131 && b[0]==2 && !gmuReads);
+  puts("PASS: 128-IB frame is one submission across the ring wrap, 129 refused before any doorbell, IB counters");
+ }
+ /* Fenced WPTR (fuxigpuncimport bit 1): off = one plain write and no GMU access; on = read the AHB fence status and write again while dropped. */
+ for(unsigned mode=0;mode<5;mode++) {
+  seed();ncimportArg=mode==0?0:2;assert(fg_abi_init());assert(fg_wptr_fence==(mode!=0));
+  fenceDrops=mode==2?1:mode==3?3:0;fenceStuck=mode==4;
+  assert(!fuxi_gpu_abi_submit(addresses,sizes,1,&fence));
+  const unsigned want[5][3]={{0,0,0},{0,0,0},{1,1,0},{1,3,0},{0,200,1}}; /* dropped then acknowledged, repeated writes, still dropped */
+  assert(doorbells==1+want[mode][1] && fg_wptr_stats[0]==1);
+  assert(fg_wptr_stats[1]==want[mode][0] && fg_wptr_stats[2]==want[mode][1] && fg_wptr_stats[3]==want[mode][2]);
+  assert(mode ? gmuReads>0 : (!gmuReads && !gmuWrites));
+  assert(fg_client_busy && state==1 && !hangLines);
+ }
+ {
+  seed();ncimportArg=2;assert(fg_abi_init());readFault=0;
+  /* a failing GMU register read is a fault, not a retry */
+  fg_access_failed=0;
+  uint64_t one[1]={va},len[1]={4096};
+  fenceDrops=0;assert(!fuxi_gpu_abi_submit(one,len,1,&fence));
+  puts("PASS: fenced WPTR off/on, dropped write repeated until acknowledged, 200-try bound, GMU window offsets");
+ }
+ /* Stall recovery (fuxigpuncimport bit 2): 30 ms snapshot + TLB drop + WPTR kick, 60 ms bus drain, completion accounting; off = nothing. */
+ for(unsigned on=0;on<2;on++) {
+  seed();ncimportArg=on?4:0;assert(fg_abi_init());assert(fg_abi_unstick==on);
+  (void)fuxi_gpu_abi_unmap(0x20000000,4096);assert(!fuxi_gpu_abi_map(0x20000000,IBSRC,4096,3,0,2));
+  assert(fg_abi_map_at(0x20000800)->source==IBSRC && !fg_abi_map_at(0x20001000) && fg_abi_maps[0].seq==1);
+  for(unsigned i=0;i<1024;i++) {uint32_t x=0x1000+i;memcpy(ibMemory+4*i,&x,4);}
+  uint64_t ib[1]={0x20000000},ln[1]={4096};
+  regs[0x3c46]=3;regs[0x928]=0x20000000;regs[0x929]=0;regs[0x943]=0x40;regs[0x92a]=0x30;regs[0xa6d]=0x20000200;regs[0xa71]=0x20000400;
+  regs[0xa72]=0;regs[0x210]=0;
+  assert(!fuxi_gpu_abi_submit(ib,ln,1,&fence));
+  unsigned d0=doorbells,t0=tlbs;
+  ticks=29000;fg_abi_watch(NULL,NULL);assert(doorbells==d0 && !stallLines && !fg_abi_stage);
+  ticks=30000;fg_abi_watch(NULL,NULL);
+  if(!on) {assert(doorbells==d0 && tlbs==t0 && !stallLines && !fg_abi_stall_stats[0] && !regs[0x3c45]);}
+  else {
+   assert(doorbells==d0+1 && tlbs==t0+1 && fg_abi_stage==1 && fg_abi_stall_stats[0]==1 && fg_abi_stall_stats[1]==1 && fg_abi_stall_stats[7]==1);
+   assert(regs[0x807]==g3_wptr); /* the same value again */
+   assert(stallLines>=7 && strstr(stallLog[0],"pending 30 ms") && strstr(stallLog[1],"30ms seq 1"));
+   assert(strstr(stallLog[1],"rptr 0 wptr") && strstr(stallLog[2],"ib1 00000000:20000000 rem 30 init 40"));
+   assert(strstr(stallLog[2],"bv rptr 0 ib1 lo 20000200 rem 0 ib2 00000000:20000400"));
+   assert(strstr(stallLog[3],"smmu fsr"));
+   /* reached = 0x40-0x30 = 16 words in: the last fetched word is 15, the window starts 12 words before it */
+   assert(strstr(stallLog[4],"BR-IB1 at 0x2000003c from 0x2000000c map 0x20000000 seq 1/1 unread 0: 00001003 00001004"));
+   assert(strstr(stallLog[5],"BV-IB1 at 0x20000200 from 0x200001d0") && strstr(stallLog[5],"unread 0: 00001074"));
+   assert(strstr(stallLog[6],"BV-IB2 at 0x20000400 from 0x200003d0"));
+   unsigned lines=stallLines;ticks=45000;fg_abi_watch(NULL,NULL);assert(doorbells==d0+1 && tlbs==t0+1 && stallLines==lines && fg_abi_stage==1);
+   ticks=60000;fg_abi_watch(NULL,NULL);
+   assert(fg_abi_stage==2 && fg_abi_stall_stats[2]==1 && fg_abi_stall_stats[3]==1 && fg_abi_stall_stats[4]==1 && !regs[0x3c45]);
+   assert(state==1 && drains==0 && fg_client_busy && !hangLines);
+   ticks=70000;fg_abi_watch(NULL,NULL);assert(fg_abi_stage==2 && doorbells==d0+1 && fg_abi_stall_stats[2]==1);
+   complete();fg_abi_watch(NULL,NULL);
+   assert(!fg_client_busy && fg_abi_stage==0 && fg_abi_stall_stats[6]==1 && fg_abi_stall_stats[5]==0 && strstr(stallLog[stallLines-1],"completed after bus drain"));
+   /* A job that completes after only the kick. */
+   assert(!fuxi_gpu_abi_submit(ib,ln,1,&fence));ticks+=30000;fg_abi_watch(NULL,NULL);assert(fg_abi_stage==1);
+   complete();fg_abi_watch(NULL,NULL);assert(fg_abi_stall_stats[5]==1 && fg_abi_stage==0 && fg_abi_stall_stats[0]==2);
+   /* A job past the 100 ms deadline is still fatal; its hang report gets the same CP and IB snapshot. */
+   assert(!fuxi_gpu_abi_submit(ib,ln,1,&fence));regs[0x807]=g3_wptr;regs[0x806]=g3_wptr-1;
+   ticks+=100001;stallLines=0;fg_abi_watch(NULL,NULL);
+   assert(state==2 && hangLines==16 && drains==1 && fg_abi_stage==0 && strstr(stallLog[0],"hang seq"));
+   assert(strstr(stallLog[3],"BR-IB1 at 0x2000003c"));
+  }
+ }
+ /* IB words come from the kernel mapping and are bounded by the mapped range; unmapped addresses and faults are reported, not read. */
+ reset();(void)fuxi_gpu_abi_unmap(0x20000000,4096);(void)fuxi_gpu_abi_unmap(0x20002000,8192);
+ assert(!fuxi_gpu_abi_map(0x20000000,IBSRC,4096,3,0,2) && !fuxi_gpu_abi_map(0x20002000,0x200000,8192,3,0,2));
+ stallLines=0;regs[0x928]=0x20000fc0;regs[0x943]=0x10;regs[0x92a]=0;regs[0xa6d]=0x20002000;regs[0xa71]=0x1000;
+ fg_abi_snapshot("t");
+ assert(strstr(stallLog[3],"BR-IB1 at 0x20000ffc from 0x20000fcc") && strstr(stallLog[3],"unread 3"));
+ assert(strstr(stallLog[4],"BV-IB1 at 0x20002000 from 0x20002000") && strstr(stallLog[4],"unread 16: deadbeef"));
+ assert(strstr(stallLog[5],"BV-IB2 IB 0x1000 not in a mapped range"));
+ stallLines=0;regs[0x928]=0x20000ffc;regs[0x943]=0;regs[0x92a]=0;fg_abi_snapshot("t");
+ assert(strstr(stallLog[3],"at 0x20000ffc from 0x20000fcc") && strstr(stallLog[3],"unread 3"));
+ assert(!fuxi_gpu_abi_unmap(0x20000000,4096) && !fg_abi_map_at(0x20000000) && fg_abi_map_at(0x20002000));
+ puts("PASS: stall recovery off/on (30 ms snapshot/TLB/kick, 60 ms drain, completion accounting), hang snapshot, IB word reads bounded by mapped ranges");
+
  puts("PASS: actual backend root isolation, 16K/4K scattered leaves, VA reuse/TLBI, present exclusion, late retirement, independent watchdog/fault/drain/quarantine");
 }
 '''
@@ -589,8 +715,11 @@ def main():
         backend = re.sub(r'__asm__ volatile\("dsb sy" ::: "memory"\);', '(void)0;', backend)
         backend = backend.replace('__asm__ volatile("dc ivac, %0" :: "r"(p) : "memory");', 'host_cache(p,1);')
         backend = backend.replace('__asm__ volatile("dc civac, %0" :: "r"(p) : "memory");', 'host_cache(p,0);')
+        adapter = (HEADERS/'fuxi_adreno.c').read_text()
+        doorbell = adapter[adapter.index('#define FG_GMU_AHB_FENCE_STATUS'):adapter.index('\n}\n', adapter.index('static int fg_ring_doorbell'))+3]
+        doorbell = re.sub(r'__asm__ volatile\("dsb sy" ::: "memory"\);', '(void)0;', doorbell)
         model = out/'backend.c'
-        model.write_text(BACKEND_PREFIX + backend + BACKEND_TEST)
+        model.write_text(BACKEND_PREFIX.replace('//FENCED_DOORBELL//', doorbell) + backend + BACKEND_TEST)
         for compiler, source in [('clang++', wire), ('clang', model)]:
             binary = source.with_suffix('')
             subprocess.run([compiler, '-std=c++17' if compiler=='clang++' else '-std=gnu11',

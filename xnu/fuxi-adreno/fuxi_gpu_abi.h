@@ -23,6 +23,8 @@ int fuxi_gpu_abi_timestamp(uint64_t *ticks);
 /* Monotonic boot-wide counts remain readable after permanent GPU failure. */
 int fuxi_gpu_abi_status(uint64_t *faults, uint64_t *suspends);
 int fuxi_gpu_abi_available(void);
+/* Snapshot of the backend's IBs-per-submit [4], WPTR fence [4] and stall recovery [8] counters; see fuxi_gpu_abi_backend.inc. */
+void fuxi_gpu_abi_sched_stats(uint32_t ibs[4], uint32_t wptr[4], uint32_t stall[8]);
 void fuxi_gpu_abi_publish(void);
 #ifdef __cplusplus
 }

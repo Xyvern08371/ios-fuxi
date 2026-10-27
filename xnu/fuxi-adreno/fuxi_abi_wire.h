@@ -16,8 +16,20 @@
 /* Exact direct-selector wire lengths. */
 static inline unsigned fg_abi_input_size(unsigned method)
 {
- static const unsigned sizes[17] = {0,0,16,32,8,416,16,0,0,80,80,8,8,8,16,0,16};
+ static const unsigned sizes[17] = {0,0,16,32,8,32+24*NativeAdrenoAbiMaxBuffers,16,0,0,80,80,8,8,8,16,0,16};
  return method <= 16 ? sizes[method] : 0;
+}
+/* Submit records of the 16-IB layout (416 bytes) are still accepted: a Turnip built before the 128-IB header keeps working on a newer
+ * kernel (the kernel image and the root's libvulkan are updated separately). The records differ only in how many buffers follow. */
+#define FG_ABI_SUBMIT_V1_BYTES 416u
+static inline unsigned fg_abi_input_ok(unsigned method, unsigned size)
+{
+ return size == fg_abi_input_size(method) || (method == NativeAdrenoMethodSubmit && size == FG_ABI_SUBMIT_V1_BYTES);
+}
+/* IBs a submit record of this many bytes can hold. */
+static inline unsigned fg_abi_submit_capacity(unsigned size)
+{
+ return size >= 32 ? (size-32)/24 : 0;
 }
 static inline unsigned fg_abi_output_size(unsigned method)
 {
@@ -66,14 +78,16 @@ static inline uint32_t fg_abi_pkt7(unsigned op, unsigned n)
 { return 0x70000000u | n | fg_abi_parity(n)<<15 | op<<16 | fg_abi_parity(op)<<23; }
 static inline uint32_t fg_abi_pkt4(unsigned reg, unsigned n)
 { return 0x40000000u | n | fg_abi_parity(n)<<7 | reg<<8 | fg_abi_parity(reg)<<27; }
-/* Caller supplies 160 words. Fixed-size framing: 37 + count*4 + 31 + WFI.
+/* Words of the largest frame: reset 11+26, one 4-word IB packet per buffer, fence 31, trailing WFI. The ring (8192 words) is idle at submit. */
+#define FG_ABI_FRAME_WORDS (11+26+4*NativeAdrenoAbiMaxBuffers+31+1)
+/* Caller supplies FG_ABI_FRAME_WORDS words. Fixed-size framing: 37 + count*4 + 31 + WFI.
  * fence_base+4 is BR completion, +12 is BV completion; +0/+8 unused here.
  * Reset on each return from the present context, which changes CP state. */
 static inline unsigned fg_abi_frame(uint32_t *w, const uint64_t *iova,
     const uint64_t *bytes, unsigned count, uint32_t fence_base,
     uint32_t previous, uint32_t seq, int reset)
 {
- if (!w || !iova || !bytes || !count || count>16 || !seq || (fence_base&15)) return 0;
+ if (!w || !iova || !bytes || !count || count>NativeAdrenoAbiMaxBuffers || !seq || (fence_base&15)) return 0;
  for (unsigned i=0;i<count;i++)
   if (!bytes[i] || ((iova[i]|bytes[i])&3) || iova[i]>>32 || bytes[i]/4>0xfffff) return 0;
  unsigned n=0;

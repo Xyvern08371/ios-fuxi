@@ -345,6 +345,8 @@ static int IOLog(const char *format,...) {
 struct IOTimerEventSource {uint64_t next=0;void wakeAtTime(int,uint64_t n,int){next=n;arms++;}void setTimeoutUS(unsigned n){next=ticks+n*1000;arms++;}};
 static unsigned abiStatsLogs;
 static void fuxi_gpu_abi_stats_log(void) {abiStatsLogs++;}
+static unsigned abiSchedLogs;
+static void fuxi_gpu_abi_sched_log(void) {abiSchedLogs++;}
 struct OSArray {
  std::vector<void *> objects;
  unsigned getCount(){return objects.size();}
@@ -470,7 +472,7 @@ int main(void) {
  assert(fb.fGpuFailed==1 && !fb.fGpuPending && fb.fShadowValid && refs==recordRefs(fb));
  // The GPU ABI timing window is printed with, and only with, the 600-frame stats line.
  fb.fStatFrames=599;pollMode=1;gpuMode=0;fb.fDirty=true;fb.swap(rec);fb.vsyncFired(&fb,&timer);
- assert(abiStatsLogs==1 && !fb.fStatFrames);
+ assert(abiStatsLogs==1 && abiSchedLogs==1 && !fb.fStatFrames);
  fb.swap(rec);fb.vsyncFired(&fb,&timer);assert(abiStatsLogs==1);
  assert(fuxi_unixnu_next_tick(10,100,50)==110);
  assert(fuxi_unixnu_next_tick(10,100,110)==210);

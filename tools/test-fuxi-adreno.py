@@ -118,6 +118,11 @@ static void CleanPoC_DcacheRegion_Force(uint64_t va,uint64_t n)
 static int g4_tlb(uint32_t *d) { (void)d; return ++tlbs==fail_tlb ? 0xe03 : 0; }
 static unsigned g3_gr(unsigned reg) { return reg==0x806 ? rptr : reg==0x807 ? wptr : reg==0x210 && mode==6 ? 2 : 0; }
 static unsigned g3_read(uint64_t pa) { assert(pa==G3_FENCE_PA+64); return mode==8 && ticks<completion ? 0 : fence; }
+#define GPU_GMU_CORE 0x03d6a000ULL
+#define FG_GMU_AHB_FENCE_STATUS (GPU_GMU_CORE+0x9313*4)
+#define FG_GMU_AHB_FENCE_CLR (GPU_GMU_CORE+0x9314*4)
+static unsigned fg_wptr_fence, fg_wptr_stats[4];
+static int g3_write(uint64_t pa, uint32_t v) { (void)pa; (void)v; assert(0); return 0; } /* only the fenced doorbell (default off) writes the GMU */
 static int g3_faulted(void) { return mode==4 && doorbells; }
 static void g3_emit(uint32_t value)
 {
@@ -427,7 +432,7 @@ def main():
             assert a + n <= b or b + m <= a, 'overlapping platform mappings'
     functions = ''.join(function(probe, n) for n in ('g3_parity', 'g3_pkt7', 'g4_pkt4', 'g4_reg', 'g4_event', 'g4_wfi', 'g4_setup', 'g4_end'))
     functions += function((ROOT / 'xnu/fuxi-adreno/fuxi_gpu_scanout.inc').read_text(), 'fg_scanout_target')
-    functions += ''.join(function(adapter, n) for n in ('fg_fail', 'fg_isolate', 'fuxi_gpu_unmap', 'fuxi_gpu_map', 'fg_rect', 'fg_clean', 'fuxi_gpu_poll', 'fuxi_gpu_copy'))
+    functions += ''.join(function(adapter, n) for n in ('fg_fail', 'fg_isolate', 'fuxi_gpu_unmap', 'fuxi_gpu_map', 'fg_rect', 'fg_clean', 'fg_ring_doorbell', 'fuxi_gpu_poll', 'fuxi_gpu_copy'))
     functions = re.sub(r'__asm__ volatile\([^;]*\);', ';', functions)
     constants = '\n'.join(line for line in sync.added_file('gpu-a740.h').splitlines() if line.startswith('#define G4_'))
     with tempfile.TemporaryDirectory() as d:
