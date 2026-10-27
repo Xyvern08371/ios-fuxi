@@ -194,6 +194,8 @@ kernel() {
     python3 tools/test-fuxi-regtrace.py
     python3 tools/test-fuxi-perf.py
     python3 tools/sync-fuxi-perf.py --check
+    python3 tools/test-fuxi-audio.py
+    python3 tools/sync-fuxi-audio.py --check
     if [[ $target == kernel-wlan6g ]]; then
         # WLAN source keeps the existing artifact/target and cmdlines. Exercise the
         # exact C carried by patch 0099 before spending a hosted kernel build.
