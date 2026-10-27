@@ -252,6 +252,7 @@ public:
 OSDefineMetaClassAndStructors(IOMobileFramebufferUserClient, IOUserClient);
 #if defined(FUXI)
 extern "C" void fuxi_display_kick(void);
+extern "C" void fuxi_gpu_abi_stats_log(void);
 #endif
 
 /* NativeMetal c6d29ca (MIT): prioritize the path carrying frames to screen.
@@ -1303,6 +1304,7 @@ void AppleCLCD::presentStats(uint64_t took)
 		    us[0], us[1], us[2], us[3], us[4], us[5], us[6], us[7],
 		    split.hits, split.misses, split.sleeps, split.blocks, split.groups, fGpuBusyTicks, fGpuFailed,
 		    imports, mapped, cleaned, skipped, invalidated);
+		fuxi_gpu_abi_stats_log();
 		fGpuBusyTicks = fGpuFailed = 0;
 		fGpuFrames = fCpuFrames = 0;
 		fGpuTime = fCpuTime = 0;

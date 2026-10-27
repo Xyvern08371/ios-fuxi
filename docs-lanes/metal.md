@@ -1876,11 +1876,19 @@ with the IRQ bit, restores BOTH/IFPC and waits for idle. Context reset is emitte
 on every return from the present context, including the first client submit.
 RBBM interrupt delivery remains masked; no GIC/IRQ completion is claimed.
 
-WaitFence sleeps in 1 ms slices and returns `kIOReturnTimeout` for a user or
-hardware deadline. Zero timeout observes once. An independent delayed callback
+WaitFence sleeps in `fuxigpuwaitus` slices (default 100 us) without holding the client lock,
+and returns `kIOReturnTimeout` for a user or hardware deadline. Zero timeout observes once. An independent delayed callback
 checks every 2 ms, even when no client calls WaitFence, and declares a pending
 job lost at 100 ms. Completion observed after the deadline wins if the ring is
 already retired. Scheduling can delay observation beyond these intervals.
+Kernel-side call cost (not yet observed on device): Submit, BoMap and BoFree
+observe a pending job once instead of waiting for the 2 ms callback, so a busy
+retry succeeds as soon as the fence is written. BoMap walks pmap once per 16K
+page; BoFree keeps its TLB invalidate; read-only
+imports are cleaned at submit but not invalidated at retirement; BoAlloc looks
+up one physical segment per run. BoAlloc still zero-fills (see source comment).
+The SWEET FB stats cadence also prints `FUXI GPU ABI: calls n/avg/max us ...`
+per selector plus lock wait, segment walk, zero fill and sleeps, then restarts.
 A client fault/hang permanently disables GPU submission for this boot, drains
 GBIF, holds reset and faults SID0/1, allowing CPU presentation to continue.
 Failed drain quarantines the wired BO references until reset. There is no

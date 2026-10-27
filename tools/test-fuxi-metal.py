@@ -182,7 +182,8 @@ static int fg_isolate(void) {assert(hangLines==16);drains++;if(fg_suspends!=UINT
 static void fg_fail(const char *why,unsigned code) {(void)why;(void)code;if(state==1 && fg_faults!=UINT64_MAX)fg_faults++;state=2;}
 static int fuxi_gpu_ready(void) {return state==1;}
 static void g3_emit(uint32_t v) {ring[g3_wptr++&8191]=v;}
-static ppnum_t pmap_find_phys(unsigned map,uintptr_t va) {(void)map; return (unsigned)(0x200000+(va>>14)*3);}
+static unsigned pmapWalks;
+static ppnum_t pmap_find_phys(unsigned map,uintptr_t va) {(void)map; pmapWalks++; return (unsigned)(0x200000+(va>>14)*3);}
 static void clock_interval_to_deadline(unsigned n,unsigned scale,uint64_t *d) {*d=ticks+(uint64_t)n*scale/1000;}
 static void thread_call_setup_with_options(thread_call_data_t *c,void (*fn)(void *,void *),void *arg,unsigned pri,unsigned opt) {(void)arg;(void)pri;(void)opt;c->fn=fn;}
 static int thread_call_enter_delayed(thread_call_data_t *c,uint64_t d) {(void)c;(void)d;enqueued++;return 0;}
@@ -289,11 +290,24 @@ int main(void) {
  assert((runtime[0]&~4095ULL)==G3_SQE_PA && (runtime[0]&0xc0)==0xc0);
  /* Deliberately cross a 1 GiB root boundary with scattered 16K pages. */
  uint64_t va=0x3fffc000,bytes=32768;uintptr_t source=0x100000;
- assert(!fuxi_gpu_abi_map(va,source,bytes,3,0,2));
+ pmapWalks=0;assert(!fuxi_gpu_abi_map(va,source,bytes,3,0,2));
+ assert(pmapWalks==bytes/16384); /* one pmap walk per 16K page, not per 4K leaf and not twice */
  for(unsigned off=0;off<bytes;off+=4096) {
   uint64_t want=((uint64_t)pmap_find_phys(0,source+off)<<14)|((source+off)&16383)|3|1u<<6|2u<<8|1u<<10;
   assert(*fg_abi_leaf(va+off)==want);
  }
+ /* 4K-aligned but not 16K-aligned source: leaves still come from the right page. */
+ pmapWalks=0;assert(!fuxi_gpu_abi_map(0x30000000,source+4096,16384,3,0,2) && pmapWalks==2);
+ for(unsigned off=0;off<16384;off+=4096) {
+  uint64_t want=((uint64_t)pmap_find_phys(0,source+4096+off)<<14)|((source+4096+off)&16383)|3|1u<<6|2u<<8|1u<<10;
+  assert(*fg_abi_leaf(0x30000000+off)==want);
+ }
+ assert(!fuxi_gpu_abi_unmap(0x30000000,16384));
+ /* A range spanning two 2 MiB chunks: the per-chunk leaf pointer must switch tables. */
+ assert(!fuxi_gpu_abi_map(0x201ff000-0x1000,source,0x4000,3,0,2));
+ for(unsigned off=0;off<0x4000;off+=4096) assert(*fg_abi_leaf(0x201ff000-0x1000+off));
+ assert(*fg_abi_leaf(0x20200000)!=*fg_abi_leaf(0x201ff000) && !fuxi_gpu_abi_unmap(0x201ff000-0x1000,0x4000));
+ assert(!*fg_abi_leaf(0x20200000) && !*fg_abi_leaf(0x201fe000));
  assert(fuxi_gpu_abi_map(va,source,bytes,3,0,2)==-1); /* no replacement */
  assert(!fuxi_gpu_abi_map(0x7ffff000,source,4096,1,1,3));
  assert((*fg_abi_leaf(0x7ffff000)&0xfff)==(3|3u<<6|1u<<2|3u<<8|1u<<10));
@@ -383,11 +397,34 @@ int main(void) {
   assert(!!fg_abi_imports[0].iova==!good); // unknown DMA keeps mapping owned
  }
  reset();assert(!fuxi_gpu_abi_map_import(va,source,16384,3));
- failTlb=1;assert(fuxi_gpu_abi_unmap(va,16384)==-1);
+ failTlb=1;assert(fuxi_gpu_abi_unmap(va,16384)==-1); // unmap keeps its TLB sync
  assert(!cacheClean && !cacheInvalidate); // no submit: preserve dirty CPU data
+ // A read-only import is cleaned for the GPU but never invalidated at retirement; a writable one still is.
+ reset();assert(!fuxi_gpu_abi_map_import(va,source,16384,1));
+ assert(!fuxi_gpu_abi_submit(addresses,sizes,1,&fence) && cacheClean==256);
+ complete();assert(!fuxi_gpu_abi_poll(fence) && !cacheInvalidate && fg_abi_imports[0].iova==va);
+ assert(!fuxi_gpu_abi_unmap(va,16384) && !fg_abi_imports[0].iova);
+ reset();assert(!fuxi_gpu_abi_map_import(va,source,16384,1) && !fuxi_gpu_abi_map_import(va+0x10000,source,16384,3));
+ assert(!fuxi_gpu_abi_submit(addresses,sizes,1,&fence) && cacheClean==512);
+ complete();fg_abi_watch(NULL,NULL);assert(cacheInvalidate==256); // only the writable range
+ assert(!fuxi_gpu_abi_unmap(va,16384) && !fuxi_gpu_abi_unmap(va+0x10000,16384));
+ // A retired job is seen by the next submit/map/unmap itself, without waiting for the 2 ms watchdog.
+ reset();assert(!fuxi_gpu_abi_map(va,source,bytes,3,0,2));
+ assert(!fuxi_gpu_abi_submit(addresses,sizes,1,&fence) && fg_client_busy);
+ assert(fuxi_gpu_abi_submit(addresses,sizes,1,&fence)==1 && fuxi_gpu_abi_unmap(va,bytes)==1 && fuxi_gpu_abi_map(0x30000000,source,4096,3,0,2)==1);
+ complete();tlbs=0;
+ assert(!fuxi_gpu_abi_unmap(va,bytes) && !fg_client_busy && tlbs==2 && !drains); /* restore-switch + the unmap's own TLBI */
+ assert(sregs[(g_cb(g3_bank)+0x20)/4]==(uint32_t)G3_PT && !*fg_abi_leaf(va));
+ assert(!fuxi_gpu_abi_map(va,source,bytes,3,0,2) && !fuxi_gpu_abi_submit(addresses,sizes,1,&fence));
+ complete();uint64_t second=0;
+ assert(!fuxi_gpu_abi_submit(addresses,sizes,1,&second) && second==fence+1 && doorbells==3 && fg_client_busy);
+ complete();assert(!fuxi_gpu_abi_map(0x30000000,source,4096,3,0,2) && !fg_client_busy);
+ // Observation on the busy path still isolates a faulting job.
+ reset();assert(!fuxi_gpu_abi_map(va,source,bytes,3,0,2) && !fuxi_gpu_abi_submit(addresses,sizes,1,&fence));
+ fault=1;regs[0x928]=1;assert(fuxi_gpu_abi_submit(addresses,sizes,1,&second)==-1 && state==2 && !fg_client_busy);
  puts("PASS: imported BO cache handoff covers indirect resources, watchdog retirement, drained fault and undrained quarantine");
  // Optional writable-import lifetime handoff. NC SMMU attributes stay equal;
- // only initial map clean replaces per-submit clean. Completion still IVACs.
+ // only initial map clean replaces per-submit clean. Completion still IVACs writable imports (not the read-only one).
  for(unsigned arg=0;arg<3;arg++) {
   seed();ncimportArg=arg;assert(fg_abi_init());
   assert(fg_abi_ncimport==(arg==1));
@@ -406,7 +443,7 @@ int main(void) {
   }
   uint64_t cleaned,skipped,invalidated,mapped;unsigned imports;
   fuxi_gpu_import_stats(&cleaned,&skipped,&invalidated,&mapped,&imports);
-  assert(imports==2 && mapped==49152 && invalidated==98304);
+  assert(imports==2 && mapped==49152 && invalidated==65536);
   assert(cleaned==(arg==1?65536u:98304u) && skipped==(arg==1?65536u:0u));
   assert(cacheClean==cleaned/64 && cacheInvalidate==invalidated/64);
   assert(!fuxi_gpu_abi_unmap(va,32768));

@@ -24,6 +24,16 @@ static inline unsigned fg_abi_output_size(unsigned method)
  static const unsigned sizes[17] = {0,24,8,8,0,8,0,8,16,0,80,8,0,16,0,64,8};
  return method <= 16 ? sizes[method] : 0;
 }
+/* Bounded per-call timing, window totals in mach ticks. Slot 0 is the wait for
+ * the client lock, 1..16 are the selectors, the rest are phases inside them. */
+enum { FG_ABI_STAT_LOCK=0, FG_ABI_STAT_WALK=17, FG_ABI_STAT_ZERO=18, FG_ABI_STAT_SLEEP=19, FG_ABI_STATS=20 };
+struct fg_abi_stat { uint64_t count, total, max; };
+static inline void fg_abi_stat_add(struct fg_abi_stat *stats, unsigned slot, uint64_t ticks)
+{
+ if (slot >= FG_ABI_STATS) return;
+ stats[slot].count++; stats[slot].total += ticks;
+ if (ticks > stats[slot].max) stats[slot].max = ticks;
+}
 static inline int fg_abi_range(uint64_t iova, uint64_t bytes)
 {
  return bytes && !((iova|bytes)&4095) && iova >= FG_ABI_VA_START &&

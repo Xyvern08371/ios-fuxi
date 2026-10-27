@@ -343,6 +343,8 @@ static int IOLog(const char *format,...) {
  return 0;
 }
 struct IOTimerEventSource {uint64_t next=0;void wakeAtTime(int,uint64_t n,int){next=n;arms++;}void setTimeoutUS(unsigned n){next=ticks+n*1000;arms++;}};
+static unsigned abiStatsLogs;
+static void fuxi_gpu_abi_stats_log(void) {abiStatsLogs++;}
 struct OSArray {
  std::vector<void *> objects;
  unsigned getCount(){return objects.size();}
@@ -449,6 +451,10 @@ int main(void) {
  // A failed GPU copy replays through CPU and reinitializes the shadow after confirmed retirement.
  fb.fGpuPending=true;fb.fShadowValid=false;pollMode=-1;fb.vsyncFired(&fb,&timer);
  assert(fb.fGpuFailed==1 && !fb.fGpuPending && fb.fShadowValid && refs==recordRefs(fb));
+ // The GPU ABI timing window is printed with, and only with, the 600-frame stats line.
+ fb.fStatFrames=599;pollMode=1;gpuMode=0;fb.fDirty=true;fb.swap(rec);fb.vsyncFired(&fb,&timer);
+ assert(abiStatsLogs==1 && !fb.fStatFrames);
+ fb.swap(rec);fb.vsyncFired(&fb,&timer);assert(abiStatsLogs==1);
  assert(fuxi_unixnu_next_tick(10,100,50)==110);
  assert(fuxi_unixnu_next_tick(10,100,110)==210);
  for(int off=0;off<2;off++)for(int black=0;black<2;black++)for(int dirty=0;dirty<2;dirty++)

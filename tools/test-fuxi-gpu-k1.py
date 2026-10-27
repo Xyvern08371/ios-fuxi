@@ -15,6 +15,7 @@ host = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(host)
 
 BUFFER = r'''
+static unsigned segMode,segCalls;
 constexpr unsigned kIOMemoryKernelUserShared=64,kIOMapWriteCombineCache=128,kIOMemoryPhysicallyContiguous=256;
 struct IOBufferMemoryDescriptor: IOMemoryDescriptor {
  void *data=nullptr;
@@ -25,6 +26,16 @@ struct IOBufferMemoryDescriptor: IOMemoryDescriptor {
   auto *m=new IOBufferMemoryDescriptor;m->length=n;m->data=calloc(1,n);assert(m->data);return m;
  }
  void *getBytesNoCopy() {return data;}
+ // 0 keeps the one-16K-segment-per-page scatter model; others return real runs.
+ uint64_t getPhysicalSegment(uint64_t off,IOByteCount *n,unsigned flags) {
+  segCalls++;
+  if(!segMode)return IOMemoryDescriptor::getPhysicalSegment(off,n,flags);
+  assert(wired && flags==kIOMemoryMapperNone && !(off&16383));
+  uint64_t half=length/2;
+  if(segMode==1){*n=length-off;return 0x40000000+off;}              // one contiguous run
+  if(segMode==2){*n=off<half?half-off:length-off;return (off<half?0x40000000ULL:0x50000000ULL)+(off<half?off:off-half);}
+  *n=length-off;return (UINT64_C(1)<<36)-16384+off;                 // ends at/after 2^36
+ }
 };
 struct FuxiAdrenoBoView {
  IOBufferMemoryDescriptor *backing=nullptr;
@@ -47,7 +58,11 @@ static int fuxi_gpu_abi_submit(const uint64_t *,const uint64_t *,unsigned,uint64
 static uint64_t mach_absolute_time() {return 0;}
 static constexpr unsigned NSEC_PER_MSEC=1000000;
 static void clock_interval_to_deadline(unsigned,unsigned,uint64_t *d) {*d=1;}
-static void IOSleep(unsigned) {}
+static unsigned statCount[FG_ABI_STATS],spins,pauses;
+static int lastSpinDepth=-1;
+static bool *spinKill;
+static void abiStat(unsigned slot,uint64_t) {assert(slot<FG_ABI_STATS);statCount[slot]++;}
+static void abiPause() {pauses++;}
 static const char *abiStep(unsigned) {return "test";}
 using OSObject=int;using IOExternalMethodDispatch=int;
 struct IOExternalMethodArguments {
@@ -144,6 +159,27 @@ int main() {
  fail=15;assert(call(c,2,&alloc,&out)==kIOReturnNoMemory && !c.wired_ && !descriptors);
  fail=16;assert(!call(c,2,&alloc,&out));assert(!c.drop(c.bos_[0]));
  alloc.contiguous=1;assert(call(c,2,&alloc,&out)==kIOReturnNoMemory && !descriptors);
+ // Physical-segment walk: one lookup per run, same acceptance as the per-page walk.
+ fail=0;c.live_=true;NativeAdrenoAbiBoAlloc big{65536,12,0};
+ segMode=1;segCalls=0;assert(!call(c,2,&big,&out) && segCalls==1);assert(!c.drop(*c.find(out.handle)));
+ big.contiguous=1;segCalls=0;assert(!call(c,2,&big,&out) && segCalls==1);assert(!c.drop(*c.find(out.handle)));
+ segMode=2;segCalls=0;assert(call(c,2,&big,&out)==kIOReturnNoMemory && segCalls==2 && !descriptors && !c.wired_); // required contiguous, split runs
+ big.contiguous=0;segCalls=0;assert(!call(c,2,&big,&out) && segCalls==2);assert(!c.drop(*c.find(out.handle)));
+ segMode=3;NativeAdrenoAbiBoAlloc edge{32768,12,0};
+ assert(call(c,2,&edge,&out)==kIOReturnNoMemory && !descriptors && !c.wired_); // second page crosses 2^36
+ edge.bytes=16384;assert(!call(c,2,&edge,&out));assert(!c.drop(*c.find(out.handle)));
+ segMode=0;big.contiguous=0;fail=4;assert(call(c,2,&big,&out)==kIOReturnNoMemory && !descriptors);fail=0; // 4K runs still refused
+ assert(!descriptors && !c.wired_);
+ // WaitFence and a submit-side wait sleep with the client lock released and refuse stale numbers.
+ NativeAdrenoAbiWaitFence wf{3,1000};c.firstFence_=1;c.lastFence_=5;spins=0;
+ assert(!call(c,6,&wf,nullptr) && spins==1 && lastSpinDepth==0 && lockDepth==0);
+ wf.fence=6;assert(call(c,6,&wf,nullptr)==kIOReturnBadArgument && spins==1);
+ wf.fence=0;assert(call(c,6,&wf,nullptr)==kIOReturnBadArgument && spins==1);
+ wf.fence=3;spinKill=&c.live_;assert(call(c,6,&wf,nullptr)==kIOReturnNotOpen && lockDepth==0);spinKill=nullptr;c.live_=true;
+ // Every accepted call is timed once (lock wait + selector); phases only where they ran.
+ unsigned calls=0;for(unsigned i=1;i<=16;i++)calls+=statCount[i];
+ assert(calls && calls==statCount[FG_ABI_STAT_LOCK] && statCount[6]>=2 && statCount[2]>1024);
+ assert(statCount[FG_ABI_STAT_WALK]>=statCount[FG_ABI_STAT_ZERO] && statCount[FG_ABI_STAT_ZERO]>1024);
  puts("PASS: actual methods 7/8 dispatch/errors/lengths, 1024 BO allocation/refusal/reuse/close, shared wired quota, metadata refusal and CPU leases");
 }
 '''
@@ -162,6 +198,10 @@ def main():
     external = host.method(source, 'externalMethod').replace(' override', '')
     # find() is pointer-returning, so use its adjacent source boundaries.
     find = source[source.index(' Bo *find('):source.index(' IOReturn wait(')]
+    wait = source[source.index(' IOReturn wait('):source.index(' IOReturn spin(')]
+    # The real waitUnlocked must release the client lock around the sleep loop.
+    wait += ' IOReturn spin(uint64_t,uint64_t) {spins++;waits++;lastSpinDepth=lockDepth;if(spinKill)*spinKill=false;return 0;}\n'
+    prefix = prefix.replace('static void IOLockLock(int *){}','static int lockDepth;static void IOLockLock(int *){lockDepth++;}').replace('static void IOLockUnlock(int *){}','static void IOLockUnlock(int *){lockDepth--;}')
     model = prefix+EXTRA+helper+'struct Client {\n'+bo+r'''
  /* The kernel allocates the table in initWithTask; the model owns it inline. */
  Bo storage_[MaxBos]={};
@@ -170,8 +210,7 @@ def main():
  uint32_t nextToken_=1;bool queues_[8]={true};
  int *lock_=&clientLock;bool live_=true;int pid_=0;
  void terminate(){} void result(){}
- int wait(uint64_t,uint64_t) {waits++;busy=false;return 0;}
-'''+find+''.join(host.method(source, n) for n in ('allocate', 'importHost', 'drop', 'run'))+close+external+TEST
+ '''+find+wait+''.join(host.method(source, n) for n in ('allocate', 'importHost', 'drop', 'run'))+close+external+TEST
     with tempfile.TemporaryDirectory() as tmp:
         path = Path(tmp)/'k1.cpp';path.write_text(model)
         exe = path.with_suffix('')

@@ -36,7 +36,9 @@ static void fg_abi_import_cache(int complete)
 {
  if (complete && !fg_abi_host_handoff) return;
  __asm__ volatile("dsb sy" ::: "memory");
- for (unsigned i=0;i<FG_ABI_MAX_IMPORTS;i++) if (fg_abi_imports[i].iova) {
+ /* A read-only PTE cannot be written by the GPU, so retirement has no stale
+  * lines to drop for it; the submit-side clean still covers every import. */
+ for (unsigned i=0;i<FG_ABI_MAX_IMPORTS;i++) if (fg_abi_imports[i].iova && (!complete || (fg_abi_imports[i].permissions&2))) {
   /* NativeAdreno b686b90 (MIT), adapted: GPU-written imports are already
    * NC in our SMMU. Opt-in requires NO CPU writes for their mapped lifetime,
    * not merely while a submission is in flight. Clean once at map, then
@@ -282,21 +284,43 @@ int fuxi_gpu_abi_status(uint64_t *faults, uint64_t *suspends)
  *faults=fg_faults; *suspends=fg_suspends;
  return 0;
 }
+/* 16K XNU pages: one pmap walk per page (not per 4K leaf), kept for the write pass. */
+static ppnum_t fg_abi_ppns[(FG_ABI_MAX_BYTES>>PAGE_SHIFT)+2];
+/* Idle test for map/unmap/submit. A pending job is observed once instead of
+ * waiting for the 2 ms watchdog, so a caller that polls sees retirement at
+ * once. 0 idle, 1 still running, -1 failed/poisoned. */
+static int fg_abi_wait_idle(void)
+{
+ if (!fg_client_busy) return 0;
+ int s=fg_abi_observe();
+ return s<0 ? -1 : s>0 ? 1 : 0;
+}
 static int fg_abi_map_locked(uint64_t iova, uintptr_t source, uint64_t bytes,
     unsigned permissions, unsigned wb, unsigned sh)
 {
  if (!fg_abi_live || !fuxi_gpu_ready() || fg_abi_poisoned) return -1;
- if (fg_client_busy) return 1;
- if (!fg_abi_map_valid(iova,bytes,permissions,wb,sh,0) || !source || (source&4095)) return -1;
+ int idle=fg_abi_wait_idle();
+ if (idle) return idle;
+ if (!fg_abi_map_valid(iova,bytes,permissions,wb,sh,0) || !source || (source&4095) || bytes>FG_ABI_MAX_BYTES) return -1;
  /* Validate the entire range before publishing any leaf. 16K XNU pages
-  * provide four distinct 4K SMMU pages, including noncontiguous BOs. */
+  * provide four distinct 4K SMMU pages, including noncontiguous BOs. A 2 MiB
+  * chunk's 512 leaves are contiguous, so the table pointer is built per chunk. */
+ uintptr_t base=source>>PAGE_SHIFT;
+ volatile uint64_t *leaf=NULL;
  for (uint64_t off=0;off<bytes;off+=4096) {
-  ppnum_t ppn=pmap_find_phys(kernel_pmap,source+off);
-  if (!ppn || ((uint64_t)ppn<<PAGE_SHIFT)>=(1ULL<<FG_ABI_PA_BITS) || *fg_abi_leaf(iova+off)) return -1;
+  if (!leaf || !((iova+off)&0x1fffff)) leaf=fg_abi_leaf(iova+off); else leaf++;
+  if (!off || !((source+off)&PAGE_MASK)) {
+   ppnum_t ppn=pmap_find_phys(kernel_pmap,source+off);
+   if (!ppn || ((uint64_t)ppn<<PAGE_SHIFT)>=(1ULL<<FG_ABI_PA_BITS)) return -1;
+   fg_abi_ppns[((source+off)>>PAGE_SHIFT)-base]=ppn;
+  }
+  if (*leaf) return -1;
  }
+ leaf=NULL;
  for (uint64_t off=0;off<bytes;off+=4096) {
-  uint64_t pa=((uint64_t)pmap_find_phys(kernel_pmap,source+off)<<PAGE_SHIFT)|((source+off)&PAGE_MASK);
-  *fg_abi_leaf(iova+off)=pa|3|(permissions==3 ? 1u<<6 : 3u<<6)|(wb ? 1u<<2 : 0)|sh<<8|1u<<10;
+  if (!leaf || !((iova+off)&0x1fffff)) leaf=fg_abi_leaf(iova+off); else leaf++;
+  uint64_t pa=((uint64_t)fg_abi_ppns[((source+off)>>PAGE_SHIFT)-base]<<PAGE_SHIFT)|((source+off)&PAGE_MASK);
+  *leaf=pa|3|(permissions==3 ? 1u<<6 : 3u<<6)|(wb ? 1u<<2 : 0)|sh<<8|1u<<10;
  }
  __asm__ volatile("dsb sy" ::: "memory");
  /* Root is inactive; TLBI is mandatory before its next doorbell. */
@@ -338,13 +362,18 @@ static void fg_abi_import_remove(uint64_t iova, uint64_t bytes)
 int fuxi_gpu_abi_unmap(uint64_t iova, uint64_t bytes)
 {
  FG_GUARD;
+ if (fg_abi_live && !fg_abi_poisoned && fg_abi_range(iova,bytes)) (void)fg_abi_wait_idle();
  if (fg_abi_poisoned) {
   if (!fg_abi_drained) return -2;
   fg_abi_import_remove(iova,bytes); return 0;
  }
  if (!fg_abi_live || !fg_abi_range(iova,bytes)) return -1;
  if (fg_client_busy) return 1;
- for (uint64_t off=0;off<bytes;off+=4096) *fg_abi_leaf(iova+off)=0;
+ volatile uint64_t *leaf=NULL;
+ for (uint64_t off=0;off<bytes;off+=4096) {
+  if (!leaf || !((iova+off)&0x1fffff)) leaf=fg_abi_leaf(iova+off); else leaf++;
+  *leaf=0;
+ }
  __asm__ volatile("dsb sy" ::: "memory");
  /* Remove stale ASID translations before backing pages can be released.
   * Safe with an in-flight present: only the inactive root was changed. */
@@ -358,7 +387,9 @@ int fuxi_gpu_abi_submit(const uint64_t *iovas, const uint64_t *sizes,
 {
  FG_GUARD;
  if (!fg_abi_live || !fuxi_gpu_ready() || fg_abi_poisoned || fg_abi_seq==UINT32_MAX) return -1;
- if (fg_busy || fg_client_busy || fg_scanout_reserved) return 1;
+ if (fg_busy || fg_scanout_reserved) return 1;
+ int idle=fg_abi_wait_idle();
+ if (idle) return idle<0 ? -1 : 1;
  if (g3_faulted() || g3_gr(0x806)!=g3_wptr || g3_gr(0x807)!=g3_wptr || (g3_gr(0x210)&~1u))
   return fg_abi_fault("client pre-submit idle/fault");
  uint32_t words[160];

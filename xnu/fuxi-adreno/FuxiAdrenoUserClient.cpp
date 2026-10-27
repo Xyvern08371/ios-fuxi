@@ -39,14 +39,27 @@ public:
 OSDefineMetaClassAndStructors(FuxiAdrenoBoView,IOSubMemoryDescriptor)
 
 static IOLock *openLock;
-static bool connected;
-static bool execswapTest;
-static unsigned testPasses, traceLines;
+/* Per-call timing for the periodic SWEET FB stats line (fuxi_gpu_abi_stats_log). */
+static IOLock *statLock;
+static fg_abi_stat stats[FG_ABI_STATS];
+static void abiStat(unsigned slot, uint64_t ticks) {
+ if (!statLock) return;
+ IOLockLock(statLock); fg_abi_stat_add(stats,slot,ticks); IOLockUnlock(statLock);
+}
 /* fuxigpuwaitus: WaitFence poll period in us (default 100; 0 = IOSleep(1)).
  * A 1 ms sleep delays every frame's retirement by up to a timer period. */
 static uint32_t waitPollUs __attribute__((unused)) = 100;
 static uint64_t waitCount __attribute__((unused)), waitPolls __attribute__((unused)),
     waitNs __attribute__((unused)), waitMaxNs __attribute__((unused));
+/* Every wait/busy-retry sleep, timed as the "sleep" phase. */
+static void abiPause() {
+ uint64_t t=mach_absolute_time();
+ if (waitPollUs) delay(waitPollUs); else IOSleep(1);
+ abiStat(FG_ABI_STAT_SLEEP,mach_absolute_time()-t);
+}
+static bool connected;
+static bool execswapTest;
+static unsigned testPasses, traceLines;
 static bool abiExecswapTest(const char *swap) {
  size_t n=strnlen(swap,192);
  if (!n || n>=191) return false;
@@ -60,6 +73,7 @@ static bool abiExecswapTest(const char *swap) {
 /* openLock serializes the boot-wide quota and trace budget (including opens
  * denied after the test). No user stdout or root-image update is needed. */
 static void abiTrace(const char *step, int pid, IOReturn rc) {
+ if (traceLines>=64) return; /* budget spent: skip the global lock (a racy read only delays the stop) */
  IOLockLock(openLock);
  if (traceLines < 64) {
   ++traceLines;
@@ -127,6 +141,18 @@ class FuxiAdrenoUserClient : public IOUserClient {
  }
  IOReturn wait(uint64_t fence, uint64_t ns) {
   if (!fence || !firstFence_ || fence<firstFence_ || fence>lastFence_) return kIOReturnBadArgument;
+  return spin(fence,ns);
+ }
+ /* Sleeps without lock_, so other threads can submit or allocate meanwhile;
+  * only the fence number is used until the lock is retaken. */
+ IOReturn waitUnlocked(uint64_t fence, uint64_t ns) {
+  if (!fence || !firstFence_ || fence<firstFence_ || fence>lastFence_) return kIOReturnBadArgument;
+  IOLockUnlock(lock_);
+  IOReturn rc=spin(fence,ns);
+  IOLockLock(lock_);
+  return live_ ? rc : kIOReturnNotOpen;
+ }
+ IOReturn spin(uint64_t fence, uint64_t ns) {
   /* The hardware watchdog is independent and always bounds ownership at
    * 100 ms. A shorter user timeout does not itself lose the context. */
   uint64_t ticks=0;
@@ -137,7 +163,7 @@ class FuxiAdrenoUserClient : public IOUserClient {
    if (!s) { if (polls) waitStat(start,polls); return kIOReturnSuccess; }
    if (s<0) return (s==-3 || s==-4) ? kIOReturnTimeout : kIOReturnIOError;
    if (mach_absolute_time()>=deadline) return kIOReturnTimeout;
-   if (waitPollUs) delay(waitPollUs); else IOSleep(1);
+   abiPause();
    ++polls;
   }
  }
@@ -189,17 +215,27 @@ class FuxiAdrenoUserClient : public IOUserClient {
   if (memory->prepare()!=kIOReturnSuccess) { memory->release(); return kIOReturnNoMemory; }
   FuxiAdrenoBoView *view=new FuxiAdrenoBoView;
   bool valid=view && memory->getBytesNoCopy() && memory->getLength()==allocated;
-  uint64_t first=0;
-  for (uint64_t off=0;valid && off<allocated;off+=16384) {
+  uint64_t first=0, tWalk=mach_absolute_time();
+  /* One lookup per physical segment: every 16K page inside it is contiguous and
+   * below the limit when the segment's end is (pa, length and step are 16K multiples). */
+  for (uint64_t off=0,step=0;valid && off<allocated;off+=step) {
    IOByteCount length=0;
    uint64_t pa=memory->getPhysicalSegment(off,&length,kIOMemoryMapperNone);
-   valid=pa && !(pa&16383) && length>=16384 && pa<(UINT64_C(1)<<FG_ABI_PA_BITS) &&
+   step=length>allocated-off ? allocated-off : length;
+   step&=~UINT64_C(16383);
+   valid=pa && !(pa&16383) && step>=16384 && step<=(UINT64_C(1)<<FG_ABI_PA_BITS) && pa<=(UINT64_C(1)<<FG_ABI_PA_BITS)-step &&
        (!off ? !(pa&((UINT64_C(1)<<r.align_log2)-1)) : !r.contiguous || pa==first+off);
    if (!valid) break;
    if (!off) first=pa;
   }
+  abiStat(FG_ABI_STAT_WALK,mach_absolute_time()-tWalk);
   if (valid) {
+   /* Kept: KMA_ZERO already zeroed the pages, but through a cacheable mapping
+    * before the buffer became write-combine; that those zeros reached DRAM for
+    * the NC GPU and user mappings is not shown here. Timed (zero) to judge. */
+   uint64_t tZero=mach_absolute_time();
    bzero(memory->getBytesNoCopy(),allocated); /* includes 16K mapping tail */
+   abiStat(FG_ABI_STAT_ZERO,mach_absolute_time()-tZero);
    valid=view->bind(memory);
   }
   if (!valid) {
@@ -272,7 +308,7 @@ class FuxiAdrenoUserClient : public IOUserClient {
    return kIOReturnSuccess;
   }
   if (method==NativeAdrenoMethodWaitFence) {
-   const auto &r=*static_cast<const NativeAdrenoAbiWaitFence *>(in); return wait(r.fence,r.timeout_ns);
+   const auto &r=*static_cast<const NativeAdrenoAbiWaitFence *>(in); return waitUnlocked(r.fence,r.timeout_ns);
   }
   if (method==NativeAdrenoMethodGetStatus) {
    auto &reply=*static_cast<NativeAdrenoAbiStatus *>(out);
@@ -310,7 +346,7 @@ class FuxiAdrenoUserClient : public IOUserClient {
     s=b->importMemory ? fuxi_gpu_abi_map_import(r.iova,b->importMap->getVirtualAddress(),b->bytes,r.permissions) :
         fuxi_gpu_abi_map(r.iova,(uintptr_t)b->memory->getBytesNoCopy(),b->bytes,r.permissions,r.writeback,r.shareability);
     if (s!=1 || mach_absolute_time()>=deadline) break;
-    IOSleep(1);
+    abiPause();
    } while (true);
    if (s) return s==1 ? kIOReturnBusy : kIOReturnBadArgument;
    b->iova=r.iova; static_cast<NativeAdrenoAbiBoMapReply *>(out)->iova=r.iova; return kIOReturnSuccess;
@@ -324,7 +360,7 @@ class FuxiAdrenoUserClient : public IOUserClient {
   if (method==NativeAdrenoMethodSubmit) {
    const auto &r=*static_cast<const NativeAdrenoAbiSubmit *>(in);
    if (!r.buffer_count || r.buffer_count>16 || r.reserved || r.queue>=8 || !queues_[r.queue]) return kIOReturnBadArgument;
-   if (r.wait_fence) { IOReturn s=wait(r.wait_fence,r.wait_timeout_ns); if (s) return s; }
+   if (r.wait_fence) { IOReturn s=waitUnlocked(r.wait_fence,r.wait_timeout_ns); if (s) return s; }
    uint64_t iova[16], bytes[16];
    for (unsigned i=0;i<r.buffer_count;i++) {
     const auto &ib=r.buffers[i]; Bo *b=find(ib.handle);
@@ -338,7 +374,7 @@ class FuxiAdrenoUserClient : public IOUserClient {
     if (!s) { if (!firstFence_) firstFence_=fence; lastFence_=fence; static_cast<NativeAdrenoAbiSubmitReply *>(out)->fence=fence; return kIOReturnSuccess; }
     if (s<0) return kIOReturnIOError;
     if (mach_absolute_time()>=deadline) return kIOReturnBusy;
-    IOSleep(1); /* Never hold the ring mutex during scheduler waits. */
+    abiPause(); /* Never hold the ring mutex during scheduler waits. */
    }
   }
   if (method==NativeAdrenoMethodSetMetadata || method==NativeAdrenoMethodGetMetadata) {
@@ -391,17 +427,22 @@ public:
  }
  IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments *a,
      IOExternalMethodDispatch *, OSObject *, void *) override {
+  uint64_t t0=mach_absolute_time();
   if (!a || selector<1 || selector>16) { abiTrace("invalid",pid_,kIOReturnUnsupported); return kIOReturnUnsupported; }
   if (a->scalarInputCount || a->scalarOutputCount || a->asyncWakePort ||
       a->structureInputDescriptor || a->structureOutputDescriptor ||
       a->structureInputSize!=fg_abi_input_size(selector) || a->structureOutputSize!=fg_abi_output_size(selector) ||
       (a->structureInputSize && !a->structureInput) || (a->structureOutputSize && !a->structureOutput)) { abiTrace(abiStep(selector),pid_,kIOReturnBadArgument); return kIOReturnBadArgument; }
   IOLockLock(lock_);
+  uint64_t t1=mach_absolute_time();
   if (a->structureOutputSize) bzero(a->structureOutput,a->structureOutputSize);
   IOReturn s=live_ ? run(selector,a->structureInput,a->structureOutput) : kIOReturnNotOpen;
   abiTrace(abiStep(selector),pid_,s);
   if (selector==NativeAdrenoMethodWaitFence && s==kIOReturnSuccess) result();
-  IOLockUnlock(lock_); return s;
+  IOLockUnlock(lock_);
+  uint64_t t2=mach_absolute_time();
+  abiStat(FG_ABI_STAT_LOCK,t1-t0); abiStat(selector,t2-t1);
+  return s;
  }
  IOReturn clientMemoryForType(UInt32 token, IOOptionBits *options, IOMemoryDescriptor **memory) override {
   if (!options || !memory) return kIOReturnBadArgument;
@@ -475,6 +516,27 @@ public:
  }
 };
 OSDefineMetaClassAndStructors(NativeAdrenoGpuPublished,IOAcceleratorES)
+/* Called from the SWEET FB stats cadence: one window of n/avg us/max us per
+ * selector and phase (lock wait, segment walk, zero fill, sleeps), then the
+ * window restarts. Silent when no call was made. */
+extern "C" void fuxi_gpu_abi_stats_log(void)
+{
+ if (!statLock) return;
+ fg_abi_stat snap[FG_ABI_STATS];
+ IOLockLock(statLock); memcpy(snap,stats,sizeof(snap)); bzero(stats,sizeof(stats)); IOLockUnlock(statLock);
+ static const char *phases[]={"lock","walk","zero","sleep"};
+ char line[320]; size_t n=0;
+ line[0]=0;
+ for (unsigned i=0;i<FG_ABI_STATS;i++) if (snap[i].count) {
+  uint64_t avg,max;
+  absolutetime_to_nanoseconds(snap[i].total/snap[i].count,&avg);
+  absolutetime_to_nanoseconds(snap[i].max,&max);
+  if (n>220) { IOLog("FUXI GPU ABI: calls n/avg/max us%s\n",line); n=0; }
+  n+=snprintf(line+n,sizeof(line)-n," %s %llu/%llu.%llu/%llu",i==0 ? phases[0] : i<=16 ? abiStep(i) : phases[i-16],
+      snap[i].count,avg/1000,(avg%1000)/100,max/1000);
+ }
+ if (n) IOLog("FUXI GPU ABI: calls n/avg/max us%s\n",line);
+}
 extern "C" void fuxi_gpu_abi_publish(void)
 {
  char swap[192]={};
@@ -482,7 +544,7 @@ extern "C" void fuxi_gpu_abi_publish(void)
      abiExecswapTest(swap);
  PE_parse_boot_argn("fuxigpuwaitus",&waitPollUs,sizeof(waitPollUs));
  if (waitPollUs>1000) waitPollUs=1000;
- openLock=IOLockAlloc();
+ openLock=IOLockAlloc(); statLock=IOLockAlloc();
  auto *service=new NativeAdrenoGpuPublished;
  if (!openLock || !service) { if (service) service->release(); return; }
  if (!service->init() || !service->attach(IOService::getPlatform()) || !service->start(IOService::getPlatform())) {
