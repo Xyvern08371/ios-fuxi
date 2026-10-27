@@ -20,10 +20,13 @@ static thread_call_data_t fg_client_watchdog;
  * list. Serialize cache handoff with the same GPU lock as submit/retirement.
  * The user client owns these prepared kernel mappings until successful unmap. */
 static struct { uint64_t iova, bytes; uintptr_t source; unsigned permissions; } fg_abi_imports[FG_ABI_MAX_IMPORTS];
-static unsigned fg_abi_host_handoff, fg_abi_ncimport, fg_abi_unstick, fg_abi_cohtest, fg_abi_tlbpages;
+static unsigned fg_abi_host_handoff, fg_abi_ncimport, fg_abi_unstick, fg_abi_cohtest, fg_abi_tlbpages, fg_abi_mapwait;
+/* Ticks the last fuxi_gpu_abi_map spent after taking the GPU lock (the caller's total minus this is the wait for that lock). */
+static uint64_t fg_abi_map_work;
 /* fuxigpuncimport is a bitmask, default 0: 1 NC-import map-time clean; 2 fenced WPTR (fg_ring_doorbell); 4 stall recovery
  * (fg_abi_unstick_step); 64 coherent-import self-test (skips the per-submit clean/retire invalidate only if it proves the GPU path
- * coherent); 128 ranged TLBIVAL for a small unmap. Parsed once in fg_abi_init. */
+ * coherent); 128 ranged TLBIVAL for a small unmap; 256 map waits for an idle GPU first (the pre-N167 behaviour; default maps while a
+ * job runs, see fg_abi_map_locked). Parsed once in fg_abi_init. */
 static unsigned fg_abi_coh, fg_abi_coh_tries; /* coh: 0 untested, 1 proven coherent, 2 refused */
 /* The submit record holds up to NativeAdrenoAbiMaxBuffers IBs; one frame is then one ring prologue and one CP context reset. */
 _Static_assert(FG_ABI_FRAME_WORDS+8 < 8192, "one frame must fit the idle ring");
@@ -117,8 +120,24 @@ static volatile uint64_t *fg_abi_leaf(uint64_t iova)
 static uint64_t fg_abi_used[(FG_ABI_VA_SIZE>>12)/64];
 static inline unsigned fg_abi_pg(uint64_t iova) { return (unsigned)((iova-FG_ABI_VA_START)>>12); }
 static inline int fg_abi_used_get(unsigned pg) { return (fg_abi_used[pg>>6]>>(pg&63))&1; }
-static inline void fg_abi_used_put(unsigned pg, int on)
-{ if (on) fg_abi_used[pg>>6]|=UINT64_C(1)<<(pg&63); else fg_abi_used[pg>>6]&=~(UINT64_C(1)<<(pg&63)); }
+/* Whole-range forms, a word at a time: any live leaf in [pg,pg+n), and set/clear [pg,pg+n). */
+static inline uint64_t fg_abi_used_mask(unsigned pg, unsigned n)
+{
+ unsigned lo=pg&63;
+ return (n==64 ? ~UINT64_C(0) : ((UINT64_C(1)<<n)-1))<<lo;
+}
+static inline int fg_abi_used_any(unsigned pg, unsigned n)
+{
+ for (unsigned k;n;pg+=k,n-=k) { k=64-(pg&63); if (k>n) k=n; if (fg_abi_used[pg>>6]&fg_abi_used_mask(pg,k)) return 1; }
+ return 0;
+}
+static inline void fg_abi_used_fill(unsigned pg, unsigned n, int on)
+{
+ for (unsigned k;n;pg+=k,n-=k) {
+  k=64-(pg&63); if (k>n) k=n;
+  if (on) fg_abi_used[pg>>6]|=fg_abi_used_mask(pg,k); else fg_abi_used[pg>>6]&=~fg_abi_used_mask(pg,k);
+ }
+}
 /* Ranged invalidate of a small unmap (opt-in value 128): TLBIVAL (+0x620, AArch64 format VA[55:12]|ASID<<48) per removed
  * 4K leaf, then TLBSYNC. Leaf-only: the L1/L2 tables are fixed for the life of the root. Same status codes as g4_tlb. */
 #define FG_ABI_TLB_PAGE_LIMIT 512u
@@ -307,7 +326,7 @@ static int fg_abi_init(void)
 {
  unsigned bits=0;
  (void)PE_parse_boot_argn("fuxigpuncimport",&bits,sizeof(bits));
- fg_abi_ncimport=bits&1; fg_wptr_fence=(bits>>1)&1; fg_abi_unstick=(bits>>2)&1; fg_abi_cohtest=(bits>>6)&1; fg_abi_tlbpages=(bits>>7)&1;
+ fg_abi_ncimport=bits&1; fg_wptr_fence=(bits>>1)&1; fg_abi_unstick=(bits>>2)&1; fg_abi_cohtest=(bits>>6)&1; fg_abi_tlbpages=(bits>>7)&1; fg_abi_mapwait=(bits>>8)&1;
  fg_abi_coh=fg_abi_coh_tries=0;
  for (unsigned i=0;i<sizeof(fg_abi_used)/sizeof(fg_abi_used[0]);i++) fg_abi_used[i]=0;
  /* 772 4K pages: root, two L2s, kernel runtime L3, 768 client L3s.
@@ -451,8 +470,14 @@ static int fg_abi_map_locked(uint64_t iova, uintptr_t source, uint64_t bytes,
     unsigned permissions, unsigned wb, unsigned sh)
 {
  if (!fg_abi_live || !fuxi_gpu_ready() || fg_abi_poisoned) return -1;
- int idle=fg_abi_wait_idle();
- if (idle) return idle;
+ /* A map only turns invalid leaves of never-referenced VA into valid ones (see the used-bit check below), so a running job is
+  * neither affected nor needs to be waited for: wait_idle made every map during a ~9 ms job (about 40% of the time) sleep out the
+  * rest of it. One observation still retires a finished job and still isolates a faulted one. Unmap and submit keep the idle rule.
+  * Invariant: a VA with its used bit clear has no TLB entry (only unmap clears it, and unmap invalidates the ASID, or each
+  * removed leaf, before returning; invalid leaves are not cached) and every submit switches TTBR with a full ASID invalidate
+  * before its doorbell, so no TLBI is needed here. fuxigpuncimport 256 restores the wait. */
+ if (fg_abi_mapwait) { int idle=fg_abi_wait_idle(); if (idle) return idle; }
+ else if (fg_client_busy && fg_abi_observe()<0) return -1;
  if (!fg_abi_map_valid(iova,bytes,permissions,wb,sh,0) || !source || (source&4095) || bytes>FG_ABI_MAX_BYTES) return -1;
  /* Validate the entire range before publishing any leaf. 16K XNU pages
   * provide four distinct 4K SMMU pages, including noncontiguous BOs. A 2 MiB
@@ -465,14 +490,14 @@ static int fg_abi_map_locked(uint64_t iova, uintptr_t source, uint64_t bytes,
    if (!ppn || ((uint64_t)ppn<<PAGE_SHIFT)>=(1ULL<<FG_ABI_PA_BITS)) return -1;
    fg_abi_ppns[((source+off)>>PAGE_SHIFT)-base]=ppn;
   }
-  if (fg_abi_used_get(fg_abi_pg(iova+off))) return -1;
  }
+ if (fg_abi_used_any(fg_abi_pg(iova),(unsigned)(bytes>>12))) return -1;
  for (uint64_t off=0;off<bytes;off+=4096) {
   if (!leaf || !((iova+off)&0x1fffff)) leaf=fg_abi_leaf(iova+off); else leaf++;
   uint64_t pa=((uint64_t)fg_abi_ppns[((source+off)>>PAGE_SHIFT)-base]<<PAGE_SHIFT)|((source+off)&PAGE_MASK);
   *leaf=pa|3|(permissions==3 ? 1u<<6 : 3u<<6)|(wb ? 1u<<2 : 0)|sh<<8|1u<<10;
-  fg_abi_used_put(fg_abi_pg(iova+off),1);
  }
+ fg_abi_used_fill(fg_abi_pg(iova),(unsigned)(bytes>>12),1);
  __asm__ volatile("dsb sy" ::: "memory");
  fg_abi_map_note(iova,bytes,source);
  /* Root is inactive; TLBI is mandatory before its next doorbell. */
@@ -482,8 +507,12 @@ int fuxi_gpu_abi_map(uint64_t iova, uintptr_t source, uint64_t bytes,
     unsigned permissions, unsigned wb, unsigned sh)
 {
  FG_GUARD;
- return fg_abi_map_locked(iova,source,bytes,permissions,wb,sh);
+ uint64_t t=mach_absolute_time();
+ int s=fg_abi_map_locked(iova,source,bytes,permissions,wb,sh);
+ fg_abi_map_work=mach_absolute_time()-t;
+ return s;
 }
+uint64_t fuxi_gpu_abi_map_work(void) { return fg_abi_map_work; }
 static void fg_abi_coh_probe(void);
 int fuxi_gpu_abi_map_import(uint64_t iova, uintptr_t source, uint64_t bytes, unsigned permissions)
 {
@@ -526,8 +555,8 @@ static int fg_abi_unmap_locked(uint64_t iova, uint64_t bytes)
  for (uint64_t off=0;off<bytes;off+=4096) {
   if (!leaf || !((iova+off)&0x1fffff)) leaf=fg_abi_leaf(iova+off); else leaf++;
   *leaf=0;
-  fg_abi_used_put(fg_abi_pg(iova+off),0);
  }
+ fg_abi_used_fill(fg_abi_pg(iova),(unsigned)(bytes>>12),0);
  __asm__ volatile("dsb sy" ::: "memory");
  /* Remove stale ASID translations before backing pages can be released; never skipped. Opt-in value 128 drops a small
   * unmap page by page instead of the whole ASID. Safe with an in-flight present: only the inactive root was changed. */
@@ -595,7 +624,7 @@ _Static_assert(FG_ABI_COH_IB >= FG_ABI_PT+(4u+768u)*4096 && FG_ABI_COH_RES+4096 
 static uint8_t fg_abi_coh_page[16384] __attribute__((aligned(16384)));
 static void fg_abi_coh_probe(void)
 {
- if (!fg_abi_live || !fuxi_gpu_ready() || fg_abi_poisoned) return;
+ if (!fg_abi_live || !fuxi_gpu_ready() || fg_abi_poisoned || fg_abi_wait_idle()) return; /* its maps and unmaps need an idle GPU */
  const uint64_t ib=FG_ABI_COH_IOVA, res=ib+0x1000, data=ib+0x4000;
  const char *why="inconclusive";
  unsigned up=0, down=0, mapped=0, definitive=0;

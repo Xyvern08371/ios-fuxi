@@ -54,6 +54,7 @@ static int fuxi_gpu_abi_status(uint64_t *f,uint64_t *s) {*f=*s=0;if(!statusRc){*
 static int fuxi_gpu_abi_poll(uint64_t) {return 0;}
 static int fuxi_gpu_abi_map(uint64_t,uintptr_t,uint64_t,unsigned,unsigned,unsigned) {return 0;}
 static int fuxi_gpu_abi_map_import(uint64_t,uintptr_t,uint64_t,unsigned) {return 0;}
+static uint64_t fuxi_gpu_abi_map_work() {return 0;}
 static int submitRc=-1;static unsigned submitCount,submitCalls;static uint64_t submitLast;
 static int fuxi_gpu_abi_submit(const uint64_t *,const uint64_t *b,unsigned n,uint64_t *f) {submitCalls++;submitCount=n;submitLast=b[n-1];*f=submitCalls;return submitRc;}
 static uint64_t mach_absolute_time() {return 0;}
@@ -182,6 +183,8 @@ int main() {
  unsigned calls=0;for(unsigned i=1;i<=16;i++)calls+=statCount[i];
  assert(calls && calls==statCount[FG_ABI_STAT_LOCK] && statCount[6]>=2 && statCount[2]>1024);
  assert(statCount[FG_ABI_STAT_WALK]>=statCount[FG_ABI_STAT_ZERO] && statCount[FG_ABI_STAT_ZERO]>1024);
+ // Alloc stages: descriptor+prepare and view bind run once per accepted alloc (never more than the segment walk); owned maps record lock and work together, imports neither.
+ assert(statCount[FG_ABI_STAT_ALLOCMEM]>=statCount[FG_ABI_STAT_WALK] && statCount[FG_ABI_STAT_BIND]==statCount[FG_ABI_STAT_ZERO] && statCount[FG_ABI_STAT_MAPLOCK]==statCount[FG_ABI_STAT_MAPWORK] && !statCount[FG_ABI_STAT_MAPWAIT]);
  // Handle index: every live handle resolves to its slot after churn, stale and zero handles do not, freed slots are reused lowest first.
  {
   Client d;d.live_=true;NativeAdrenoAbiBoAlloc one{4096,12,0};NativeAdrenoAbiBoAllocReply r[40];

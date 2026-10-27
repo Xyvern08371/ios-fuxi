@@ -41,7 +41,7 @@ int main() {
  assert(raw[5].count==3 && raw[5].total==60 && raw[5].max==30);
  fg_abi_stat_add(raw,FG_ABI_STATS,1);fg_abi_stat_add(raw,~0u,1);
  for(unsigned i=0;i<FG_ABI_STATS;i++)assert(i==5 || !raw[i].count);
- static_assert(FG_ABI_STAT_LOCK==0 && FG_ABI_STAT_WALK==17 && FG_ABI_STAT_SLEEP==19 && FG_ABI_STATS==20,"slot layout");
+ static_assert(FG_ABI_STAT_LOCK==0 && FG_ABI_STAT_WALK==17 && FG_ABI_STAT_SLEEP==19 && FG_ABI_STAT_MAPWAIT==20 && FG_ABI_STAT_BIND==24 && FG_ABI_STATS==25,"slot layout");
  // No lock yet (allocation failure) or no calls: silent, no crash.
  abiStat(5,10);fuxi_gpu_abi_stats_log();assert(!logCount && !locks);
  static IOLock storage;statLock=&storage;
@@ -56,13 +56,16 @@ int main() {
  tickScale=42;logCount=0;
  for(unsigned i=0;i<FG_ABI_STATS;i++)abiStat(i,1000000+i);
  fuxi_gpu_abi_stats_log();
- assert(logCount>=2 && logCount<=3);
+ assert(logCount>=3 && logCount<=4);
+ // Selectors and phases never share a line: "calls" lines hold slots 0..16, "stages" lines the phases.
+ for(unsigned l=0;l<logCount;l++){bool st=strstr(logs[l],"ABI: stages ")!=nullptr;assert(st!=(strstr(logs[l],"ABI: calls ")!=nullptr));
+  assert(st==(!!strstr(logs[l]," walk ") || !!strstr(logs[l]," bind ") || !!strstr(logs[l]," mapwork ") || !!strstr(logs[l]," sleep ")));assert(!st || (!strstr(logs[l]," alloc ") && !strstr(logs[l]," map ")));}
  static const char *names[]={"lock","query","alloc","map","free","submit","wait","timestamp","status",
   "set-metadata","get-metadata","create-queue","close-queue","cpu-token","cpu-unmap","device-info","import",
-  "walk","zero","sleep"};
+  "walk","zero","sleep","mapwait","maplock","mapwork","allocmem","bind"};
  for(unsigned i=0;i<FG_ABI_STATS;i++) {
   char key[64];snprintf(key,sizeof(key)," %%s 1/",names[i]);unsigned seen=0;
-  for(unsigned l=0;l<logCount;l++){assert(strlen(logs[l])<350);for(const char *p=logs[l];(p=strstr(p,key));p++)seen++;}
+  for(unsigned l=0;l<logCount;l++){assert(strlen(logs[l])<300);for(const char *p=logs[l];(p=strstr(p,key));p++)seen++;}
   assert(seen==1);
  }
  assert(strstr(logs[0],"lock 1/42000.0/42000"));

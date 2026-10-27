@@ -228,11 +228,13 @@ class FuxiAdrenoUserClient : public IOUserClient {
   uint64_t mask=((UINT64_C(1)<<FG_ABI_PA_BITS)-1)&~((UINT64_C(1)<<r.align_log2)-1);
   IOOptionBits options=kIODirectionInOut|kIOMemoryMapperNone|kIOMemoryKernelUserShared|kIOMapWriteCombineCache;
   /* Contiguous-first, with a wired scattered fallback unless required. */
+  uint64_t tMem=mach_absolute_time();
   IOBufferMemoryDescriptor *memory=IOBufferMemoryDescriptor::inTaskWithPhysicalMask(
       kernel_task,options|kIOMemoryPhysicallyContiguous,allocated,mask);
   if (!memory && !r.contiguous) memory=IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,options,allocated,mask);
   if (!memory) return kIOReturnNoMemory;
   if (memory->prepare()!=kIOReturnSuccess) { memory->release(); return kIOReturnNoMemory; }
+  abiStat(FG_ABI_STAT_ALLOCMEM,mach_absolute_time()-tMem);
   FuxiAdrenoBoView *view=new FuxiAdrenoBoView;
   bool valid=view && memory->getBytesNoCopy() && memory->getLength()==allocated;
   uint64_t first=0, tWalk=mach_absolute_time();
@@ -256,7 +258,9 @@ class FuxiAdrenoUserClient : public IOUserClient {
    uint64_t tZero=mach_absolute_time();
    bzero(memory->getBytesNoCopy(),allocated); /* includes 16K mapping tail */
    abiStat(FG_ABI_STAT_ZERO,mach_absolute_time()-tZero);
+   uint64_t tBind=mach_absolute_time();
    valid=view->bind(memory);
+   abiStat(FG_ABI_STAT_BIND,mach_absolute_time()-tBind);
   }
   if (!valid) {
    if (view) view->release();
@@ -367,12 +371,19 @@ class FuxiAdrenoUserClient : public IOUserClient {
     return kIOReturnBadArgument;
    uint64_t deadline; clock_interval_to_deadline(150,NSEC_PER_MSEC,&deadline);
    int s;
+   uint64_t tMap=mach_absolute_time(), tTry;
    do {
+    tTry=mach_absolute_time();
     s=b->importMemory ? fuxi_gpu_abi_map_import(r.iova,b->importMap->getVirtualAddress(),b->bytes,r.permissions) :
         fuxi_gpu_abi_map(r.iova,(uintptr_t)b->memory->getBytesNoCopy(),b->bytes,r.permissions,r.writeback,r.shareability);
     if (s!=1 || mach_absolute_time()>=deadline) break;
     abiPause();
    } while (true);
+   if (!b->importMemory) {
+    uint64_t end=mach_absolute_time(), work=fuxi_gpu_abi_map_work(), call=end-tTry;
+    if (tTry!=tMap) abiStat(FG_ABI_STAT_MAPWAIT,tTry-tMap);
+    abiStat(FG_ABI_STAT_MAPLOCK,call>work ? call-work : 0); abiStat(FG_ABI_STAT_MAPWORK,work);
+   }
    if (s) return s==1 ? kIOReturnBusy : kIOReturnBadArgument;
    b->iova=r.iova; static_cast<NativeAdrenoAbiBoMapReply *>(out)->iova=r.iova; return kIOReturnSuccess;
   }
@@ -546,25 +557,29 @@ public:
 };
 OSDefineMetaClassAndStructors(NativeAdrenoGpuPublished,IOAcceleratorES)
 /* Called from the SWEET FB stats cadence: one window of n/avg us/max us per
- * selector and phase (lock wait, segment walk, zero fill, sleeps), then the
- * window restarts. Silent when no call was made. */
+ * selector ("calls" lines, lock wait first) and per phase inside alloc and map
+ * ("stages" lines: walk, zero, sleep, mapwait, maplock, mapwork, allocmem, bind),
+ * then the window restarts. Silent when no call was made. */
 extern "C" void fuxi_gpu_abi_stats_log(void)
 {
  if (!statLock) return;
  fg_abi_stat snap[FG_ABI_STATS];
  IOLockLock(statLock); memcpy(snap,stats,sizeof(snap)); bzero(stats,sizeof(stats)); IOLockUnlock(statLock);
- static const char *phases[]={"lock","walk","zero","sleep"};
+ static const char *phases[]={"lock","walk","zero","sleep","mapwait","maplock","mapwork","allocmem","bind"};
  char line[320]; size_t n=0;
  line[0]=0;
- for (unsigned i=0;i<FG_ABI_STATS;i++) if (snap[i].count) {
-  uint64_t avg,max;
-  absolutetime_to_nanoseconds(snap[i].total/snap[i].count,&avg);
-  absolutetime_to_nanoseconds(snap[i].max,&max);
-  if (n>220) { IOLog("FUXI GPU ABI: calls n/avg/max us%s\n",line); n=0; }
-  n+=snprintf(line+n,sizeof(line)-n," %s %llu/%llu.%llu/%llu",i==0 ? phases[0] : i<=16 ? abiStep(i) : phases[i-16],
-      snap[i].count,avg/1000,(avg%1000)/100,max/1000);
+ for (unsigned i=0;i<FG_ABI_STATS;i++) {
+  const char *kind=i<=16 ? "calls" : "stages";
+  if (snap[i].count) {
+   uint64_t avg,max;
+   absolutetime_to_nanoseconds(snap[i].total/snap[i].count,&avg);
+   absolutetime_to_nanoseconds(snap[i].max,&max);
+   if (n>220) { IOLog("FUXI GPU ABI: %s n/avg/max us%s\n",kind,line); n=0; }
+   n+=snprintf(line+n,sizeof(line)-n," %s %llu/%llu.%llu/%llu",i==0 ? phases[0] : i<=16 ? abiStep(i) : phases[i-16],
+       snap[i].count,avg/1000,(avg%1000)/100,max/1000);
+  }
+  if (n && (i==16 || i==FG_ABI_STATS-1)) { IOLog("FUXI GPU ABI: %s n/avg/max us%s\n",kind,line); n=0; }
  }
- if (n) IOLog("FUXI GPU ABI: calls n/avg/max us%s\n",line);
 }
 extern "C" void fuxi_gpu_abi_publish(void)
 {

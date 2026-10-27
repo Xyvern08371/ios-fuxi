@@ -38,7 +38,11 @@ static inline unsigned fg_abi_output_size(unsigned method)
 }
 /* Bounded per-call timing, window totals in mach ticks. Slot 0 is the wait for
  * the client lock, 1..16 are the selectors, the rest are phases inside them. */
-enum { FG_ABI_STAT_LOCK=0, FG_ABI_STAT_WALK=17, FG_ABI_STAT_ZERO=18, FG_ABI_STAT_SLEEP=19, FG_ABI_STATS=20 };
+/* 17..24 are phases inside alloc and map, logged on their own "stages" line: walk/zero/allocmem/bind are alloc's segment walk, bzero,
+ * descriptor allocation+prepare and view bind; mapwait is the time a map spent retrying a busy GPU before its last attempt (only maps
+ * that retried), maplock the last attempt's wait for the GPU lock, mapwork its work under that lock (pmap walk, leaves, barrier). */
+enum { FG_ABI_STAT_LOCK=0, FG_ABI_STAT_WALK=17, FG_ABI_STAT_ZERO=18, FG_ABI_STAT_SLEEP=19, FG_ABI_STAT_MAPWAIT=20, FG_ABI_STAT_MAPLOCK=21,
+ FG_ABI_STAT_MAPWORK=22, FG_ABI_STAT_ALLOCMEM=23, FG_ABI_STAT_BIND=24, FG_ABI_STATS=25 };
 struct fg_abi_stat { uint64_t count, total, max; };
 static inline void fg_abi_stat_add(struct fg_abi_stat *stats, unsigned slot, uint64_t ticks)
 {

@@ -153,6 +153,7 @@ typedef void *thread_call_param_t;
 typedef struct {void (*fn)(void *,void *);} thread_call_data_t;
 static uint64_t ticks;
 static uint64_t counter(const char *name) {return strcmp(name,"cntfrq_el0")?ticks:1000000;}
+static uint64_t mach_absolute_time(void) {return ticks;}
 #define rsr(r) counter(r)
 static unsigned fg_access_failed,fg_busy,fg_client_busy,g3_wptr,g3_bank=2,g3_asid=3;
 static unsigned cacheClean,cacheInvalidate,ncimportArg;
@@ -387,7 +388,11 @@ int main(void) {
  assert(sregs[(g_cb(g3_bank)+0x20)/4]==(uint32_t)FG_ABI_PT);
  assert(fuxi_gpu_abi_submit(addresses,sizes,1,&fence)==1 && doorbells==1);
  assert(fuxi_gpu_abi_unmap(va,bytes)==1);
- assert(fuxi_gpu_abi_map(0x30000000,source,4096,3,0,2)==1);
+ /* A map of free VA does not wait for the running job: leaf and used bit published, no TLBI, doorbell or retirement. */
+ { unsigned t0=tlbs,d0=doorbells; assert(!fuxi_gpu_abi_map(0x30000000,source,4096,3,0,2) && fg_client_busy && tlbs==t0 && doorbells==d0);
+   assert(*fg_abi_leaf(0x30000000) && fg_abi_used_get(fg_abi_pg(0x30000000)));
+   assert(fuxi_gpu_abi_map(0x30000000,source,4096,3,0,2)==-1 && fuxi_gpu_abi_map(va,source,bytes,3,0,2)==-1); /* overlap still refused while busy */
+   assert(fuxi_gpu_abi_unmap(0x30000000,4096)==1 && *fg_abi_leaf(0x30000000)); } /* unmap keeps its idle rule */
  assert(fuxi_gpu_abi_poll(fence)==1);
  unsigned schedules=enqueued;fg_abi_watch(NULL,NULL);assert(enqueued==schedules+1);
  complete(); ticks=200000; /* completion wins despite a late watchdog */
@@ -445,12 +450,12 @@ int main(void) {
  assert(!fuxi_gpu_abi_submit(addresses,sizes,1,&fence));
  assert(cacheClean==512 && !cacheInvalidate);
  assert(fuxi_gpu_abi_unmap(va,32768)==1 && fg_abi_imports[0].iova==va);
- assert(fuxi_gpu_abi_map_import(va+0x10000,source,16384,3)==1);
+ assert(!fuxi_gpu_abi_map_import(va+0x10000,source,16384,3) && fg_client_busy); /* mapped while the job runs */
  complete(); fg_abi_watch(NULL,NULL);
- assert(cacheInvalidate==512 && !fuxi_gpu_abi_poll(fence));
- assert(!fuxi_gpu_abi_unmap(va,32768) && !fg_abi_imports[0].iova);
+ assert(cacheInvalidate==768 && !fuxi_gpu_abi_poll(fence)); /* 512 + the 16K import mapped during the job */
+ assert(!fuxi_gpu_abi_unmap(va,32768) && !fuxi_gpu_abi_unmap(va+0x10000,16384) && !fg_abi_imports[0].iova && !fg_abi_imports[1].iova);
  assert(!fuxi_gpu_abi_submit(addresses,sizes,1,&fence));
- complete();fg_abi_watch(NULL,NULL);assert(cacheClean==512 && cacheInvalidate==512);
+ complete();fg_abi_watch(NULL,NULL);assert(cacheClean==512 && cacheInvalidate==768);
  for(unsigned good=0;good<2;good++) {
   reset();drainGood=good;fg_scanout_owned=1;
   assert(!fuxi_gpu_abi_map_import(va,source,16384,3));
@@ -475,7 +480,7 @@ int main(void) {
  // A retired job is seen by the next submit/map/unmap itself, without waiting for the 2 ms watchdog.
  reset();assert(!fuxi_gpu_abi_map(va,source,bytes,3,0,2));
  assert(!fuxi_gpu_abi_submit(addresses,sizes,1,&fence) && fg_client_busy);
- assert(fuxi_gpu_abi_submit(addresses,sizes,1,&fence)==1 && fuxi_gpu_abi_unmap(va,bytes)==1 && fuxi_gpu_abi_map(0x30000000,source,4096,3,0,2)==1);
+ assert(fuxi_gpu_abi_submit(addresses,sizes,1,&fence)==1 && fuxi_gpu_abi_unmap(va,bytes)==1 && !fuxi_gpu_abi_map(0x30010000,source,4096,3,0,2));
  complete();tlbs=0;
  assert(!fuxi_gpu_abi_unmap(va,bytes) && !fg_client_busy && tlbs==2 && !drains); /* restore-switch + the unmap's own TLBI */
  assert(sregs[(g_cb(g3_bank)+0x20)/4]==(uint32_t)G3_PT && !*fg_abi_leaf(va));
@@ -502,7 +507,7 @@ int main(void) {
   for(unsigned frame=0;frame<2;frame++) {
    assert(!fuxi_gpu_abi_submit(addresses,sizes,1,&fence));
    before=cacheClean;
-   assert(fuxi_gpu_abi_map_import(va+0x20000,source,16384,3)==1 && cacheClean==before);
+   assert(fuxi_gpu_abi_map_import(va,source,16384,3)==-1 && cacheClean==before);
    complete();assert(!fuxi_gpu_abi_poll(fence));
   }
   uint64_t cleaned,skipped,invalidated,mapped;unsigned imports;
@@ -513,6 +518,10 @@ int main(void) {
   assert(!fuxi_gpu_abi_unmap(va,32768));
   fuxi_gpu_import_stats(&cleaned,&skipped,&invalidated,&mapped,&imports);
   assert(imports==1 && mapped==16384);
+  // Default maps during a job: only the new range is handed off (one map-time clean with arg 1), the running job's imports are not walked.
+  assert(!fuxi_gpu_abi_submit(addresses,sizes,1,&fence));before=cacheClean;
+  assert(!fuxi_gpu_abi_map_import(va+0x20000,source,16384,3) && fg_client_busy && cacheClean==before+(arg==1?256u:0u));
+  complete();assert(!fuxi_gpu_abi_poll(fence));
  }
  for(unsigned good=0;good<2;good++) {
   seed();ncimportArg=1;assert(fg_abi_init());drainGood=good;
@@ -525,9 +534,9 @@ int main(void) {
   puts("PASS: opt-in NC-import map handoff, indirect RW/RO policy, repeated submits, byte counters, map failure/busy and fault quarantine");
  /* fuxigpuncimport is a bitmask: 1 NC import, 64 coherent self-test, 128 ranged TLBI. Value 1 keeps its meaning;
   * the low bits 2..32 stay free for other lanes and are ignored here. */
- for(unsigned arg=0;arg<256;arg++) {
+ for(unsigned arg=0;arg<512;arg++) {
   seed();ncimportArg=arg;assert(fg_abi_init());
-  assert(fg_abi_ncimport==(arg&1) && fg_abi_cohtest==((arg>>6)&1) && fg_abi_tlbpages==((arg>>7)&1) && !fg_abi_coh && !delays);
+  assert(fg_abi_ncimport==(arg&1) && fg_abi_cohtest==((arg>>6)&1) && fg_abi_tlbpages==((arg>>7)&1) && fg_abi_mapwait==((arg>>8)&1) && !fg_abi_coh && !delays);
  }
  /* Cached overlap mirror replaces the NC leaf read: exact 4K overlap refusal, nothing published on refusal, unmap/init clear. */
  reset();assert(!fuxi_gpu_abi_map(va,source,32768,3,0,2));
@@ -538,7 +547,29 @@ int main(void) {
  assert(!fuxi_gpu_abi_map(va,source,32768,3,0,2) && fuxi_gpu_abi_map(va,source,4096,3,0,2)==-1);
  assert(!fuxi_gpu_abi_unmap(va,32768) && !fuxi_gpu_abi_unmap(va+0x8000,4096) && !fuxi_gpu_abi_unmap(va-4096,4096));
  for(unsigned i=0;i<sizeof(fg_abi_used)/sizeof(fg_abi_used[0]);i++) assert(!fg_abi_used[i]);
- puts("PASS: cached overlap mirror (exact 4K overlap refusal, no partial publish, unmap clears, init clears)");
+ /* Word-wise bitmap: ranges that start/end mid-word, span several words, and fill an exact word. */
+ { static const struct { uint64_t pg, n; } r[]={{0,64},{3,61},{60,10},{64,128},{100,300},{63,1},{1,200},{511,513}};
+   for(unsigned i=0;i<sizeof(r)/sizeof(r[0]);i++) {
+    uint64_t v=0x40000000+r[i].pg*4096,nb=r[i].n*4096;reset();
+    assert(!fuxi_gpu_abi_map(v,source,nb,3,0,2));
+    for(uint64_t k=r[i].pg>1?r[i].pg-2:0;k<r[i].pg+r[i].n+2;k++) assert(fg_abi_used_get(fg_abi_pg(0x40000000+k*4096))==(k>=r[i].pg && k<r[i].pg+r[i].n));
+    assert(fuxi_gpu_abi_map(v+(r[i].n-1)*4096,source,4096,3,0,2)==-1 && fuxi_gpu_abi_map(v-(r[i].pg?4096:0),source,r[i].pg?8192:4096,3,0,2)==-1);
+    assert(!fuxi_gpu_abi_unmap(v,nb));
+    for(unsigned w=0;w<sizeof(fg_abi_used)/sizeof(fg_abi_used[0]);w++) assert(!fg_abi_used[w]);
+   }
+ }
+ /* Legacy opt-in (fuxigpuncimport 256): a map waits for an idle GPU again. */
+ seed();ncimportArg=256;assert(fg_abi_init() && fg_abi_mapwait);
+ { uint64_t sz[1]={4096},ad[1]={va},fn=0;
+   assert(!fuxi_gpu_abi_map(va,source,bytes,3,0,2) && !fuxi_gpu_abi_submit(ad,sz,1,&fn) && fg_client_busy);
+   assert(fuxi_gpu_abi_map(0x30000000,source,4096,3,0,2)==1 && !*fg_abi_leaf(0x30000000) && !fg_abi_used_get(fg_abi_pg(0x30000000)));
+   complete();assert(!fuxi_gpu_abi_map(0x30000000,source,4096,3,0,2) && !fg_client_busy); }
+ /* Default: a faulted job seen by the map's own observation is still isolated, and the map then refuses. */
+ reset();
+ { uint64_t sz[1]={4096},ad[1]={va},fn=0;
+   assert(!fuxi_gpu_abi_map(va,source,bytes,3,0,2) && !fuxi_gpu_abi_submit(ad,sz,1,&fn));
+   fault=1;regs[0x928]=1;assert(fuxi_gpu_abi_map(0x30000000,source,4096,3,0,2)==-1 && state==2 && !fg_client_busy && !*fg_abi_leaf(0x30000000)); }
+ puts("PASS: map while a job runs (default) vs idle wait (256), word-wise overlap bitmap, cached overlap mirror (exact 4K overlap refusal, no partial publish, unmap clears, init clears)");
  /* Ranged invalidate: default keeps the whole-ASID TLBI; value 128 does one TLBIVAL per 4K page plus sync, up to 512 pages. */
  reset();assert(!fuxi_gpu_abi_map(va,source,32768,3,0,2));tlbs=0;
  assert(!fuxi_gpu_abi_unmap(va,32768) && tlbs==1 && !tlbiWrites);
