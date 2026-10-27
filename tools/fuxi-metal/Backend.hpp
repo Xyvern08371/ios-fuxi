@@ -28,6 +28,7 @@
 #include "SamplingPolicy.hpp"
 #include "PixelFormats.hpp"
 #include "ObjectCache.hpp"
+#include "HostImportRange.hpp"
 #include <functional>
 #include <memory>
 #include <optional>
@@ -77,7 +78,7 @@ inline void importCheck(VkResult r,int line=__builtin_LINE()) {
  X(CreatePipelineLayout) X(DestroyPipelineLayout) X(CreateGraphicsPipelines) X(DestroyPipeline) \
  X(CreatePipelineCache) X(DestroyPipelineCache) X(GetPipelineCacheData) \
  X(CmdBindVertexBuffers) X(CmdBindIndexBuffer) X(CmdDrawIndexed) X(CmdSetViewport) X(CmdSetScissor) X(CmdPushConstants) X(CmdBeginRenderPass) X(CmdEndRenderPass) X(CmdBindPipeline) X(CmdDraw) X(CmdCopyImageToBuffer) X(CmdPipelineBarrier) X(CreateFence) X(DestroyFence) X(QueueSubmit) X(WaitForFences)
-struct Buffer { VkBuffer buffer{}; VkDeviceMemory memory{}; void *contents{}; size_t length{}, allocated{},charged{},memoryBytes{},references=1;uint32_t memoryType{};bool imported=false,upload=false; };
+struct Buffer { VkBuffer buffer{}; VkDeviceMemory memory{}; void *contents{}; size_t length{}, allocated{},charged{},memoryBytes{},memoryOffset{},references=1;uint32_t memoryType{};bool imported=false,upload=false; };
 // Host ranges a submit's prepare callback will write; absent means unknown (full drain).
 struct PrepareWrite {Buffer *buffer;uint64_t offset,bytes;};
 struct Texture : TextureLevels {VkImage image{};VkDeviceMemory memory{};VkImageView view{};size_t allocated{},charged{},memoryBytes{},references=1;
@@ -414,8 +415,13 @@ public:
  // page contract. Sample-only layouts may use a refreshed optimal shadow.
  Buffer *importBuffer(void *base,size_t bytes) {
   std::lock_guard<std::mutex> guard(mutex);requireLive();
-  if(!supportsHostImport() || !base || !bytes || bytes>maxBufferLength || uintptr_t(base)%hostAlignment || bytes%hostAlignment)throw std::runtime_error("no-copy buffer host alignment/length");
-  auto *b=new Buffer{};b->length=bytes;b->imported=true;
+  ++HostImportStats::attempts;
+  if(!supportsHostImport())throw std::runtime_error("no-copy buffer host import unsupported");
+  // Import the enclosing host pages and bind the buffer at the pointer's offset: CA's CGImage bytes are rarely page aligned.
+  auto plan=planHostImport(uintptr_t(base),bytes,hostAlignment,0,maxBufferLength);
+  if(!bytes || bytes>maxBufferLength || !plan.ok()){++HostImportStats::refusedPlan;throw std::runtime_error(std::string("no-copy buffer host range (")+hostImportWhyText(plan.why)+") ptr%16K="+std::to_string(uintptr_t(base)%hostAlignment)+" len%16K="+std::to_string(bytes%hostAlignment));}
+  if(plan.offset)++HostImportStats::enclosed;else ++HostImportStats::aligned;
+  auto *b=new Buffer{};b->length=bytes;b->imported=true;b->memoryOffset=plan.offset;
   try {
    VkExternalMemoryBufferCreateInfo ext{};ext.sType=VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO;ext.handleTypes=VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
    VkBufferCreateInfo ci{};ci.sType=VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;ci.pNext=&ext;ci.size=bytes;
@@ -427,20 +433,21 @@ public:
    if(!(externalFeatures&VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT) || (externalFeatures&VK_EXTERNAL_MEMORY_FEATURE_DEDICATED_ONLY_BIT) || !(properties.externalMemoryProperties.compatibleHandleTypes&info.handleType))throw std::runtime_error("no-copy buffer external import unavailable");
    check(CreateBuffer(device,&ci,nullptr,&b->buffer));VkMemoryRequirements req{};GetBufferMemoryRequirements(device,b->buffer,&req);
    if(req.size>bytes)throw std::runtime_error("no-copy buffer allocation size");
-   VkMemoryHostPointerPropertiesEXT hp{};hp.sType=VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT;importCheck(GetMemoryHostPointerPropertiesEXT(device,VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT,base,&hp));
+   if(!planHostImport(uintptr_t(base),bytes,hostAlignment,req.alignment,maxBufferLength).ok() || plan.offset+req.size>plan.bytes)throw std::runtime_error("no-copy buffer offset alignment "+std::to_string(plan.offset)+" required="+std::to_string(req.alignment));
+   VkMemoryHostPointerPropertiesEXT hp{};hp.sType=VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT;importCheck(GetMemoryHostPointerPropertiesEXT(device,VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT,(void *)plan.base,&hp));
    uint32_t type=0;while(type<memory.memoryTypeCount && (!(req.memoryTypeBits&hp.memoryTypeBits&(1u<<type)) || !(memory.memoryTypes[type].propertyFlags&VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)))++type;
    if(type==memory.memoryTypeCount)throw std::runtime_error("no-copy buffer memory type");
-   VkImportMemoryHostPointerInfoEXT hi{};hi.sType=VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT;hi.handleType=VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;hi.pHostPointer=base;
-   VkMemoryAllocateInfo ai{};ai.sType=VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;ai.pNext=&hi;ai.allocationSize=bytes;ai.memoryTypeIndex=type;
+   VkImportMemoryHostPointerInfoEXT hi{};hi.sType=VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT;hi.handleType=VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;hi.pHostPointer=(void *)plan.base;
+   VkMemoryAllocateInfo ai{};ai.sType=VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;ai.pNext=&hi;ai.allocationSize=plan.bytes;ai.memoryTypeIndex=type;
    reserveMemoryUnlocked(ai.allocationSize);b->charged=ai.allocationSize;
-   importCheck(frameKernelCall([&]{return AllocateMemory(device,&ai,nullptr,&b->memory);}));if(systemTranslationPolicy().frameTrace)++frameCounts.allocations;++liveMemoryObjects;liveMemoryBytes+=ai.allocationSize;b->memoryBytes=ai.allocationSize;b->allocated=bytes;b->memoryType=type;check(frameKernelCall([&]{return BindBufferMemory(device,b->buffer,b->memory,0);}));
-   check(frameKernelCall([&]{return MapMemory(device,b->memory,0,VK_WHOLE_SIZE,0,&b->contents);}));return b;
-  }catch(...){destroyUnlocked(b);throw;}
+   importCheck(frameKernelCall([&]{return AllocateMemory(device,&ai,nullptr,&b->memory);}));if(systemTranslationPolicy().frameTrace)++frameCounts.allocations;++liveMemoryObjects;liveMemoryBytes+=ai.allocationSize;b->memoryBytes=ai.allocationSize;b->allocated=bytes;b->memoryType=type;check(frameKernelCall([&]{return BindBufferMemory(device,b->buffer,b->memory,plan.offset);}));
+   check(frameKernelCall([&]{return MapMemory(device,b->memory,0,VK_WHOLE_SIZE,0,&b->contents);}));b->contents=(uint8_t *)b->contents+plan.offset;return b;
+  }catch(...){++HostImportStats::refusedVulkan;destroyUnlocked(b);throw;}
  }
- static std::string linearAliasMismatch(const VkMemoryRequirements &req,const VkSubresourceLayout &layout,uint32_t memoryType,size_t allocated,size_t offset,size_t row) {
+ static std::string linearAliasMismatch(const VkMemoryRequirements &req,const VkSubresourceLayout &layout,uint32_t memoryType,size_t allocated,size_t offset,size_t row,size_t memoryOffset=0) {
    std::string mismatch;
    auto failed=[&](bool condition,const std::string &text){if(condition){if(!mismatch.empty())mismatch+=", ";mismatch+=text;}};
-   failed(!req.alignment || offset%req.alignment,"alignment offset="+std::to_string(offset)+" required="+std::to_string(req.alignment));
+   failed(!req.alignment || (memoryOffset+offset)%req.alignment,"alignment offset="+std::to_string(memoryOffset+offset)+" required="+std::to_string(req.alignment));
    failed(!(req.memoryTypeBits&(1u<<memoryType)),"memory type buffer="+std::to_string(memoryType)+" allowedBits="+std::to_string(req.memoryTypeBits));
    failed(offset>allocated || req.size>allocated-std::min(offset,allocated),"size required="+std::to_string(req.size)+" available="+std::to_string(allocated-std::min(offset,allocated)));
    failed(layout.offset!=0,"layout.offset Vulkan="+std::to_string(layout.offset)+" Metal=0");
@@ -477,9 +484,9 @@ public:
    }
    auto result=CreateImage(device,&ci,nullptr,&t->image);if(result==VK_ERROR_FORMAT_NOT_SUPPORTED)return fallback("linear texture image format unavailable");check(result);VkMemoryRequirements req{};GetImageMemoryRequirements(device,t->image,&req);
    VkImageSubresource sub{VK_IMAGE_ASPECT_COLOR_BIT,0,0};VkSubresourceLayout layout{};GetImageSubresourceLayout(device,t->image,&sub,&layout);
-   auto mismatch=linearAliasMismatch(req,layout,b->memoryType,b->allocated,offset,row);
+   auto mismatch=linearAliasMismatch(req,layout,b->memoryType,b->allocated,offset,row,b->memoryOffset);
    if(!mismatch.empty())return fallback("linear texture Vulkan memory/layout mismatch: "+mismatch);
-   check(frameKernelCall([&]{return BindImageMemory(device,t->image,b->memory,offset);}));t->memory=b->memory;t->memoryType=b->memoryType;t->borrowedMemory=true;t->allocated=req.size;
+   check(frameKernelCall([&]{return BindImageMemory(device,t->image,b->memory,b->memoryOffset+offset);}));t->memory=b->memory;t->memoryType=b->memoryType;t->borrowedMemory=true;t->allocated=req.size;
    t->mapped=(uint8_t *)b->contents+offset;t->layout=ci.initialLayout;t->defined=true;t->usage=ci.usage;
    VkImageViewCreateInfo vi{};vi.sType=VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;vi.image=t->image;vi.viewType=VK_IMAGE_VIEW_TYPE_2D;vi.format=t->vkFormat;vi.subresourceRange={VK_IMAGE_ASPECT_COLOR_BIT,0,1,0,1};
    check(CreateImageView(device,&vi,nullptr,&t->view));t->blendable=formatProperties.linearTilingFeatures&VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT;t->filterable=formatProperties.linearTilingFeatures&VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT;t->backingBuffer=b;++b->references;return t;

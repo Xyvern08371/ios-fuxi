@@ -4,6 +4,7 @@
 #include <cassert>
 #include <fstream>
 #include <iterator>
+#include <sys/mman.h>
 #include <sys/wait.h>
 #include <unistd.h>
 template<class F> static std::string refuses(F f){try{f();}catch(const std::runtime_error &e){return e.what();}assert(false);return {};}
@@ -14,6 +15,21 @@ static void transfers(fuxi::Backend &b){
  auto mismatch=b.linearAliasMismatch(req,layout,0,512,3,480);
  for(const char *part:{"alignment offset=3 required=64","memory type buffer=0 allowedBits=2","size required=1024 available=509","layout.offset Vulkan=8 Metal=0","rowPitch Vulkan=256 Metal=480"})assert(mismatch.find(part)!=std::string::npos);
  req.alignment=1;req.memoryTypeBits=1;req.size=512;layout.offset=0;layout.rowPitch=480;assert(b.linearAliasMismatch(req,layout,0,512,0,480).empty());
+ // An enclosing-page import binds at its pointer offset: the alignment test uses memory offset + texture offset.
+ req.alignment=64;assert(b.linearAliasMismatch(req,layout,0,1024,0,480,64).empty() && b.linearAliasMismatch(req,layout,0,1024,64,480,128).empty());
+ assert(b.linearAliasMismatch(req,layout,0,1024,0,480,8).find("alignment offset=8 required=64")!=std::string::npos);
+ assert(b.linearAliasMismatch(req,layout,0,1024,32,480,32).empty());
+ // No-copy import: null/empty refuse; with host import, aligned and enclosing-page pointers keep contents==caller pointer.
+ {auto attempts=fuxi::HostImportStats::attempts.load();
+  assert(!refuses([&]{b.importBuffer(nullptr,64);}).empty() && !refuses([&]{b.importBuffer((void *)0x10000,0);}).empty());
+  if(b.supportsHostImport()){
+   size_t pg=16384;void *m=mmap(nullptr,4*pg,PROT_READ|PROT_WRITE,MAP_ANON|MAP_PRIVATE,-1,0);assert(m!=MAP_FAILED);memset(m,0x5a,4*pg);
+   for(size_t off:{size_t(0),size_t(256),pg-64}){size_t len=off==pg-64?200:pg;
+    fuxi::Buffer *imported=nullptr;try{imported=b.importBuffer((uint8_t *)m+off,len);}catch(const std::runtime_error &e){assert(off!=0 && std::string(e.what()).find("no-copy buffer")!=std::string::npos);}
+    if(imported){assert(imported->contents==(uint8_t *)m+off && imported->length==len && *(uint8_t *)imported->contents==0x5a);b.destroy(imported);}}
+   munmap(m,4*pg);
+  }
+  assert(fuxi::HostImportStats::attempts.load()>=attempts+2);}
  for(uint32_t format:{1u,30u}){
   const size_t pixel=b.texelBytes(format),offset=3*pixel,row=16*pixel,w=7,h=5;
   // Only the used bytes of the last row exist. Odd binding offsets and padded

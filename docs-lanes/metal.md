@@ -2494,6 +2494,22 @@ snapshot into shared backing after a full drain. It is not an IOSurface snapshot
 in `Backend::submit`'s `refresh`, not the CPU snapshot/copy. Its supplied
 **513,947 bytes/frame** is unchanged by this revision.
 
+**No-copy import range (code only, device effect not yet observed).** J163 logged one
+refusal: `Vulkan rc -1000072003 at Backend.hpp:433 (host import)`, i.e.
+`VK_ERROR_INVALID_EXTERNAL_HANDLE` from `AllocateMemory` after the 16 KiB pointer and
+length checks had passed, so that buffer was refused by Turnip/the kernel, not by
+FuxiMetal alignment. The log is one-shot, so the share of unaligned pointers is unknown.
+`importBuffer` now imports the enclosing 16 KiB pages (`HostImportRange.hpp`) and binds the
+`VkBuffer` at the pointer offset (`Buffer::memoryOffset`, folded into linear-texture binds and
+the alignment check), so unaligned or ragged-length CA pointers no longer fail on FuxiMetal's own
+rule; every imported page holds a caller byte. Offsets the buffer cannot bind at are refused.
+The kernel `importHost` logs bounded `FUXI GPU: host import refused stage N ... detail` lines
+(1 args, 2 quota, 3 slots, 4 no VM entry, 5 prepare, 6 length, 7 physical page: detail is the
+offset, 8 kernel mapping, 9 wire alias), and the `no-copy buffer shadowed` line now carries
+`ptr%16K len%16K` and attempts/aligned/enclosed/plan_refused/vulkan_refused counters. A
+read-only/COW page refusal would need a read-only import ABI; not attempted without that
+evidence. No generation-based skip exists for raw pointers, so shadow copies stay for refused imports.
+
 Raw no-copy pointers have no observable CPU mutation generation or IOSurface
 seed. Skipping on object identity, shader-read usage or `didModifyRange` alone
 would miss legal CPU writes. `ShadowCache` instead compares exact bytes at

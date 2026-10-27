@@ -36,6 +36,7 @@
 #include "CAState.hpp"
 #include "CommandStorage.hpp"
 #include "Timeline.hpp"
+#include "HostImportRange.hpp"
 #include "SurfaceLease.hpp"
 #include "VertexProfile.hpp"
 #ifndef FUXI_MTL_BACKEND_HEADER
@@ -1805,8 +1806,9 @@ static NSString *surfaceDescriptorText(IOSurfaceRef surface,NSUInteger plane){
   // copy-on-write pages the kernel will not wire for GPU access (M9 CA smoke
   // stage 3). Shadow them: contents stays the client's pointer and every
   // commit refreshes the GPU copy. GPU writes do not reach the client's pages.
-  static std::atomic<bool> logged{false};
-  if(!logged.exchange(true))fprintf(stderr,"FUXI MTL: no-copy buffer shadowed (%s)\n",e.what());
+  // Page-aligned or enclosing-page imports are tried first; log each refusal reason (bounded) with the running outcome counters.
+  static std::atomic<unsigned> refusals{0};unsigned n=refusals.fetch_add(1);
+  if(n<12 || !(n&511))fprintf(stderr,"FUXI MTL: no-copy buffer shadowed (%s) len=%lu import attempts=%llu aligned=%llu enclosed=%llu plan_refused=%llu vulkan_refused=%llu\n",e.what(),(unsigned long)length,(unsigned long long)fuxi::HostImportStats::attempts.load(),(unsigned long long)fuxi::HostImportStats::aligned.load(),(unsigned long long)fuxi::HostImportStats::enclosed.load(),(unsigned long long)fuxi::HostImportStats::refusedPlan.load(),(unsigned long long)fuxi::HostImportStats::refusedVulkan.load());
   try {b->_buffer=owner(self)->backend->allocate(length);}
   catch(const std::exception &a){failureLog("FUXI MTL: no-copy buffer FAIL %s\n",a.what());[b release];return nil;}
   memcpy(b->_buffer->contents,pointer,length);b->_shadow=YES;

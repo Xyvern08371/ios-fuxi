@@ -58,6 +58,10 @@ def main():
                         '-o',str(d/'timeline')],check=True)
         if not a.compile_only:subprocess.run([str(d/'timeline')],check=True,timeout=15)
         subprocess.run([*compiler,'-std=c++17','-Wall','-Wextra','-Werror',
+                        '-fsanitize=address,undefined',str(ROOT/'tools/fuxi-metal/HostImportRangeTests.cpp'),
+                        '-o',str(d/'host-import-range')],check=True)
+        if not a.compile_only:subprocess.run([str(d/'host-import-range')],check=True,timeout=15)
+        subprocess.run([*compiler,'-std=c++17','-Wall','-Wextra','-Werror',
                         '-fsanitize=address,undefined',str(ROOT/'tools/fuxi-metal/ResourceCacheTests.cpp'),
                         '-o',str(d/'resource-cache')],check=True)
         if not a.compile_only:subprocess.run([str(d/'resource-cache')],check=True,timeout=30)

@@ -215,34 +215,46 @@ class FuxiAdrenoUserClient : public IOUserClient {
   * COW resolution, before wiring. Never translate a user VA with kernel_pmap,
   * change its WIMG/cache mode, or manufacture a physical descriptor alias. */
  IOReturn importHost(const NativeAdrenoAbiBoImport &r, NativeAdrenoAbiBoAllocReply &out) {
+  /* Stage numbers tell userland which rule refused a client page range:
+   * 1 argument/task, 2 quota, 3 BO slots, 4 no VM entry (hole or protection),
+   * 5 prepare/wire, 6 length, 7 physical segment (detail = page index<<8|why),
+   * 8 kernel mapping, 9 wire alias. Bounded log; detail is a VA or offset. */
+  static unsigned refused;
+  auto refuse=[&](unsigned stage,IOReturn kr,uint64_t detail)->IOReturn{
+   if (refused<32) { refused++; IOLog("FUXI GPU: host import refused stage %u kr 0x%08x va 0x%llx bytes 0x%llx detail 0x%llx\n",
+       stage,(unsigned)kr,(unsigned long long)r.address,(unsigned long long)r.bytes,(unsigned long long)detail); }
+   return kr;
+  };
   if (current_task()!=task_ || task_==kernel_task || !fg_abi_import_valid(r.address,r.bytes))
-   return kIOReturnBadArgument;
+   return refuse(1,kIOReturnBadArgument,0);
   if (wired_>FG_ABI_MAX_WIRED_BYTES || r.bytes>FG_ABI_MAX_WIRED_BYTES-wired_ ||
-      nextHandle_==UINT64_MAX) return kIOReturnNoResources;
+      nextHandle_==UINT64_MAX) return refuse(2,kIOReturnNoResources,wired_);
   Bo *b=nullptr;
   for (auto &candidate:bos_) if (!candidate.handle) { b=&candidate; break; }
-  if (!b) return kIOReturnNoResources;
+  if (!b) return refuse(3,kIOReturnNoResources,0);
   IOMemoryDescriptor *memory=IOMemoryDescriptor::withAddressRange(r.address,r.bytes,
       kIODirectionInOut|kIOMemoryMapperNone|kIOMemoryPersistent,task_);
-  if (!memory) return kIOReturnNoMemory;
-  if (memory->prepare()!=kIOReturnSuccess) { memory->release(); return kIOReturnBadArgument; }
+  if (!memory) return refuse(4,kIOReturnNoMemory,0);
+  if (memory->prepare()!=kIOReturnSuccess) { memory->release(); return refuse(5,kIOReturnBadArgument,0); }
   bool valid=memory->getLength()==r.bytes;
+  uint64_t why=valid ? 0 : (6ULL<<56);
   for (uint64_t off=0;valid && off<r.bytes;off+=NativeAdrenoAbiHostPageBytes) {
    IOByteCount length=0;
    uint64_t pa=memory->getPhysicalSegment(off,&length,kIOMemoryMapperNone);
    valid=pa && !(pa&(NativeAdrenoAbiHostPageBytes-1)) && length>=NativeAdrenoAbiHostPageBytes &&
        pa<(UINT64_C(1)<<FG_ABI_PA_BITS) && fuxi_adreno_host_page_ok(pa);
+   if (!valid) why=(7ULL<<56)|off;
   }
   // DefaultCache inherits the memory entry's actual policy (WB or Normal NC).
   IOMemoryMap *mapping=valid ? memory->createMappingInTask(kernel_task,0,kIOMapAnywhere|kIOMapDefaultCache) : nullptr;
   if (!mapping || !mapping->getVirtualAddress() || mapping->getLength()!=r.bytes) {
    if (mapping) mapping->release();
-   memory->complete(); memory->release(); return kIOReturnBadArgument;
+   memory->complete(); memory->release(); return refuse(valid ? 8 : (why>>56),kIOReturnBadArgument,why&((1ULL<<56)-1));
   }
   // Fault/wire the kernel alias as well: pmap lookup and watchdog cache
   // maintenance must never depend on a pageable/demand-faulted KVA mapping.
   if (mapping->wireRange(kIODirectionInOut,0,r.bytes)!=kIOReturnSuccess) {
-   mapping->release(); memory->complete(); memory->release(); return kIOReturnNoMemory;
+   mapping->release(); memory->complete(); memory->release(); return refuse(9,kIOReturnNoMemory,0);
   }
   b->importMemory=memory; b->importMap=mapping; b->bytes=b->allocated=r.bytes;
   b->handle=nextHandle_++; wired_+=r.bytes; out.handle=b->handle;
