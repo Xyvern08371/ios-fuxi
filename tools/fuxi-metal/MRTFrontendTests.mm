@@ -32,7 +32,7 @@ int main(){@autoreleasepool {
  for(unsigned i=0;i<4;++i)assert([cb->_resources containsObject:textures[i]]);
  // Pipeline state at slot 3 affects identity; absent slots' defaults are inert.
  auto misses=fuxi::Backend::pipelineMisses.load();pd.colorAttachments[3].writeMask=MTLColorWriteMaskAll;id changed=[device newRenderPipelineStateWithDescriptor:pd error:&error];assert(changed && fuxi::Backend::pipelineMisses==misses+1);[changed release];
- auto refuses=[&](void (^change)(),void (^restore)()) {change();FuxiCommandBuffer *bad=(FuxiCommandBuffer *)[q commandBuffer];id refused=[bad renderCommandEncoderWithDescriptor:pass];assert(refused && [refused isKindOfClass:[FuxiRefusedRender class]] && bad->_rejected);[refused setRenderPipelineState:nil];[refused drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];[refused endEncoding];restore();};
+ auto refuses=[&](void (^change)(),void (^restore)()) {change();FuxiCommandBuffer *bad=(FuxiCommandBuffer *)[q commandBuffer];id refused=[bad renderCommandEncoderWithDescriptor:pass];assert(refused && [refused isKindOfClass:[FuxiRefusedRender class]] && bad->_rejected);id<MTLRenderPipelineState> none=nil;[refused setRenderPipelineState:none];[refused drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];[refused endEncoding];restore();};
  refuses(^{pass.colorAttachments[2].level=0;},^{pass.colorAttachments[2].level=1;});
  refuses(^{pass.colorAttachments[3].slice=1;},^{pass.colorAttachments[3].slice=0;});
  for(auto action:{MTLStoreActionMultisampleResolve,MTLStoreActionStoreAndMultisampleResolve,MTLStoreActionUnknown})refuses(^{pass.colorAttachments[2].storeAction=action;},^{pass.colorAttachments[2].storeAction=MTLStoreActionStore;});

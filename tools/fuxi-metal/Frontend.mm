@@ -1573,7 +1573,7 @@ static NSString *renderPassText(MTLRenderPassDescriptor *d){
 - (FuxiTexture *)texture:(id)t slice:(NSUInteger)s level:(NSUInteger)l origin:(MTLOrigin)o size:(MTLSize)z {FRONTEND_TIME(_command);
  if(_ended || !_command->_encoding || _command->_status!=MTLCommandBufferStatusNotEnqueued)invalid(@"inactive blit encoder");
  if(![t isKindOfClass:[FuxiTexture class]] || [t device]!=[self device])invalid(@"foreign texture/device");
- bool volume=[t textureType]==MTLTextureType3D;NSUInteger levelDepth=std::max(NSUInteger(1),[t depth]>>l);
+ bool volume=[t textureType]==MTLTextureType3D;NSUInteger levelDepth=l<64?std::max(NSUInteger(1),[t depth]>>l):1;
  if(s || l>=[t mipmapLevelCount] || (volume?(!z.depth || o.z>levelDepth || z.depth>levelDepth-o.z):(o.z || z.depth!=1)) || !z.width || !z.height || o.x>std::max(NSUInteger(1),[t width]>>l) || z.width>std::max(NSUInteger(1),[t width]>>l)-o.x || o.y>std::max(NSUInteger(1),[t height]>>l) || z.height>std::max(NSUInteger(1),[t height]>>l)-o.y)invalid(@"texture copy region bounds");return t;
 }
 - (FuxiBuffer *)imageBuffer:(id)b offset:(NSUInteger)offset row:(NSUInteger)row image:(NSUInteger)image size:(MTLSize)size pixel:(NSUInteger)pixel {FRONTEND_TIME(_command);
