@@ -34,6 +34,7 @@
 #include <IOKit/IOLib.h>
 #include <IOKit/IOLocks.h>
 #include <IOKit/system.h>
+#include <pexpert/pexpert.h>
 #include <libkern/c++/OSArray.h>
 #include <libkern/c++/OSDictionary.h>
 #include <libkern/c++/OSNumber.h>
@@ -63,6 +64,13 @@ enum {
 #define SWEET_SURFACE_MAX_ALLOC         (256u << 20)
 #define SWEET_SURFACE_MAX_PROPS         (64u << 10)
 #define SWEET_SURFACE_ROW_ALIGN         64
+/* backboardd's Metal renderer only ever wraps 4-byte single-plane surfaces whose
+ * row is 256-aligned (all its own surfaces are). MaterialKit snapshot surfaces ask
+ * for CGBitmapGetAlignedBytesPerRow (32-byte) rows, so CARenderServerSnapshot
+ * left them unrendered and the opaque App Library background stayed black.
+ * Explicit rows are a minimum (clients query the row back); sweetsurfrow=0 keeps
+ * the requested value. */
+#define SWEET_SURFACE_GPU_ROW_ALIGN     256
 #define SWEET_SURFACE_TIMESTAMPS        0x800   /* offset in the state page */
 #define SWEET_SURFACE_STATE_USE         0x18
 #define SWEET_SURFACE_USE_MAX           65535u
@@ -558,6 +566,18 @@ sweet_row_bytes(uint32_t width, uint32_t ew, uint32_t bpe)
 	return (uint32_t)((row + SWEET_SURFACE_ROW_ALIGN - 1) & ~(uint64_t)(SWEET_SURFACE_ROW_ALIGN - 1));
 }
 
+static bool
+sweet_surface_gpu_rows(void)
+{
+	static int enabled = -1;
+	if (enabled < 0) {
+		uint32_t v = 1;
+		(void)PE_parse_boot_argn("sweetsurfrow", &v, sizeof(v));
+		enabled = v != 0;
+	}
+	return enabled != 0;
+}
+
 /* Geometry from the creation properties (IOSurface.h keys). */
 static IOReturn
 sweet_surface_layout(SweetSurface *s, OSDictionary *props)
@@ -580,6 +600,10 @@ sweet_surface_layout(SweetSurface *s, OSDictionary *props)
 	    sweet_row_bytes(s->width, s->elementWidth, s->bytesPerElement));
 	if (s->bytesPerRow < (uint64_t)sweet_div_up(s->width, s->elementWidth) * s->bytesPerElement) {
 		return kIOReturnBadArgument;
+	}
+	if (s->bytesPerElement == 4 && props->getObject("IOSurfacePlaneInfo") == NULL &&
+	    (s->bytesPerRow & (SWEET_SURFACE_GPU_ROW_ALIGN - 1)) != 0 && sweet_surface_gpu_rows()) {
+		s->bytesPerRow = (s->bytesPerRow + SWEET_SURFACE_GPU_ROW_ALIGN - 1) & ~(uint32_t)(SWEET_SURFACE_GPU_ROW_ALIGN - 1);
 	}
 	end = (uint64_t)s->offset + (uint64_t)s->bytesPerRow * sweet_div_up(s->height, s->elementHeight);
 
