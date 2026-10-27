@@ -211,6 +211,9 @@ public:
  IOReturn swapWait(uint32_t id, uint32_t flags, uint64_t timeout);
  void recordDone(SwapRecord &record, bool shown);
  void consumeRecord(SwapRecord &record);
+ void retireEarly(const SwapRecord &record);
+ bool          fEarlyRetire;
+ uint32_t      fEarlyRetires;
  void stopRecords(void);
 	bool present(const SwapRecord &record);
  void presentNext(void);
@@ -271,6 +274,35 @@ static uint32_t sweet_fb_timer_options(void)
 }
 
 #if defined(FUXI)
+/* IOMFBDisplayRefresh.displayMinRefreshInterval: seconds in 0.32 fixed point, a 32-bit OSNumber
+ * (CA reads it with CFNumberGetValue as int32; NativeMobileDisplay getRefreshAttributes uses 2^32/hz).
+ * 120 Hz -> 35791394. displayRefreshStepMachTime is deliberately not published (VRR-only). */
+static uint32_t sweet_fb_refresh_interval(uint32_t hz)
+{
+ return hz == 0 ? 0 : (uint32_t)(((1ULL << 32) + hz / 2) / hz);
+}
+
+/* Opt-in: fuxipanel120=1 only; an explicit sweetfb_hz<=60 keeps CA's 1/60 s heartbeat. */
+static bool sweet_fb_refresh_wanted(uint32_t panel120, bool hzPresent, uint32_t hz)
+{
+ return panel120 == 1 && !(hzPresent && hz <= 60);
+}
+
+static void sweet_fb_refresh_publish(AppleCLCD *fb)
+{
+ uint32_t panel120 = 0, hz = 0;
+ PE_parse_boot_argn("fuxipanel120", &panel120, sizeof(panel120));
+ bool hzPresent = PE_parse_boot_argn("sweetfb_hz", &hz, sizeof(hz));
+ if (!sweet_fb_refresh_wanted(panel120, hzPresent, hz)) return;
+ OSDictionary *refresh = OSDictionary::withCapacity(1);
+ OSNumber *interval = OSNumber::withNumber((uint64_t)sweet_fb_refresh_interval(120), 32);
+ if (refresh && interval && refresh->setObject("displayMinRefreshInterval", interval) &&
+     fb->setProperty("IOMFBDisplayRefresh", refresh))
+  IOLog("SWEET FB: IOMFBDisplayRefresh displayMinRefreshInterval=%u (120 Hz)\n", sweet_fb_refresh_interval(120));
+ OSSafeReleaseNULL(interval);
+ OSSafeReleaseNULL(refresh);
+}
+
 static void sweet_fb_te_configure(AppleCLCD *fb)
 {
  unsigned enabled = 0, offset = 7800; /* 7.3 ms transfer + 0.5 ms margin */
@@ -394,6 +426,9 @@ AppleCLCD::start(IOService *provider)
 	PE_parse_boot_argn("fuxi_unixnu_idlefb", &idle, sizeof(idle));
 	fUnixnuDiff = diff == 1;
 	fUnixnuIdle = idle == 1;
+	uint32_t early = 0;
+	PE_parse_boot_argn("fuxiearly", &early, sizeof(early));
+	fEarlyRetire = early == 1;
 	if (fUnixnuDiff) {
 		fShadowBytes = (uint64_t)fWidth * fHeight * 4;
 		if (fWidth > 16384 || fHeight > 16384 || !fShadowBytes || fShadowBytes > (64ULL << 20) ||
@@ -442,6 +477,7 @@ AppleCLCD::start(IOService *provider)
 	PE_parse_boot_argn("fuxibacklight", &backlight, sizeof(backlight));
 	fBacklightPowerNotifications = backlight == 2 || backlight == 3;
 	fuxi_backlight_publish(this);
+	sweet_fb_refresh_publish(this);
 #endif
 	registerService();
 	IOLog("SWEET FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u, presented as %ux%u\n",
@@ -705,6 +741,18 @@ void AppleCLCD::consumeRecord(SwapRecord &record)
  uint32_t id = get32(record.bytes, 0x50);
  SwapStatus &status = fSwapStatus[id % SWEET_FB_SWAP_HISTORY];
  if (id && status.id == id && status.state == SwapQueued) { status.state = SwapConsumed; IOLockWakeup(fLock, fSwapStatus, false); }
+}
+
+/* NativeMobileDisplay (BSD-2-Clause-Patent) early retire: the GPU copy owns the frame, so SwapWait(flags 0)
+ * may return now. displayUses stay held (released at the fence) and the writer lock still blocks CA on the
+ * surface until the copy retires. */
+void AppleCLCD::retireEarly(const SwapRecord &record)
+{
+ uint32_t id = get32(record.bytes, 0x50);
+ IOLockLock(fLock);
+ SwapStatus &status = fSwapStatus[id % SWEET_FB_SWAP_HISTORY];
+ if (id && status.id == id && status.state == SwapQueued) { status.state = SwapConsumed; fEarlyRetires++; IOLockWakeup(fLock, fSwapStatus, false); }
+ IOLockUnlock(fLock);
 }
 
 void AppleCLCD::recordDone(SwapRecord &record, bool shown)
@@ -1099,6 +1147,7 @@ AppleCLCD::present(const SwapRecord &record)
              struct fg_present_times times; fuxi_gpu_scanout_stamps(&times);
              fStageGpu = true; fStage[3] = times.submitted;
              if (read.held) { sweet_surface_present_end(); read.held = false; }
+             if (fEarlyRetire) retireEarly(record);
              fScanoutBytes = fuxi_gpu_scanout_double() ? (uint64_t)1080 * 2400 * 4 : (uint64_t)w * h * 4;
 				fShadowValid = false;
 				gpuFrame = true;
@@ -1276,8 +1325,8 @@ void AppleCLCD::presentStats(uint64_t took)
 		fStatSwaps = fStatDropped = 0;
 		IOLockUnlock(fLock);
 		IOLog("SWEET FB: stats %u frames in %llu ms, copy avg %llu us max %llu us, "
-		    "%u swaps, %u not shown queued_pending=%u fifo_overflow=%u ready_skips=%u ownership_defers=%u reuse_before_show=%llu wait_mode0=%llu wait_mode1=%llu wait_early=%llu wait_id0=%llu outstanding_max=%u\n", fStatFrames, span_ns / 1000000, avg_ns / 1000,
-		    max_ns / 1000, swaps, dropped, pending, overflow, skips, fScanoutDefers, reuse, waits[0], waits[1], early, latest, outstanding);
+		    "%u swaps, %u not shown queued_pending=%u fifo_overflow=%u ready_skips=%u ownership_defers=%u reuse_before_show=%llu wait_mode0=%llu wait_mode1=%llu wait_early=%llu wait_id0=%llu outstanding_max=%u early_retires=%u\n", fStatFrames, span_ns / 1000000, avg_ns / 1000,
+		    max_ns / 1000, swaps, dropped, pending, overflow, skips, fScanoutDefers, reuse, waits[0], waits[1], early, latest, outstanding, fEarlyRetires);
 		uint64_t gpu_ns, cpu_ns;
 		absolutetime_to_nanoseconds(fGpuTime, &gpu_ns);
 		absolutetime_to_nanoseconds(fCpuTime, &cpu_ns);

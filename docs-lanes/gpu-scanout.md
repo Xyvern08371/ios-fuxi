@@ -1204,3 +1204,95 @@ limit and synchronous fence candidates. The inspected framebuffer property
 lookup uses `IOService` with options 0; the supplied work-interval caller offset
 does not identify its key in the inspected cache. No framebuffer property or
 SwapWait/source/TE/transfer guard changes. Kernel patches regenerate unchanged.
+
+## IOMFBDisplayRefresh, early SwapWait retire, direct scanout delta (UniXNU port)
+
+Source: NativeMobileDisplay (BSD-2-Clause-Patent), `NativeLegacyDisplay.cpp`,
+origin/main `8666a99`. Read only. Nothing below has been observed on a device.
+
+### IOMFBDisplayRefresh (opt-in `fuxipanel120=1`)
+
+CoreAnimation's heartbeat falls back to 1/60 s when AppleCLCD publishes no
+`IOMFBDisplayRefresh`, even with 120 Hz vsync callbacks. NativeMobileDisplay's
+`getRefreshAttributes` reports one fixed rate as 32.32 seconds (`2^32/hz`) and
+the original family publishes the dictionary. Ours publishes it directly:
+
+- Property `IOMFBDisplayRefresh` on AppleCLCD, set before `registerService()`:
+  an `OSDictionary` with one key, `displayMinRefreshInterval`, an `OSNumber`
+  of 32 bits = round(2^32/120) = **35791394**.
+- `displayRefreshStepMachTime` is not published (CA zeroes it without the VRR
+  MobileGestalt flag, which must stay false on this image).
+- Gate: `fuxipanel120=1` (exact value, same as the DSI switch). An explicit
+  `sweetfb_hz<=60` suppresses it (that arg is otherwise inert at >=60, so no new
+  boot-arg). The rate published is 120 regardless of whether the DSI switch
+  later succeeds; if it fails the panel stays at 60 Hz and CA targets 120.
+  Log: `SWEET FB: IOMFBDisplayRefresh displayMinRefreshInterval=35791394 (120 Hz)`.
+- CA precedence (code reading of the local cache): env `CA_HEARTBEAT_RATE`,
+  then step mach time, then this value, then 1/60 s. A mode-derived override
+  applies if the display's current-mode word (+0x230) is not -1; it is filled
+  from IOMFB digital-mode data. **Unverified risk:** our user client answers
+  unknown selectors with success and zeroed outputs, so a mode query could
+  yield a zero refresh rate and override the property. The once-per-selector
+  `SWEET FB: <proc> sel N` lines show which selectors backboardd issues; check
+  them before blaming the property.
+- Fallback without a kernel change: `CA_HEARTBEAT_RATE=120` in backboardd's
+  environment. Frame cost is about 22 ms median, so CA will miss most 8.3 ms
+  deadlines until frames are cheap: effective fps not yet observed.
+
+### Early SwapWait retire (`fuxiearly=1`, default off)
+
+NativeMobileDisplay retires the swap when the GPU client takes the frame
+(`sheng-early-retire`), not when its copy ends, because render and copy were
+serialized. Our SwapWait already returns for `SwapConsumed` (flags without bit
+0, counted as `wait_early`), but `SwapConsumed` was set only after the copy
+fence in `completePresent`. With `fuxiearly=1` a GPU-copied record is set to
+`SwapConsumed` when `sweet_surface_gpu_copy` returns 2 (`retireEarly`). Display
+uses stay held until the fence and the writer lock still blocks CA writes to
+the surface during the copy, so ownership is unchanged; only SwapWait(flags 0)
+waiters wake about one copy (about 1.3 ms) earlier. A failed copy replays the
+record as before. Waiters with flags bit 0 still wait for Shown. New stats
+field: `early_retires=N` on the `SWEET FB: stats` line. Not yet observed.
+
+### Direct scanout: why it is not ported
+
+NativeMobileDisplay (`sheng-dpu-scanout=2`) programs VIG0/VIG1 source address
+(+0x14) and stride (+0x24) with the compositor surface's own stride, flushes
+CTL0 (0x15018, bits 0 and 1), and polls the flush bit from a 500 us timer for
+up to 50 ms before retiring the swap. These are the same DPU 9.2 registers as
+ours (SRC0 = 0xae01000 + 0x4014). Allocation is the part that does not map:
+
+- It makes arbitrary compositor pages reachable by pinning the surface and
+  mapping its physical segments into the display's IOVA window via
+  `native_ufs_dpu_map` (4 LRU slots, never the shown or pending slot). Our
+  tree has no qualified display-SMMU mapping API, and our SRC0 is a 32-bit PA,
+  so non-contiguous RAM above 4 GiB is unreachable.
+- Stride: they pass the surface stride unchanged and scan the whole surface.
+  We need stride 4608 (not 4320), a (22,18) crop of 1125x2436 into 1080x2400
+  and SSPP SRC_XY/IMG_SIZE writes whose live values were never dumped.
+- Ownership: they hold the surface by reference, serialize one latch at a
+  time, and rely on the compositor not drawing before the swap retires. We
+  have SwapShown at START plus A/B/C triple buffers and a writer lock; a
+  direct design needs `scanoutOwned` in `sweet_gpu_writer`, a bounded sleep,
+  newest-wins collapse, and no CPU reads of write-combined pool pages.
+
+Precise delta for our design (carve three 0xAB8000 drawables out of the
+44 MiB splash reservation at 0xb8a00000, replacing B and C; opt-in
+`fuxiscandirect=1`, exclusive with double/triple):
+
+1. Instrument first: log swapped surface ids, SSPP +0x00..+0x30 and CTL flush
+   at takeover; qualify display reach of D1/D2 (0xb94b8000, 0xb9f70000, end
+   0xbaa28000) by CPU fill and kick.
+2. `fg_scanout_desc {pa, stride, xy, img}` programmed in one flush; every stop
+   path restores A {0xb8000000, 4320, 0, 1080x2400}.
+3. Allocator hook in IOSurface create (backboardd BGRA 1125x2436, bpr 4608
+   only) returning a physical-address descriptor with a pool slot; free
+   returns the slot.
+4. `fuxi_adreno_host_page_ok` must accept pool PAs, else FuxiMetal imports
+   fail and fall back to the shadow copy, which is strictly worse.
+5. Writer block plus hold-until-replaced release, deferring (never
+   CPU-reading) when direct publication is refused; probe 0x4e learns stride
+   4608 and the crop.
+
+Expected gain is 0.6-1.3 ms GPU time per frame and about 1-3 ms present
+latency (estimates); the fps effect is unobserved and the prior is small. Not
+started.

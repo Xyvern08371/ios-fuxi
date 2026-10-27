@@ -393,6 +393,15 @@ class IOMobileFramebufferUserClient {
 
 DISPLAY_PREFIX = DISPLAY_PREFIX.replace('#define FUXI 1', TE_OBSERVER + '\n' + PRESENT_TIMES + '\n#define FUXI 1')
 
+REFRESH_TEST = r'''
+int main(void) {
+ assert(sweet_fb_refresh_interval(120)==35791394 && sweet_fb_refresh_interval(60)==71582788 && sweet_fb_refresh_interval(0)==0);
+ assert(!sweet_fb_refresh_wanted(0,false,0) && sweet_fb_refresh_wanted(1,false,0) && !sweet_fb_refresh_wanted(2,false,0));
+ assert(sweet_fb_refresh_wanted(1,true,120) && !sweet_fb_refresh_wanted(1,true,60) && !sweet_fb_refresh_wanted(1,true,30));
+ puts("PASS: IOMFBDisplayRefresh interval and gating");return 0;
+}
+'''
+
 DISPLAY_TEST = r'''
 static IOReturn offer(AppleCLCD &fb,const uint8_t *rec) {
  uint8_t next[SWEET_FB_SWAP_REC_SIZE];memcpy(next,rec,sizeof(next));uint32_t id=get32(next,0x50);
@@ -430,6 +439,14 @@ int main(void) {
  gpuMode=2;offer(fb,rec);fb.vsyncFired(&fb,&timer);assert(fb.fGpuPending && fb.fTickArmed && !fb.fShadowValid);
  pollMode=0;unsigned before=arms;fb.vsyncFired(&fb,&timer);assert(fb.fGpuPending && fb.fTickArmed && arms==before+1);
  memset(pixels,0x55,sizeof(pixels));pollMode=1;fb.vsyncFired(&fb,&timer);assert(!fb.fGpuPending && !fb.fTickArmed);
+ // fuxiearly: the swap is Consumed when the GPU copy is submitted, before its fence; off by default.
+ {gpuMode=2;offer(fb,rec);uint32_t eid=fb.fSwapID;fb.vsyncFired(&fb,&timer);
+  assert(fb.fGpuPending && fb.fEarlyRetires==0 && fb.fSwapStatus[eid%SWEET_FB_SWAP_HISTORY].state==AppleCLCD::SwapQueued);
+  pollMode=1;fb.vsyncFired(&fb,&timer);assert(!fb.fGpuPending && fb.fSwapStatus[eid%SWEET_FB_SWAP_HISTORY].state!=AppleCLCD::SwapQueued);
+  fb.fEarlyRetire=true;offer(fb,rec);eid=fb.fSwapID;fb.vsyncFired(&fb,&timer);
+  assert(fb.fGpuPending && fb.fEarlyRetires==1 && fb.fSwapStatus[eid%SWEET_FB_SWAP_HISTORY].state==AppleCLCD::SwapConsumed);
+  assert(fb.swapWait(eid,0,0)==kIOReturnSuccess && fb.fWaitEarly>=1 && fb.swapWait(eid,0x80000001u,0)==kIOReturnBusy);
+  pollMode=1;fb.vsyncFired(&fb,&timer);assert(!fb.fGpuPending && fb.fEarlyRetires==1);fb.fEarlyRetire=false;}
  gpuMode=0;offer(fb,rec);fb.vsyncFired(&fb,&timer);assert(fb.fDiffStored==432 && fb.fShadowValid);
  // Blanking invalidates the shadow; swaps while off remain pending without waking a cleared black screen.
  fb.fPowerOff=true;fb.fFadeStep=0;fb.fDirty=true;
@@ -909,13 +926,21 @@ def main():
                             '-I', str(SRC), str(path), '-o', str(exe)], check=True)
             subprocess.run([str(exe)], check=True)
         display = (SRC / 'SweetFramebuffer.cpp').read_text()
+        refresh = tmp / 'refresh.c'
+        refresh.write_text('#include <assert.h>\n#include <stdbool.h>\n#include <stdint.h>\n#include <stdio.h>\n' +
+            function(display, 'sweet_fb_refresh_interval') + function(display, 'sweet_fb_refresh_wanted') + REFRESH_TEST)
+        subprocess.run(['clang', '-std=gnu11', '-Wall', '-Wextra', '-Werror', str(refresh), '-o', str(tmp / 'refresh')], check=True)
+        subprocess.run([str(tmp / 'refresh')], check=True)
+        assert re.search(r'setObject\("displayMinRefreshInterval", interval\)', display) and \
+            display.index('sweet_fb_refresh_publish(this);') < display.index('\tregisterService();\n\tIOLog("SWEET FB: AppleCLCD')
+        assert 'displayRefreshStepMachTime' not in display.replace('deliberately not published', '').split('sweet_fb_refresh_publish(AppleCLCD')[1]
         declaration = display[display.index('class AppleCLCD :'):display.index('OSDefineMetaClassAndStructors(AppleCLCD')]
         declaration = declaration.replace(': public IOMobileFramebuffer', '').replace(
             'OSDeclareDefaultStructors(AppleCLCD);', 'public:')
         methods = ''.join(function(display, name) for name in (
             'sweet_fb_te_configure', 'AppleCLCD::teVsyncTick', 'AppleCLCD::teVsyncLog',
             'AppleCLCD::presentWantedLocked', 'AppleCLCD::wakePresentLocked', 'sweet_fb_rearm',
-            'AppleCLCD::vsyncFired', 'AppleCLCD::scanoutLog', 'get32', 'AppleCLCD::observeRecord', 'AppleCLCD::recordDone', 'AppleCLCD::consumeRecord', 'AppleCLCD::releaseRecord',
+            'AppleCLCD::vsyncFired', 'AppleCLCD::scanoutLog', 'get32', 'AppleCLCD::observeRecord', 'AppleCLCD::recordDone', 'AppleCLCD::consumeRecord', 'AppleCLCD::retireEarly', 'AppleCLCD::releaseRecord',
             'AppleCLCD::swapWait', 'AppleCLCD::stopRecords',
             'AppleCLCD::writerRetired', 'AppleCLCD::writerWake', 'AppleCLCD::writerWakeAction',
             'AppleCLCD::presentStep', 'AppleCLCD::stageStats', 'AppleCLCD::completePresent', 'AppleCLCD::presentStats', 'AppleCLCD::presentNext', 'AppleCLCD::swap', 'AppleCLCD::present'))
