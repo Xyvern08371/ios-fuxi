@@ -226,5 +226,23 @@ with tempfile.TemporaryDirectory() as root:
     m.reduce_transparency(root, False, owner)
     assert plistlib.load(open(ax, 'rb')) == {'Other': 1}             # other keys kept
 
+with tempfile.TemporaryDirectory() as root:
+    assert m.mg_cache_extra(root, [m.MG_DEEP_COLOR + '=false']) is False      # absent: not created
+    path = os.path.join(root, m.MG_CACHE)
+    assert not os.path.exists(path)
+    os.makedirs(os.path.dirname(path))
+    plistlib.dump({'CacheVersion': '20H392', 'CacheData': b'x', 'CacheExtra': {'other': 1}}, open(path, 'wb'), fmt=plistlib.FMT_BINARY)
+    os.chmod(path, 0o644)
+    assert m.mg_cache_extra(root, [m.MG_DEEP_COLOR + '=false'])
+    d = plistlib.load(open(path, 'rb'))
+    assert d == {'CacheVersion': '20H392', 'CacheData': b'x', 'CacheExtra': {'other': 1, m.MG_DEEP_COLOR: False}}
+    assert os.stat(path).st_mode & 0o777 == 0o644
+    for bad in ['x', 'k=1', '=true']:
+        try:
+            m.mg_cache_extra(root, [bad])
+            raise AssertionError('bad spec accepted: %r' % bad)
+        except SystemExit:
+            pass
+
 print('PASS: cpbitmap trailer/length/pixels, legibility style, PNG decode, wallpaper files, colour wallpaper prefs, '
-      'staged apps install/undo, LaunchServices reset, oslog jobs, job env, reduce transparency')
+      'staged apps install/undo, LaunchServices reset, oslog jobs, job env, reduce transparency, MobileGestalt CacheExtra')

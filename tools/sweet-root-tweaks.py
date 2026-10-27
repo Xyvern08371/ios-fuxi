@@ -134,6 +134,37 @@ def reduce_transparency(root, enable, owner=(MOBILE, MOBILE)):
     print('pref', AX_PREF, 'reduce transparency', 'on' if enable else 'off')
 
 
+MG_CACHE = 'private/var/containers/Shared/SystemGroup/systemgroup.com.apple.mobilegestaltcache/Library/Caches/com.apple.MobileGestalt.plist'
+# Aixt/MEN2O2B7f+8m4TxUA is the deep colour answer MaterialKit, QuartzCore and
+# UIKit read (MTSupportsDeepColor). True makes MaterialKit snapshot idle materials
+# (App Library, Today view) into two-plane 10-bit 'b3a8' surfaces that the Fuxi GPU
+# path cannot render, so they stay black; the panel scans out 8-bit BGRA anyway.
+MG_DEEP_COLOR = 'Aixt/MEN2O2B7f+8m4TxUA'
+
+
+def mg_cache_extra(root, specs):
+    """Override MobileGestalt answers in the cache's CacheExtra (KEY=true|false).
+    The cache is written by MobileGestalt itself; an absent cache is left absent."""
+    values = {}
+    for spec in specs:
+        key, sep, value = spec.partition('=')
+        if not key or not sep or value not in ('true', 'false'):
+            sys.exit('bad --mg-cache-extra %r (KEY=true|false)' % spec)
+        values[key] = value == 'true'
+    path = os.path.join(root, MG_CACHE)
+    if not os.path.exists(path):
+        print('mobilegestalt cache: absent, nothing changed')
+        return False
+    st = os.stat(path)
+    data = load(path)
+    extra = data.setdefault('CacheExtra', {})
+    for key, value in sorted(values.items()):
+        print('mobilegestalt cache:', key, extra.get(key, '<unset>'), '->', value)
+        extra[key] = value
+    save(path, data, st.st_uid, st.st_gid, st.st_mode & 0o7777)
+    return True
+
+
 def launchd(root):
     path = os.path.join(root, 'System/Library/xpc/launchd.plist')
     st = os.stat(path)
@@ -675,6 +706,7 @@ def main():
     ap.add_argument('--oslog', metavar='LABEL[,LABEL...]')
     ap.add_argument('--job-env', action='append', metavar='LABEL:KEY=VALUE')
     ap.add_argument('--rebuild-launchservices', action='store_true')
+    ap.add_argument('--mg-cache-extra', action='append', metavar='KEY=true|false')
     staged = ap.add_mutually_exclusive_group()
     staged.add_argument('--install-staged-apps', action='store_true')
     staged.add_argument('--no-install-staged-apps', action='store_true')
@@ -692,6 +724,8 @@ def main():
         oslog_jobs(root, [label for label in args.oslog.split(',') if label])
     if args.job_env:
         job_env(root, args.job_env)
+    if args.mg_cache_extra:
+        mg_cache_extra(root, args.mg_cache_extra)
     if args.install_staged_apps:
         install_staged_apps(root)
     if args.no_install_staged_apps:
