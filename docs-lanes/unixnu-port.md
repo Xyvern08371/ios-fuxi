@@ -498,3 +498,26 @@ The cmdline additions cost 18, 13 and 15 bytes respectively including one
 separator (`fuxigpuncimport=1`, `fuxifbprio=1`, `fuxiuniondir=1`); they need not be
 enabled together. No early-retirement/refresh switch is added without a matching
 ABI consumer.
+
+## AdrenoMetal / UniXNU Turnip and runtime tuning port
+
+Offline review, nothing built or run on a device; every effect below is **not yet
+observed**. Sources (read only): [AdrenoMetal](https://github.com/UniXNU/AdrenoMetal)
+`ce5e19e33e05e1873d38d818e23cabfe0ac708c3`, MIT, and the UniXNU `turnip-darwin-kmd.patch`
+newer than our pinned `fb6aad6`, BSD-2-Clause-Patent. Checked against metal2vulkan `720ef1ce`
+(downloaded for a dry apply only): AdrenoMetal 0001-0016 apply in order with zero fuzz, and
+0009-0015 also apply on the unpatched pin. The NativeMetal pin `a96fece` ships only 0001-0007
+(0003, device entry-point priming, is therefore already in the native stack).
+
+| Item | Result |
+| --- | --- |
+| Let Turnip choose tile or system memory per pass | Already available: `fuxigpugmem=1` gives `TU_DEBUG=nocb` (autotune). Default stays `sysmem,nocb`: the earlier GMEM trial changed nothing (gpu-translation.md) and A740 GMEM hangs are on record. AdrenoMetal pairs it with patch 0016 (tile stores kept in a texture's rows), which only matters under its `AliasWrites` policy; nothing here selects that policy, so 0008/0016 are not carried. |
+| System memory in every Metal process | Already done: `setupMetalClient` sets `TU_DEBUG` for every admitted process (not only backboardd), preserving an explicit value. |
+| No concurrent binning in every process | Already done: `nocb` is in both defaults. |
+| Cache device answers that take an argument | Not applicable: `FuxiMTLDevice` answers from constants and one backend field, it does not query a runtime per call. AdrenoMetal's cache lives in NativeMetal's own frontend, which the native helper does not use. |
+| metal2vulkan 0009-0015 | Ported as `tools/patches/metal2vulkan-adrenometal-*.patch` (MIT header and source revision kept), applied after NativeMetal's 0001-0007 by `build-fuxi-nativemetal.py`; `FUXI_NATIVE_M2V_DRAW=0` omits them. Only the `fuximetal=native` helper gains them: the default FuxiMetal bridge uses the runtime for binding plans only and its translator checkout stays unpatched (0013 touches `bind/`). Expected effect: fewer allocations and rebuilds per draw on the native path; none on the default path. |
+| 0003 device entry-point priming | Already in the native stack (NativeMetal pin). Default path does not use runtime startup priming. |
+| Fence wait up to 100 ms a call | Ported as `tools/patches/mesa-fuxi-fence-wait-100ms.patch` (after `mesa-fuxi-smoke.patch`, verified with zero fuzz against the reconstructed file). The kernel `WaitFence` polls to the fence or the slice (clamped to 1 s), so fewer IOKit round trips per frame wait, same latency. |
+| OS-image shader priming, linked visible functions, zeroed constants | Not ported. It needs compute pipelines, function constants, linked functions and libraries over 4 MiB, which `Frontend.mm` refuses by design; it also spends CPU on all 166 OS libraries while frames run. `fuxigpucache=1` already persists the artifacts and Vulkan pipeline cache of pipelines actually used. A future seeding pass should replay recorded pipeline descriptors instead. |
+
+Test: `tools/test-fuxi-patch-stack.py`.

@@ -76,7 +76,7 @@ jobs:
         with:
           path: |
             ~/.cargo/registry
-          key: fuxi-cargo-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('tools/ci/pins.env', 'tools/fuxi-metal2vulkan-bridge.rs', 'tools/build-fuxi-metal-translator.sh', 'tools/build-fuxi-nativemetal.py', 'tools/patches/nativemetal-fuxi-*.patch') }}
+          key: fuxi-cargo-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('tools/ci/pins.env', 'tools/fuxi-metal2vulkan-bridge.rs', 'tools/build-fuxi-metal-translator.sh', 'tools/build-fuxi-nativemetal.py', 'tools/patches/nativemetal-fuxi-*.patch', 'tools/patches/metal2vulkan-adrenometal-*.patch') }}
       - name: Build selected target (no boot-image packing)
         run: bash tools/ci/build.sh "$TARGET"
       - name: Upload target outputs and logs
