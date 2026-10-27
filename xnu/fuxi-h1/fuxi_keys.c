@@ -522,6 +522,18 @@ fk_tour(void *arg, wait_result_t wr)
 	fk_tour_shot(&shot, "lock");
 	fk_tour_home();
 	fk_tour_shot(&shot, "home");
+	/* App Library is past the last home page; extra swipes there are ignored. */
+	for (unsigned i = 0; i < 4; ++i) {
+		fk_swipe(900, 1300, 180, 1300, 250);
+		fk_script_sleep(1200);
+	}
+	fk_tour_shot(&shot, "app-library");
+	fk_script_sleep(8000);
+	fk_tour_shot(&shot, "app-library-idle");
+	fk_script_sleep(20000);
+	fk_tour_shot(&shot, "app-library-idle-30s");
+	fk_tour_home();
+	fk_tour_home();
 	fk_swipe(60, 1300, 1020, 1300, 450);    /* Today view */
 	fk_script_sleep(2000);
 	fk_tour_shot(&shot, "today");
