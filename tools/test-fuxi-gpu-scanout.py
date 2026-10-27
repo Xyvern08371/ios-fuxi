@@ -172,8 +172,8 @@ static uint64_t phE,phSkew;static unsigned phC,phHold;
 static void phase_script(void) {
  uint64_t t=ticks;unsigned c=phC+(t>=phE)+(t>=phE+8333);
  intf[0x298/4]=(c<<16)|7;ctl[0x1c/4]=0;intf[0x2b0/4]=(t>=phE && (phHold || t<phE+8000))?300:2400;}
-static void phase_run(uint64_t e,unsigned c,unsigned hold) {
- phE=e+phSkew;phC=c;phHold=hold;ticks=e+fg_scanout_ph_done_us-400;fg_scanout_ph_e=e;fg_scanout_spin_sync=0;fg_scanout_spin_serial=fg_scanout_starts;
+static void phase_run(uint64_t e,unsigned c,unsigned hold,unsigned wakeOff) {
+ phE=e+phSkew;phC=c;phHold=hold;ticks=e+wakeOff;fg_scanout_ph_e=e;fg_scanout_spin_sync=0;fg_scanout_spin_serial=fg_scanout_starts;
  fg_scanout_spin_c0=c;fg_scanout_ph_wake=ticks;fg_scanout_spin_busy=1;probeScript=phase_script;phase_script();
  fg_scanout_spin_run(0,0);probeScript=0;}
 static void panel120_tests(uint8_t *panel) {
@@ -439,49 +439,65 @@ static void triple_tests(uint8_t *panel) {
   fg_scanout_spin_err_n=fg_scanout_spin_late_n=0;
   // No model yet: one sync wake now, from the START's count.
   uint64_t T=ticks+100;ticks=T;fg_scanout_last_start=T;fg_scanout_last_count=5;
-  fg_scanout_spin_kick();
+  fg_scanout_spin_kick(1);
   assert(spinKicks==1 && fg_scanout_spin_busy && fg_scanout_spin_sync && spinDeadline==T && fg_scanout_ph_p==8333 && fg_scanout_ph_done_us==7950);
-  fg_scanout_spin_kick();assert(spinKicks==1); // one pending call
+  fg_scanout_spin_kick(1);assert(spinKicks==1); // one pending call
   phE=T+1000;phC=5;phHold=0;probeScript=phase_script;phase_script();
   fg_scanout_spin_run(0,0);probeScript=0;
   assert(st[FG_SPIN_SYNCS]==1 && fg_scanout_ph_ok && fg_scanout_ph_c==6 && fg_scanout_ph_t>=T+1000 && fg_scanout_ph_t<=T+1004);
-  assert(spinKicks==2 && fg_scanout_spin_busy && !fg_scanout_spin_sync && fg_scanout_ph_e==fg_scanout_ph_t && spinDeadline==fg_scanout_ph_t+7550);
+  assert(spinKicks==2 && fg_scanout_spin_busy && !fg_scanout_spin_sync && fg_scanout_ph_e==fg_scanout_ph_t && spinDeadline==fg_scanout_ph_t+fg_scanout_ph_done_us-fg_scanout_spin_lead_us());
   // A waiting back buffer is STARTed at the first idle sample after the edge and the active line; the next edge resyncs the model and the chain re-arms.
   assert(fuxi_gpu_scanout_acquire()==1);ctl[0x1c/4]=1;intf[0x2b0/4]=100;assert(fuxi_gpu_scanout_publish()==2 && fg_scanout_back_ready);
   uint64_t E=fg_scanout_ph_t+8333;unsigned s0=starts;
-  spinKicks=0;phase_run(E,6,0);
+  spinKicks=0;phase_run(E,6,0,7550);
   assert(starts==s0+1 && !fg_scanout_back_ready && fg_scanout_async_published && st[FG_SPIN_PUBLISHED]==1 && st[FG_SPIN_HIT]==1 && !st[FG_SPIN_LATE]);
   assert(fg_scanout_spin_err_n==1 && fg_scanout_spin_err_max<=6 && fg_scanout_ph_c==8 && fg_scanout_ph_t>=E+8333 && fg_scanout_ph_t<=E+8339);
   assert(fg_scanout_ph_done_us>=7955 && fg_scanout_ph_done_us<=7975 && fg_scanout_ph_p>=8300 && fg_scanout_ph_p<=8340);
-  assert(spinKicks==1 && !fg_scanout_spin_sync && fg_scanout_ph_e==fg_scanout_ph_t && spinDeadline==fg_scanout_ph_t+fg_scanout_ph_done_us-400);
+  assert(spinKicks==0 && st[FG_SPIN_SKIPPED]==1 && !fg_scanout_spin_busy); // no frame queued: nothing armed
   assert(fuxi_gpu_scanout_retry()==1 && !fg_scanout_async_published && fuxi_gpu_scanout_retry()==0);
   // No back buffer at done: nothing is published, the edge still resyncs, and nothing is armed (the display path's next START re-arms).
   fg_scanout_spin_busy=0;spinKicks=0;E=fg_scanout_ph_t+8333;s0=starts;
-  phase_run(E,8,0);
+  phase_run(E,8,0,7550);
   assert(starts==s0 && st[FG_SPIN_NO_BACK]==1 && st[FG_SPIN_PUBLISHED]==1 && fg_scanout_ph_c==10 && !spinKicks && !fg_scanout_spin_busy);
+  // The wake came after transfer-done (W176: thread call ~0.5 ms late): the line is never seen active, but an edge, idle and the minimum transfer time suffice.
+  assert(fuxi_gpu_scanout_acquire()==1);ctl[0x1c/4]=1;intf[0x2b0/4]=100;assert(fuxi_gpu_scanout_publish()==2 && fg_scanout_back_ready);
+  fg_scanout_spin_busy=0;spinKicks=0;E=fg_scanout_ph_t+8333;s0=starts;unsigned done0=fg_scanout_ph_done_us;
+  phase_run(E,10,0,8100);
+  assert(starts==s0+1 && st[FG_SPIN_PUBLISHED]==2 && st[FG_SPIN_HIT]==2 && fg_scanout_ph_done_us==done0 && !st[FG_SPIN_NO_ACTIVE]);
+  assert(fuxi_gpu_scanout_retry()==1);
+
   // Another START intervened (display path won the race): publish nothing, arm the newer START.
   assert(fuxi_gpu_scanout_acquire()==1);ctl[0x1c/4]=1;intf[0x2b0/4]=100;assert(fuxi_gpu_scanout_publish()==2);
   E=fg_scanout_ph_t+8333;s0=starts;spinKicks=0;
   fg_scanout_spin_busy=0;fg_scanout_spin_serial=fg_scanout_starts;
-  phE=E;phC=10;phHold=0;ticks=E+7550;fg_scanout_ph_e=E;fg_scanout_spin_sync=0;fg_scanout_spin_c0=10;fg_scanout_ph_wake=ticks;fg_scanout_spin_busy=1;
+  fg_scanout_last_start=E-2000;phE=E;phC=10;phHold=0;ticks=E+7550;fg_scanout_ph_e=E;fg_scanout_spin_sync=0;fg_scanout_spin_c0=10;fg_scanout_ph_wake=ticks;fg_scanout_spin_busy=1;
   fg_scanout_starts++;s0=starts;probeScript=phase_script;phase_script();fg_scanout_spin_run(0,0);probeScript=0;
   assert(starts==s0 && fg_scanout_back_ready && st[FG_SPIN_RACED]==1 && spinKicks==1);
   // The START latch was missed (the transfer starts a period later): the line is never active before the window closes.
   fg_scanout_spin_busy=0;spinKicks=0;E=fg_scanout_ph_t+8333;s0=starts;
-  phSkew=9000;phase_run(E,10,0);phSkew=0;
+  phSkew=9000;phase_run(E,10,0,7550);phSkew=0;
   assert(starts==s0 && st[FG_SPIN_NO_ACTIVE]==1 && fg_scanout_back_ready);
   // The transfer never ends: give up shortly after the next TE.
-  fg_scanout_spin_busy=0;E=fg_scanout_ph_t+8333;phase_run(E,10,1);
+  fg_scanout_spin_busy=0;E=fg_scanout_ph_t+8333;phase_run(E,10,1,7550);
   assert(starts==s0 && st[FG_SPIN_EXPIRED]==1 && ticks<=E+8333+8333*6/100+20 && !fg_scanout_spin_busy);
+  // Arrival arming: a good model arms only when a frame is waiting; a START too close to the edge is not trusted; a finished transfer is not armed.
+  fg_scanout_spin_busy=0;spinKicks=0;st[FG_SPIN_SKIPPED]=st[FG_SPIN_ARRIVAL]=st[FG_SPIN_NEAR_EDGE]=0;
+  fg_scanout_ph_ok=1;fg_scanout_ph_p=8333;fg_scanout_ph_t=ticks-1000;fg_scanout_last_start=ticks-500;fg_scanout_back_ready=0;
+  fg_scanout_spin_kick(1);assert(st[FG_SPIN_SKIPPED]==1 && !spinKicks);
+  fg_scanout_spin_kick(0);assert(st[FG_SPIN_SKIPPED]==1 && !spinKicks);
+  fg_scanout_back_ready=1;fg_scanout_spin_kick(0);
+  assert(spinKicks==1 && st[FG_SPIN_ARRIVAL]==1 && fg_scanout_spin_busy && !fg_scanout_spin_sync && fg_scanout_ph_e==fg_scanout_ph_t+8333 && fg_scanout_spin_serial==fg_scanout_starts);
+  fg_scanout_spin_busy=0;spinKicks=0;fg_scanout_last_start=fg_scanout_ph_t+8333-30;fg_scanout_spin_kick(1);assert(st[FG_SPIN_NEAR_EDGE]==1 && !spinKicks);
+  fg_scanout_ph_t=ticks-20000;fg_scanout_last_start=ticks-30000;fg_scanout_spin_kick(0);assert(!spinKicks);
   // Stale model: sync again. A sync that sees no edge fails and arms nothing.
   fg_scanout_ph_t=ticks-64*8333-1;fg_scanout_spin_busy=0;spinKicks=0;fg_scanout_last_start=ticks;fg_scanout_last_count=intf[0x298/4]>>16;
-  fg_scanout_spin_kick();assert(spinKicks==1 && fg_scanout_spin_sync);
+  fg_scanout_spin_kick(1);assert(spinKicks==1 && fg_scanout_spin_sync);
   phE=ticks+100000;phC=intf[0x298/4]>>16;phHold=0;probeScript=phase_script;uint64_t t0_=ticks;fg_scanout_spin_c0=phC;fg_scanout_spin_serial=fg_scanout_starts;
   fg_scanout_spin_run(0,0);probeScript=0;
   assert(st[FG_SPIN_SYNC_FAIL]==1 && spinKicks==1 && ticks-t0_>=8333 && ticks-t0_<=8333*5/4+10 && !fg_scanout_spin_busy);
   // Off by default and outside panel120.
-  fg_abi_spin=0;spinKicks=0;fg_scanout_spin_kick();assert(!spinKicks);
-  fg_abi_spin=1;fg_scanout_panel120_active=0;fg_scanout_spin_kick();assert(!spinKicks);
+  fg_abi_spin=0;spinKicks=0;fg_scanout_spin_kick(1);assert(!spinKicks);
+  fg_abi_spin=1;fg_scanout_panel120_active=0;fg_scanout_spin_kick(1);assert(!spinKicks);
   fg_abi_spin=0;fg_scanout_ph_ok=0;fg_scanout_ph_p=0;fg_scanout_ph_done_us=0;ctl[0x1c/4]=1;intf[0x2b0/4]=2400;intf[0x298/4]=keepCount;
   fg_scanout_back_ready=0;fg_scanout_starts=keepStarts;fg_scanout_current_match=keepMatch;fg_scanout_current_mismatch=keepMismatch;fg_scanout_te_frames=keepTe;fg_scanout_period_us=16667;
  }
