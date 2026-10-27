@@ -80,7 +80,7 @@ inline void importCheck(VkResult r,int line=__builtin_LINE()) {
  X(CreatePipelineLayout) X(DestroyPipelineLayout) X(CreateGraphicsPipelines) X(DestroyPipeline) \
  X(CreatePipelineCache) X(DestroyPipelineCache) X(GetPipelineCacheData) \
  X(CmdBindVertexBuffers) X(CmdBindIndexBuffer) X(CmdDrawIndexed) X(CmdSetViewport) X(CmdSetScissor) X(CmdPushConstants) X(CmdBeginRenderPass) X(CmdEndRenderPass) X(CmdBindPipeline) X(CmdDraw) X(CmdCopyImageToBuffer) X(CmdPipelineBarrier) X(CreateFence) X(DestroyFence) X(QueueSubmit) X(WaitForFences)
-struct Buffer { VkBuffer buffer{}; VkDeviceMemory memory{}; void *contents{}; size_t length{}, allocated{},charged{},memoryBytes{},memoryOffset{},references=1;uint32_t memoryType{};bool imported=false,upload=false; };
+struct Buffer { VkBuffer buffer{}; VkDeviceMemory memory{}; void *contents{};void *key{};Buffer *spare{};void *shadowKey() const{return key?key:contents;}bool shadowBacking=false,directUse=false,spareFailed=false; size_t length{}, allocated{},charged{},memoryBytes{},memoryOffset{},references=1;uint32_t memoryType{};bool imported=false,upload=false; };
 // Host ranges a submit's prepare callback will write; absent means unknown (full drain).
 struct PrepareWrite {Buffer *buffer;uint64_t offset,bytes;};
 struct Texture : TextureLevels {VkImage image{};VkDeviceMemory memory{};VkImageView view{};size_t allocated{},charged{},memoryBytes{},references=1;
@@ -192,7 +192,8 @@ private:
   limits.reserve(bytes);
  }
  // Two independently resettable lanes. A busy lane belongs to its retirement.
- struct HostUse {VkDeviceMemory memory;const void *address;size_t bytes;};
+ // kind bits name the resource for conflict diagnostics: 1 buffer, 2 shadow backing, 4 texture, 8 surface, 16 index.
+ struct HostUse {VkDeviceMemory memory;const void *address;size_t bytes;uint8_t kind=1;Buffer *buffer=nullptr;};
  struct SubmitSlot {
   VkCommandPool commandPool{};VkCommandBuffer command{};VkFence submitFence{};VkQueryPool queryPool{};
   Buffer *aliasScratch=nullptr;VkDescriptorPool descriptorPool{};uint32_t descriptorSets{};
@@ -418,7 +419,7 @@ public:
    VkMemoryAllocateInfo ai{};ai.sType=VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;ai.allocationSize=req.size;ai.memoryTypeIndex=type;b->memoryType=type;
    reserveMemoryUnlocked(ai.allocationSize);b->charged=ai.allocationSize;
    check(frameKernelCall([&]{return AllocateMemory(device,&ai,nullptr,&b->memory);}));if(systemTranslationPolicy().frameTrace)++frameCounts.allocations;++liveMemoryObjects;liveMemoryBytes+=ai.allocationSize;b->memoryBytes=ai.allocationSize;check(frameKernelCall([&]{return BindBufferMemory(device,b->buffer,b->memory,0);}));
-   check(frameKernelCall([&]{return MapMemory(device,b->memory,0,VK_WHOLE_SIZE,0,&b->contents);}));memset(b->contents,0,(length+15)&~size_t(15));return b;
+   check(frameKernelCall([&]{return MapMemory(device,b->memory,0,VK_WHOLE_SIZE,0,&b->contents);}));b->key=b->contents;memset(b->contents,0,(length+15)&~size_t(15));return b;
   } catch(...) {destroyUnlocked(b);throw;}
  }
  // NativeMetal's no-copy buffer/linear-image design, using Fuxi HostImport's
@@ -479,7 +480,7 @@ public:
     if(usage!=1)throw std::runtime_error(reason);
     if(t->image)DestroyImage(device,t->image,nullptr);delete t;t=nullptr;
     auto *shadow=allocateTextureUnlocked(format,1,width,height);
-    shadow->shadow=true;shadow->backingBuffer=b;++b->references;shadow->backingOffset=offset;shadow->backingRow=row;
+    shadow->shadow=true;b->shadowBacking=true;shadow->backingBuffer=b;++b->references;shadow->backingOffset=offset;shadow->backingRow=row;
     fprintf(stderr,"FUXI MTL: linear texture shadow format=%u %ux%u offset=%zu row=%zu reason=%s\n",format,width,height,offset,row,reason.c_str());return shadow;
    };
    if((formatProperties.linearTilingFeatures&required)!=(uint32_t)required)return fallback("linear texture format features unavailable");
@@ -504,6 +505,7 @@ public:
  }
  void destroyUnlocked(Buffer *b) {
   if(!b || --b->references) return;
+  if(b->spare){auto *s=b->spare;b->spare=nullptr;destroyUnlocked(s);}
   if(!poisoned) {
    if(b->contents) frameKernelCall([&]{return UnmapMemory(device,b->memory);});
    if(b->buffer) DestroyBuffer(device,b->buffer,nullptr);
@@ -956,35 +958,56 @@ public:
   std::unique_lock<std::mutex> guard(mutex);
   if(currentFrame)currentFrame->backendLock+=since(submitStart);
   requireLive();std::vector<HostUse> hostUses,writes,uses;
-  auto addUse=[](std::vector<HostUse> &list,VkDeviceMemory memory,const void *address,size_t bytes){if(std::none_of(list.begin(),list.end(),[&](auto old){return old.memory==memory && old.address==address && old.bytes==bytes;}))list.push_back({memory,address,bytes});};
-  auto bufferUse=[&](std::vector<HostUse> &list,Buffer *b){if(b)addUse(list,b->memory,b->contents,b->length);};
+  auto addUse=[](std::vector<HostUse> &list,VkDeviceMemory memory,const void *address,size_t bytes,uint8_t kind=1,Buffer *buffer=nullptr){for(auto &old:list)if(old.memory==memory && old.address==address && old.bytes==bytes){old.kind|=kind;return;}list.push_back({memory,address,bytes,kind,buffer});};
+  auto bufferUse=[&](std::vector<HostUse> &list,Buffer *b,uint8_t kind=1){if(b)addUse(list,b->memory,b->contents,b->length,kind,b);};
   auto textureUse=[&](std::vector<HostUse> &list,Texture *t){if(t){addUse(list,t->memory,t->mapped,t->allocated);bufferUse(list,t->backingBuffer);}};
-  if(retirement || prepare || systemTranslationPolicy().overlap){ // uses: every host-mapped allocation, coherent too, for prepare conflicts
-   auto buffer=[&](Buffer *b){if(b){bufferUse(uses,b);if(!coherent(b->memoryType))bufferUse(hostUses,b);}};
-   auto texture=[&](Texture *t){if(t){if(t->mapped){addUse(uses,t->memory,t->mapped,t->allocated);if(!coherent(t->memoryType))addUse(hostUses,t->memory,t->mapped,t->allocated);}buffer(t->backingBuffer);}};
-   for(const auto &op:ops){buffer(op.src);buffer(op.dst);buffer(op.indices);texture(op.texture);texture(op.sourceTexture);for(auto *t:op.samples)texture(t);for(unsigned i=0;i<std::min(op.colorCount,8u);++i)texture(op.color(i).texture);for(auto &stage:op.buffers)for(auto binding:stage)buffer(binding.buffer);if(op.pipeline)for(auto *blob:op.pipeline->constantBlobs)buffer(blob);}
-  }
+  const bool renaming=systemTranslationPolicy().shadowRename;
+  auto collectUses=[&]{ // uses: every host-mapped allocation, coherent too, for prepare conflicts
+   uses.clear();hostUses.clear();
+   auto buffer=[&](Buffer *b,uint8_t kind=1){if(b){bufferUse(uses,b,kind);if(!coherent(b->memoryType))bufferUse(hostUses,b,kind);}};
+   auto direct=[&](Buffer *b,uint8_t kind=1){if(b)b->directUse=true;buffer(b,kind);};
+   auto texture=[&](Texture *t){if(t){if(t->mapped){uint8_t kind=t->imported?8:4;addUse(uses,t->memory,t->mapped,t->allocated,kind);if(!coherent(t->memoryType))addUse(hostUses,t->memory,t->mapped,t->allocated,kind);}buffer(t->backingBuffer,2);}};
+   for(const auto &op:ops){direct(op.src);direct(op.dst);direct(op.indices,16);texture(op.texture);texture(op.sourceTexture);for(auto *t:op.samples)texture(t);for(unsigned i=0;i<std::min(op.colorCount,8u);++i)texture(op.color(i).texture);for(auto &stage:op.buffers)for(auto binding:stage)direct(binding.buffer);if(op.pipeline)for(auto *blob:op.pipeline->constantBlobs)direct(blob);}
+  };
+  if(retirement || prepare || systemTranslationPolicy().overlap)collectUses();
   auto aliases=[](HostUse a,HostUse b){return (a.memory && a.memory==b.memory) || hostRangesOverlap(a.address,a.bytes,b.address,b.bytes);};
   auto conflicts=[&]{for(auto &pending:slots)if(pending.busy)for(auto old:pending.hostUses)for(auto use:hostUses)if(aliases(old,use))return true;return false;};
   // A declared prepare waits only for flights using the memory it writes; undeclared drains.
   std::vector<HostUse> prepared;const bool declared=prepare && prepareWrites;
-  if(declared)for(auto w:*prepareWrites)if(w.buffer && w.bytes)prepared.push_back({w.buffer->memory,(const uint8_t *)w.buffer->contents+w.offset,w.bytes});
-  auto prepareConflicts=[&]{for(auto &pending:slots)if(pending.busy)for(auto old:pending.uses)for(auto write:prepared)if(aliases(old,write))return true;return false;};
+  auto collectPrepared=[&]{prepared.clear();if(declared)for(auto w:*prepareWrites)if(w.buffer && w.bytes)prepared.push_back({w.buffer->memory,(const uint8_t *)w.buffer->contents+w.offset,w.bytes,1,w.buffer});};
+  collectPrepared();
+  // A shadow backing buffer only the GPU reads (never bound directly) can be renamed to a spare storage instead of waiting for the flights reading it.
+  auto renameable=[&](Buffer *b){return renaming && b && b->shadowBacking && !b->directUse && !b->imported && !b->upload && !b->spareFailed && b->contents;};
+  auto busyUse=[&](HostUse use){for(auto &pending:slots)if(pending.busy)for(auto old:pending.uses)if(aliases(old,use))return true;return false;};
+  auto spareBusy=[&](Buffer *b){return b->spare && busyUse({b->spare->memory,b->spare->contents,b->spare->length});};
+  auto prepareConflicts=[&]{for(auto &pending:slots)if(pending.busy)for(auto old:pending.uses)for(auto write:prepared)if(aliases(old,write)){if(renameable(write.buffer) && write.buffer->spare && !spareBusy(write.buffer))continue;return true;}return false;};
+  auto conflictKinds=[&]{unsigned m=0;for(auto &pending:slots)if(pending.busy){for(auto old:pending.uses)for(auto write:prepared)if(aliases(old,write))m|=old.kind;for(auto old:pending.hostUses)for(auto use:hostUses)if(aliases(old,use))m|=old.kind;}return m;};
+  if(renaming)for(auto &w:prepared)if(renameable(w.buffer) && !w.buffer->spare && busyUse(w)){ // first conflict: create the spare storage
+   try{w.buffer->spare=allocateUnlocked(w.buffer->length);}catch(const std::exception &){w.buffer->spareFailed=true;}}
   auto indexHazard=[&](bool uploadOnly=false){for(auto &op:ops)if(op.indices && (!uploadOnly || op.indices->upload))for(auto &pending:slots)if(pending.busy)for(auto old:pending.writes)if(aliases(old,{op.indices->memory,op.indices->contents,op.indices->length}))return true;return false;};
   // Coherent index reads need only exclude real GPU writers. Noncoherent cache
   // maintenance still excludes every shared allocation; undeclared prepare drains.
-  bool sawDrain=false,sawIndex=false,sawUpload=false,sawPrepare=false,sawUnknown=false,sawPrepConflict=false,sawDrainWait=false,sawConflict=false,sawSlots=false,otherIndices=false;
+  unsigned kindSeen=0;bool sawDrain=false,sawIndex=false,sawUpload=false,sawPrepare=false,sawUnknown=false,sawPrepConflict=false,sawDrainWait=false,sawConflict=false,sawSlots=false,otherIndices=false;
   if(currentFrame){bool upload=false;for(auto &op:ops)if(op.indices)(op.indices->upload?upload:otherIndices)=true;currentFrame->indexUploadSubmits+=upload;}
   auto slotStart=FrameClock::now();
   submitWake.wait(guard,[&]{if(poisoned)return true;bool index=indexHazard(),unknown=prepare && !declared,prepConflict=declared && prepareConflicts(),drain=unknown || index,busy=slots[0].busy || slots[1].busy,conflict=conflicts() || prepConflict,full=slots[0].busy && (!retirement || slots[1].busy);
    if(currentFrame){auto once=[](bool value,bool &seen,uint64_t &count){if(value && !seen){++count;seen=true;}};
     once(drain,sawDrain,currentFrame->drainSubmits);once(index,sawIndex,currentFrame->indexGPUWritableDrains);once(indexHazard(true),sawUpload,currentFrame->indexUploadDrains);once(bool(prepare),sawPrepare,currentFrame->prepareDrains);once(unknown,sawUnknown,currentFrame->prepareUnknownDrains);once(prepConflict,sawPrepConflict,currentFrame->prepareConflictWaits);
-    once(drain && busy,sawDrainWait,currentFrame->drainWaits);once(conflict,sawConflict,currentFrame->conflictWaits);once(full,sawSlots,currentFrame->slotWaits);}
+    once(drain && busy,sawDrainWait,currentFrame->drainWaits);once(conflict,sawConflict,currentFrame->conflictWaits);once(full,sawSlots,currentFrame->slotWaits);
+    if(conflict || index){unsigned m=conflictKinds()|(index?16u:0u);for(unsigned k=0;k<5;++k)if((m>>k&1) && !(kindSeen>>k&1)){kindSeen|=1u<<k;++currentFrame->conflictKinds[k];}}}
    return !full && (!drain || !busy) && !conflict;
   });
   if(currentFrame){currentFrame->indexGPUWritableSubmits+=sawIndex;currentFrame->indexReadOnlySubmits+=otherIndices && !sawIndex;}
   if(currentFrame)currentFrame->slotWait+=since(slotStart);
-  requireLive();auto &slot=slots[slots[0].busy?1:0];
+  requireLive();
+  if(renaming && declared){std::vector<Buffer *> renamed;
+   for(auto &w:prepared)if(renameable(w.buffer) && w.buffer->spare && busyUse(w) && std::find(renamed.begin(),renamed.end(),w.buffer)==renamed.end()){
+    auto *b=w.buffer,*sp=b->spare;if(spareBusy(b))continue;
+    memcpy(sp->contents,b->contents,b->length);
+    std::swap(b->buffer,sp->buffer);std::swap(b->memory,sp->memory);std::swap(b->contents,sp->contents);std::swap(b->allocated,sp->allocated);std::swap(b->charged,sp->charged);std::swap(b->memoryBytes,sp->memoryBytes);std::swap(b->memoryType,sp->memoryType);
+    renamed.push_back(b);if(currentFrame){++currentFrame->shadowRenames;currentFrame->shadowRenameBytes+=b->length;}}
+   if(!renamed.empty()){collectUses();collectPrepared();}}
+  auto &slot=slots[slots[0].busy?1:0];
   auto &commandPool=slot.commandPool;auto &command=slot.command;auto &submitFence=slot.submitFence;auto &queryPool=slot.queryPool;
   auto &descriptorPool=slot.descriptorPool;auto &descriptorSets=slot.descriptorSets;auto &descriptorCapacity=slot.descriptorCapacity;auto &aliasScratch=slot.aliasScratch;
 #ifdef FUXI_MTL_HOST_TEST

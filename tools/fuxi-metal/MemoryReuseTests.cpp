@@ -2,6 +2,7 @@
 #include "Backend.hpp"
 #include <cassert>
 #include <cstdio>
+#include <future>
 int main(int argc,char **){
  using namespace fuxi;Backend backend;backend.slabsEnabled=false;auto objects=liveMemoryObjects.load();
  if(argc>1){
@@ -75,6 +76,27 @@ int main(int argc,char **){
   sb.trimMemoryForTest(0);assert(sb.resourceBytes()>=SlabMemory<VkDeviceMemory>::slabSize); // idle trim keeps the newest slab warm
   sb.destroy(up1);sb.destroy(up2);sb.destroy(o1);sb.destroy(o2);sb.trimMemory();assert(!sb.resourceBytes() && liveMemoryObjects==live0);sb.close();
   puts("PASS: slab sub-allocation (shared allocation, aligned disjoint offsets, pixels, fence-gated reuse, steady state, budget)");
+ }
+
+ // Shadow-storage rename: a prepare write that conflicts with a flight reading the shadow's backing buffer gets fresh storage instead of waiting.
+ {
+  Backend rb;auto *buf=rb.allocate(1024);memset(buf->contents,0x11,1024);auto *shadow=rb.allocateTexture(80,1,16,16);shadow->shadow=true;buf->shadowBacking=true;shadow->backingBuffer=buf;++buf->references;shadow->backingRow=64;
+  auto *dst=rb.allocateTexture(80,5,16,16);Operation copy{};copy.texture=dst;copy.sourceTexture=shadow;copy.width=16;copy.height=16;
+  auto *oldContents=(uint8_t *)buf->contents;std::vector<PrepareWrite> writes{{buf,0,64}};
+  auto flight=[&](bool expectWait,FrameSample &trace){
+   std::function<void()> a,b;rb.submit({copy},{},&a);bool prepared=false;std::promise<void> started;
+   auto f=std::async(std::launch::async,[&]{FrameTraceScope scope(&trace);started.set_value();rb.submit({copy},{},&b,[&]{prepared=true;memset(buf->contents,0x22,64);},&writes);});
+   started.get_future().wait();assert(f.wait_for(std::chrono::milliseconds(expectWait?100:5000))==(expectWait?std::future_status::timeout:std::future_status::ready));
+   a();f.get();b();assert(prepared);
+  };
+  FrameSample renamed;flight(false,renamed);
+  assert(renamed.shadowRenames==1 && renamed.shadowRenameBytes==1024 && !renamed.conflictWaits && buf->contents!=oldContents && buf->spare && buf->spare->contents==oldContents);
+  assert(((uint8_t *)buf->contents)[0]==0x22 && ((uint8_t *)buf->contents)[64]==0x11 && oldContents[0]==0x11); // new storage carries the old bytes plus the write; the old one is untouched
+  assert(buf->shadowKey()==oldContents);
+  // Bound directly (possible GPU writes): never renamed, the prepare waits and the conflicting kind is reported.
+  buf->directUse=true;FrameSample waited;flight(true,waited);assert(!waited.shadowRenames && waited.conflictWaits==1 && waited.conflictKinds[1]==1 && !waited.conflictKinds[0]);
+  rb.destroy(copy.sourceTexture);rb.destroy(dst);rb.destroy(buf);rb.close();
+  puts("PASS: shadow storage rename (no wait, bytes preserved, old storage untouched, direct use refused, conflict kind reported)");
  }
  assert(frameCounts.allocations>before);
  printf("PASS: image memory reuse after fence only, new-image layout/defined state, pixels, cap/idle/pressure/charge/close; Operation=%zu BufferBind=%zu bindings=%zu\n",sizeof(Operation),sizeof(BufferBind),sizeof(Operation::buffers));

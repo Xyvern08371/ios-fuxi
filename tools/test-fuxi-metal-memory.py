@@ -26,7 +26,7 @@ def main():
             '-ldl','-pthread','-o',str(d/'test')],check=True)
         for extra in ({},{'LOST':'1'},{'TIMEOUT':'1'}):
             env=dict(os.environ,ASAN_OPTIONS='detect_leaks=0',LP_NUM_THREADS='2',
-                     FUXI_MTL_TEST_BOOTARGS='fuxigpuframetrace=1',SOFTWARE_ICD=str(args.icd),**extra)
+                     FUXI_MTL_TEST_BOOTARGS='fuxigpuframetrace=1 fuxigpurename=1',SOFTWARE_ICD=str(args.icd),**extra)
             p=subprocess.run([str(d/'test')]+(['fault'] if extra else []),env=env,text=True,capture_output=True,timeout=60)
             assert p.returncode==0,p.stderr
             assert 'AddressSanitizer' not in p.stderr and 'runtime error:' not in p.stderr,p.stderr

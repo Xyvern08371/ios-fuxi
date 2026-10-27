@@ -1414,7 +1414,7 @@ static NSString *renderPassText(MTLRenderPassDescriptor *d){
    _pendingLease=std::make_shared<fuxi::SurfaceLease>(true,lockScanoutPendingSurface,unlockScanoutSurface,&backend->poisoned);
    for(auto &entry:commandSurfaces(self))if(entry.second)_pendingLease->add(entry.first); // Sampled-only surfaces need no producer reservation.
   }
-  prepareCommandShadows(self,_frameTrace?&_flightTrace:nullptr);for(auto &entry:_shadowUses){auto &use=entry.second;_shadows.add(use.buffer->_buffer->contents,use.buffer->_wrapped,use.ranges);}
+  prepareCommandShadows(self,_frameTrace?&_flightTrace:nullptr);for(auto &entry:_shadowUses){auto &use=entry.second;_shadows.add(use.buffer->_buffer->shadowKey(),use.buffer->_wrapped,use.ranges);}
   _shadows.capture(_queue->_shadowPool);if(_frameTrace)_flightTrace.snapshotBytes+=_shadows.bytes();
  }catch(const std::exception &e){[self submissionError:e.what()];}
  _commitReturn=fuxi::FrameClock::now();
@@ -1446,12 +1446,12 @@ static NSString *renderPassText(MTLRenderPassDescriptor *d){
   if(gpuScanout)for(auto &entry:commandSurfaces(self))_lease->add(entry.first,entry.second);
   if(_frameTrace)fuxi::addLeaseTrace(_flightTrace,*_lease,fuxi::frameNanos(leaseStart));
   auto refresh=[&]{auto start=fuxi::FrameClock::now();
-   uint64_t bytes=_overlap?_shadows.apply(_queue->_shadowPool):refreshCommandShadows(self);if(_frameTrace)_flightTrace.shadowCopyBytes+=bytes;
+   uint64_t bytes=_overlap?_shadows.apply(_queue->_shadowPool,[&](void *key)->void *{for(auto &entry:_shadowUses)if(entry.first->shadowKey()==key)return entry.first->contents;return key;}):refreshCommandShadows(self);if(_frameTrace)_flightTrace.shadowCopyBytes+=bytes;
    auto ns=fuxi::frameNanos(start);fuxi::Backend::shadowCopyNanos+=ns;if(_frameTrace)_flightTrace.shadowCopy+=ns;
   };
   std::function<void()> prepare;std::vector<fuxi::PrepareWrite> prepareWrites;const std::vector<fuxi::PrepareWrite> *declared=nullptr;
   if(_overlap){if(_shadows.bytes()){prepare=refresh;bool known=true; // the apply() destinations, resolved to backend buffers; unresolved means undeclared (full drain)
-   _shadows.eachWrite([&](void *destination,uint64_t offset,uint64_t bytes){fuxi::Buffer *target=nullptr;for(auto &entry:_shadowUses)if(entry.first->contents==destination){target=entry.first;break;}if(target)prepareWrites.push_back({target,offset,bytes});else known=false;});
+   _shadows.eachWrite([&](void *destination,uint64_t offset,uint64_t bytes){fuxi::Buffer *target=nullptr;for(auto &entry:_shadowUses)if(entry.first->shadowKey()==destination){target=entry.first;break;}if(target)prepareWrites.push_back({target,offset,bytes});else known=false;});
    if(known)declared=&prepareWrites;}}else refresh();
   size_t begin=0;
   auto scheduled=[&]{@synchronized(self){_scheduled=YES;if(_status<MTLCommandBufferStatusScheduled)_status=MTLCommandBufferStatusScheduled;}};

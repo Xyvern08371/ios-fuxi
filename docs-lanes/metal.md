@@ -2820,3 +2820,19 @@ no per-range alias classes, so the port is the same idea in our shape:
   fault/busy/occupied, bitmask parse), `tools/test-fuxi-hostimport.py` (segment lookups, per-page predicate in a long run).
 - New log field: the self-test line above. Owned BO maps still need one pmap lookup per 16K page (scattered BOs); a contiguous
   BO could skip it but the backend does not know contiguity, not changed.
+
+**Submit waits and shadow rename (O168 analysis; device effect not yet observed).**
+`lease_back` in the frame trace is `Backend::submit` entry to slot acquisition (backend
+mutex plus the slot/conflict wait), not a display or IOSurface lease; `lease_lock` is
+`lease_front` (the IOSurface locks, about 0.03 ms) plus `lease_back`, which is why it
+equals `slot_wait`. `wait_reasons conflict` and `drain_reasons prepare-conflict` mean a
+declared shadow prepare (`ShadowSnapshot::apply`, which memcpys changed ranges into a
+backend buffer) overlaps memory used by an in-flight slot, so the submit waits for that
+flight's fence (GPU retirement). `conflict_kinds=buffer,shadow,texture,surface,index`
+counts submits that waited per resource kind; `display_lease_wait_ms/frame` is the only
+display-side wait. `fuxigpurename=1` (opt-in; requires overlap) renames the backing
+buffer of a read-only shadow texture (never bound directly, tracked by
+`Buffer::directUse`) to a spare storage of equal size: the current bytes are copied
+there, the write goes to the new storage, and the flight keeps reading the old one. The
+snapshot key is `Buffer::shadowKey()` so queued snapshots follow the swap. New fields:
+`shadow_renames/frame`, `shadow_rename_bytes/frame`.
