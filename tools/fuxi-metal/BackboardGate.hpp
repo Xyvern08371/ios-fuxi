@@ -4,6 +4,8 @@
 #include "ClientStorage.hpp"
 #include "FrameTrace.hpp"
 #include "SamplingPolicy.hpp"
+#include <array>
+#include <string>
 #include <chrono>
 #include <atomic>
 #include <mutex>
@@ -99,6 +101,8 @@ public:
    else {failed=true;strikes=strikeLimit;bool saved=persistDenied();fprintf(stderr,"FUXI MTL: backboardd gate deny reason=good-write next-respawn=CPU persisted=%u\n",unsigned(saved));}
   }
  }
+ // log2 bucket:count pairs for non-zero buckets, or "-".
+ static std::string classCounts(const std::array<std::atomic<uint64_t>,40> &a){std::string r;char b[40];for(size_t i=0;i<a.size();++i)if(auto v=a[i].load()){snprintf(b,sizeof b,"%s%zu:%llu",r.empty()?"":",",i,(unsigned long long)v);r+=b;}return r.empty()?"-":r;}
  void report() {
   if(!active.load())return;
   std::lock_guard<std::mutex> guard(mutex);double t=now();if(!active || t-lastReport<5)return;
@@ -108,9 +112,9 @@ public:
   // This is compositor timestamp occupancy, not a whole-engine busy counter.
   double busy=100.0*double(gpu-lastGPU)/1e9/(t-lastReport);if(busy>100.0)busy=100.0;
   if(count && gpu==lastGPU)busy=-1.0; // completed frames without timestamp data
-  fprintf(stderr,"FUXI MTL: backboardd frames=%llu gpu_ms=%.3f late=%llu failures=%llu sampling_skipped=%llu hz=%.2f window_frames=%llu gpu_busy_est_pct=%.1f tex_pool_hits=%llu tex_pool_misses=%llu tex_pool_trims=%llu tex_pool_bytes=%llu\n",
+  fprintf(stderr,"FUXI MTL: backboardd frames=%llu gpu_ms=%.3f late=%llu failures=%llu sampling_skipped=%llu hz=%.2f window_frames=%llu gpu_busy_est_pct=%.1f tex_pool_hits=%llu tex_pool_misses=%llu tex_pool_trims=%llu tex_pool_bytes=%llu tex_pool_wasted=%llu tex_pool_idle_trims=%llu tex_pool_pressure_trims=%llu tex_pool_reject_full=%llu tex_pool_reject_budget=%llu tex_pool_class_hits=%s tex_pool_class_misses=%s\n",
    (unsigned long long)frames,count?(gpu-lastGPU)/1e6/double(count):0.0,(unsigned long long)late,
-   (unsigned long long)failures,(unsigned long long)skippedSamplingDraws.load(),double(count)/(t-lastReport),(unsigned long long)count,busy,(unsigned long long)texturePoolHits.load(),(unsigned long long)texturePoolMisses.load(),(unsigned long long)texturePoolTrims.load(),(unsigned long long)texturePoolBytes.load());
+   (unsigned long long)failures,(unsigned long long)skippedSamplingDraws.load(),double(count)/(t-lastReport),(unsigned long long)count,busy,(unsigned long long)texturePoolHits.load(),(unsigned long long)texturePoolMisses.load(),(unsigned long long)texturePoolTrims.load(),(unsigned long long)texturePoolBytes.load(),(unsigned long long)texturePoolWasted.load(),(unsigned long long)texturePoolIdleTrims.load(),(unsigned long long)texturePoolPressureTrims.load(),(unsigned long long)texturePoolRejectFull.load(),(unsigned long long)texturePoolRejectBudget.load(),classCounts(texturePoolClassHits).c_str(),classCounts(texturePoolClassMisses).c_str());
   if(systemTranslationPolicy().frameTrace)frameTrace.report();
   lastReport=t;lastFrames=frames;lastGPU=gpu;
  }

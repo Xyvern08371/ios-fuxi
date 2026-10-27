@@ -5,16 +5,29 @@
 #include <memory>
 #include <thread>
 int main(){
- using namespace fuxi;TransientMemory<unsigned> pool;MemoryKey key{4096,256,80,5,1};
- assert(!pool.take(key));assert(pool.put(key,1,0));auto different=key;
- for(unsigned field=0;field<5;++field){different=key;if(field==0)++different.bytes;if(field==1)++different.alignment;if(field==2)++different.format;if(field==3)++different.usage;if(field==4)++different.type;assert(!pool.take(different));}
- assert(pool.take(key)==1 && !pool.bytes());
+ using namespace fuxi;TransientMemory<unsigned> pool;
+ // Size classes: 1/8 steps, monotone, never smaller than the request, bounded waste.
+ assert(memorySizeClass(1)==4096 && memorySizeClass(4096)==4096 && memorySizeClass(4097)==8192 && memorySizeClass(0)==0);
+ for(uint64_t n=1;n<(1ull<<28);n=n*9/8+7){auto c=memorySizeClass(n);assert(c>=n && c-n<=(n>>3)+4096 && memorySizeClass(c)==c);}
+ assert(memorySizeClass(11059200)==11534336 && memorySizeClass(11500000)==11534336);
+ unsigned h=0;MemoryKey got{};MemoryKey key{memorySizeClass(100000),1};
+ assert(!pool.take(100000,~0u,h,got));assert(pool.put(key,1,0));
+ assert(!pool.take(key.bytes+1,~0u,h,got));            // too small
+ assert(!pool.take(100000,~2u,h,got));                  // memory type 1 not permitted
+ assert(!pool.take(key.bytes/2,~0u,h,got));             // too much slack
+ auto wasted=texturePoolWasted.load();assert(pool.take(99000,1u<<1,h,got) && h==1 && got==key && !pool.bytes() && texturePoolWasted==wasted+key.bytes-99000);
+ // Smallest sufficient block wins; the larger stays pooled.
+ MemoryKey big{key.bytes+8192,1};assert(pool.put(big,2,0) && pool.put(key,3,0));assert(pool.take(100000,2,h,got) && h==3 && pool.bytes()==big.bytes);
+ assert(pool.take(100000,2,h,got) && h==2 && !pool.bytes());
  unsigned freed=0;auto free=[&](unsigned,size_t){++freed;};
- for(unsigned i=1;i<=32;++i)assert(pool.put(key,i,0));assert(!pool.put(key,33,0));
- pool.trim(pool.idleNanos-1,false,free);assert(!freed);pool.trim(pool.idleNanos,false,free);assert(freed==32 && !pool.bytes());
- auto large=key;large.bytes=pool.budget;assert(pool.put(large,40,100));assert(!pool.put(key,41,100));
- pool.trim(99,false,free);assert(pool.bytes()==pool.budget);pool.trim(100,true,free);assert(!pool.bytes() && freed==33);
- assert(texturePoolHits==1 && texturePoolMisses==6 && texturePoolTrims==33 && !texturePoolBytes);
+ for(unsigned i=1;i<=64;++i)assert(pool.put(key,i,0));assert(!pool.put(key,65,0) && texturePoolRejectFull==1);
+ pool.trim(pool.idleNanos-1,false,free);assert(!freed);pool.trim(pool.idleNanos,false,free);assert(freed==64 && !pool.bytes() && texturePoolIdleTrims==64);
+ auto large=key;large.bytes=pool.budget;assert(pool.put(large,40,100));assert(!pool.put(key,41,100) && texturePoolRejectBudget==1);
+ pool.trim(99,false,free);assert(pool.bytes()==pool.budget);pool.trim(100,true,free);assert(!pool.bytes() && freed==65);
+ // Pressure reclaims only as much as needed, longest-idle first.
+ MemoryKey m{1<<20,0};for(unsigned i=0;i<4;++i)assert(pool.put(m,10+i,10-i));freed=0;unsigned last=0;auto track=[&](unsigned v,size_t){++freed;last=v;};
+ pool.reclaim(m.bytes+1,track);assert(freed==2 && last==12 && pool.bytes()==2*m.bytes);pool.reclaim(0,track);assert(freed==2);pool.reclaim(UINT64_MAX,track);assert(freed==4 && !pool.bytes());
+ assert(texturePoolHits==3 && texturePoolMisses==4 && !texturePoolBytes && texturePoolClassHits[memoryClassBucket(key.bytes)]==3 && texturePoolPressureTrims==5);
  CommandStorage<std::shared_ptr<int>> storage;auto a=storage.acquire();auto *identity=a.data();auto owned=std::make_shared<int>(12);a.push_back(owned);
  auto b=storage.acquire();assert(b.data()!=identity);storage.release(a);assert(owned.use_count()==1);
  auto c=storage.acquire();assert(c.empty() && c.data()==identity && c.capacity()>=256);
@@ -33,5 +46,5 @@ int main(){
  bool refused=false;try{ring.copy(bytes,4097,uploads,allocate,contents);}catch(const std::runtime_error&){refused=true;}assert(refused);
  // Overflow storage is discarded rather than retained by the bounded cache.
  CommandStorage<uint8_t> bounded;auto huge=bounded.acquire();huge.reserve(bounded.budget+1);auto *largeIdentity=huge.data();bounded.release(huge);auto small=bounded.acquire();assert(small.data()!=largeIdentity);
- puts("PASS: exact memory key, entry/byte bounds, idle/pressure trim, disjoint storage reuse, inline slices/copy/padding, flight isolation and poison discard");
+ puts("PASS: size-class memory reuse (type/slack/best fit), entry/byte bounds, idle trim, incremental pressure reclaim, entry/byte bounds, idle/pressure trim, disjoint storage reuse, inline slices/copy/padding, flight isolation and poison discard");
 }

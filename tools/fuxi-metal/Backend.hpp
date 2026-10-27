@@ -172,10 +172,11 @@ class Backend {
  static uint64_t memoryNow(){return std::chrono::duration_cast<std::chrono::nanoseconds>(CacheClock::now().time_since_epoch()).count();}
  void trimMemoryUnlocked(bool all=false,uint64_t now=memoryNow()){
   if(poisoned)return;
-  textureMemory.trim(now,all,[&](VkDeviceMemory h,size_t bytes){frameKernelCall([&]{FreeMemory(device,h,nullptr);});--liveMemoryObjects;liveMemoryBytes-=bytes;limits.release(bytes);});
+  textureMemory.trim(now,all,[&](VkDeviceMemory h,size_t bytes){freePooledUnlocked(h,bytes);});
  }
+ void freePooledUnlocked(VkDeviceMemory h,size_t bytes){frameKernelCall([&]{FreeMemory(device,h,nullptr);});--liveMemoryObjects;liveMemoryBytes-=bytes;limits.release(bytes);}
  void reserveMemoryUnlocked(size_t bytes){
-  if(bytes>ResourceLimits::budget-limits.used)trimMemoryUnlocked(true);
+  if(bytes>ResourceLimits::budget-limits.used && !poisoned)textureMemory.reclaim(bytes-(ResourceLimits::budget-limits.used),[&](VkDeviceMemory h,size_t n){freePooledUnlocked(h,n);});
   limits.reserve(bytes);
  }
  // Two independently resettable lanes. A busy lane belongs to its retirement.
@@ -608,11 +609,12 @@ public:
    t->usage=ii.usage;check(CreateImage(device,&ii,nullptr,&t->image));VkMemoryRequirements req{};GetImageMemoryRequirements(device,t->image,&req);t->allocated=req.size;
    uint32_t memoryType=0;while(memoryType<memory.memoryTypeCount && (!(req.memoryTypeBits&(1u<<memoryType)) || !(memory.memoryTypes[memoryType].propertyFlags&VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)))++memoryType;
    if(memoryType==memory.memoryTypeCount)throw std::runtime_error("no device-local texture memory");
-   VkMemoryAllocateInfo ai{};ai.sType=VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;ai.allocationSize=req.size;ai.memoryTypeIndex=memoryType;t->memoryType=memoryType;
-   trimMemoryUnlocked();t->recycleKey={req.size,req.alignment,uint32_t(ii.format),uint32_t(ii.usage),memoryType};
-   t->memory=textureMemory.take(t->recycleKey);
-   if(t->memory)t->charged=ai.allocationSize;
+   VkMemoryAllocateInfo ai{};ai.sType=VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;ai.allocationSize=memorySizeClass(req.size);if(ai.allocationSize>ResourceLimits::single)ai.allocationSize=req.size;ai.memoryTypeIndex=memoryType;t->memoryType=memoryType;
+   trimMemoryUnlocked();MemoryKey got{};
+   // Pooled blocks are plain device-local allocations (no dedicated/imported); offset 0 satisfies any alignment.
+   if(textureMemory.take(req.size,req.memoryTypeBits,t->memory,got)){t->recycleKey=got;t->memoryType=got.type;ai.allocationSize=got.bytes;t->charged=got.bytes;}
    else {
+    t->recycleKey={ai.allocationSize,memoryType};texturePoolWasted+=ai.allocationSize-req.size;
     reserveMemoryUnlocked(ai.allocationSize);t->charged=ai.allocationSize;
     auto result=frameKernelCall([&]{return AllocateMemory(device,&ai,nullptr,&t->memory);});
     if(result==VK_ERROR_OUT_OF_DEVICE_MEMORY || result==VK_ERROR_OUT_OF_HOST_MEMORY){trimMemoryUnlocked(true);result=frameKernelCall([&]{return AllocateMemory(device,&ai,nullptr,&t->memory);});}

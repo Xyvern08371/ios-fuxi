@@ -6,7 +6,7 @@ int main(int argc,char **){
  using namespace fuxi;Backend backend;auto objects=liveMemoryObjects.load();
  if(argc>1){
   auto *idle=backend.allocateTexture(80,5,16,16);backend.destroy(idle);auto cached=texturePoolBytes.load();assert(cached);
-  auto *t=backend.allocateTexture(80,5,32,32);auto *buffer=backend.allocate(4096);
+  auto *t=backend.allocateTexture(80,5,64,64);auto *buffer=backend.allocate(16384);
   Operation upload{};upload.texture=t;upload.src=buffer;upload.upload=true;std::function<void()> retire;backend.submit({upload},{},&retire);
   bool failed=false;try{retire();}catch(const std::runtime_error&){failed=true;}assert(failed && backend.poisoned);
   auto held=liveMemoryObjects.load();backend.trimMemory();assert(texturePoolBytes==cached);
@@ -24,8 +24,11 @@ int main(int argc,char **){
  upload.texture=c;Operation read{};read.texture=c;read.dst=out;backend.submit({upload,read});assert(!memcmp(up->contents,out->contents,1024));
  backend.destroy(b);backend.destroy(c);backend.destroy(stillLive);assert(backend.resourceBytes()==bytes*3+up->charged+out->charged);
  backend.trimMemoryForTest(UINT64_MAX);assert(backend.resourceBytes()==up->charged+out->charged);
- std::vector<Texture *> textures;for(unsigned i=0;i<34;++i)textures.push_back(backend.allocateTexture(80,5,16,16));for(auto *t:textures)backend.destroy(t);
- assert(texturePoolBytes==bytes*32);backend.trimMemory();assert(!texturePoolBytes);
+ std::vector<Texture *> textures;for(unsigned i=0;i<66;++i)textures.push_back(backend.allocateTexture(80,5,16,16));for(auto *t:textures)backend.destroy(t);
+ assert(texturePoolBytes==bytes*64);backend.trimMemory();assert(!texturePoolBytes);
+ // Nearby sizes share a class: a 17x16 texture reuses the pooled block without a new allocation.
+ {auto *p=backend.allocateTexture(80,5,16,16);auto *q=backend.allocateTexture(80,5,17,16);auto m=p->memory;auto classBytes=p->charged;backend.destroy(p);auto allocs=frameCounts.allocations,h2=texturePoolHits.load();auto *r=backend.allocateTexture(80,5,17,16);
+  assert(r->memory==m && texturePoolHits==h2+1 && frameCounts.allocations==allocs && r->charged==classBytes && classBytes>=r->allocated);backend.destroy(q);backend.destroy(r);backend.trimMemory();}
  // Idle storage still counts toward the device budget; imports must never donate memory.
  auto *cached=backend.allocateTexture(80,5,16,16);backend.destroy(cached);assert(texturePoolBytes==bytes);
  backend.trimMemory();backend.destroy(up);backend.destroy(out);assert(!backend.resourceBytes());backend.close();assert(liveMemoryObjects==objects);
