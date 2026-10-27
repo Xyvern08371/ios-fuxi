@@ -2745,3 +2745,25 @@ Change (host-tested on lavapipe, device effect not yet observed):
   `BlitFrontendTests.mm` (compiles only on macOS; checked by inspection).
 - New log fields: none. Expected device evidence: no `texture reject
   textureType 7` line and no `gate runtime-failure`; not yet observed.
+
+## AdrenoMetal port review (surface import reuse, refusing render encoder)
+
+Source: AdrenoMetal (MIT), `NativeBridgeMetalFrontend.mm` (`surfaceBuffer`, `encoder:handle:what:`) and
+`bridge/patches/0008..0016`. The source's git history was not readable from this lane; the current tree was compared.
+
+- Present import reuse (ported in spirit, device effect not yet observed): `Backend::importTexture` takes the IOSurface ID
+  as `identity`; a live import with the same (id, base, bytes, row, offset, w, h) is shared by reference count instead of a new
+  `vkAllocateMemory` + `vkMapMemory` + image/view per CA wrap. The cache holds no reference, so an entry dies with its last wrapper
+  or pending command; a new mapping, size or layout misses. New log fields on `backboardd frames=`: `surface_import_hits`,
+  `surface_import_misses`. Test: `MemoryReuseTests.cpp` (lavapipe host import).
+- Refusing render encoder (ported, device effect not yet observed): every refused `renderCommandEncoderWithDescriptor:` returns a
+  `FuxiRefusedRender` that forwards all selectors to `rejectSelector:` (command buffer stays rejected and errors on commit), instead
+  of nil. RenderBox caches encoder IMPs with `methodForSelector:`, which is NULL for nil. Census mode still returns nil.
+- Not ported, padded-row aliasing (0008) and tile-store bound (0016): they edit the metal2vulkan Rust runtime. FuxiMetal's own
+  `linearTexture` only aliases when Vulkan's linear pitch equals Metal's and otherwise falls back to a shadow copy (J163 shows A8
+  masks at row 256/512/768 against Turnip 64-byte pitches). A wider image over the padded row would need the sampled coordinates
+  scaled by width/pitch in the translated shader, which this lane cannot do; written-texture aliasing is not reachable (the fallback
+  only exists for sampled-only textures). Candidate for the translator/build-patch lane.
+- Not ported, 0009..0015: all metal2vulkan runtime/bind/canon changes with no FuxiMetal equivalent.
+- Not ported, frame/wait trace: FrameTrace already records `waitUntilCompleted`/`waitUntilScheduled` durations per frame; their
+  addition is the caller return address, judged too little to add.

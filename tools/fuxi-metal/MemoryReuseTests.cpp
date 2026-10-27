@@ -32,6 +32,18 @@ int main(int argc,char **){
  // Idle storage still counts toward the device budget; imports must never donate memory.
  auto *cached=backend.allocateTexture(80,5,16,16);backend.destroy(cached);assert(texturePoolBytes==bytes);
  backend.trimMemory();backend.destroy(up);backend.destroy(out);assert(!backend.resourceBytes());backend.close();assert(liveMemoryObjects==objects);
+ // Identity-keyed surface imports share one live texture per mapping/size/layout and die with their last holder.
+ if(Backend backend2;backend2.supportsHostImport()){
+  constexpr size_t row=4352,w=1080,h=64;size_t allocation=(row*h+65535)&~size_t(65535);void *host=nullptr;assert(!posix_memalign(&host,65536,allocation));memset(host,0,allocation);
+  auto hits=surfaceImportHits.load(),misses=surfaceImportMisses.load();
+  auto *s1=backend2.importTexture(host,allocation,row,w,h,0,77);auto allocs=frameCounts.allocations;auto *s2=backend2.importTexture(host,allocation,row,w,h,0,77);
+  assert(s1==s2 && s1->references==2 && surfaceImportHits==hits+1 && surfaceImportMisses==misses+1 && frameCounts.allocations==allocs);
+  auto *other=backend2.importTexture(host,allocation,row,w,h,0,78);assert(other!=s1);
+  backend2.destroy(s2);assert(s1->references==1);backend2.destroy(s1);backend2.destroy(other);
+  auto *again=backend2.importTexture(host,allocation,row,w,h,0,77);assert(again->references==1 && surfaceImportMisses==misses+3);
+  auto *shrunk=backend2.importTexture(host,allocation,row,w,h-1,0,77);assert(shrunk!=again);auto *plain=backend2.importTexture(host,allocation,row,w,h);assert(plain!=again && plain->references==1);
+  backend2.destroy(again);backend2.destroy(shrunk);backend2.destroy(plain);assert(!backend2.resourceBytes());free(host);puts("PASS: surface import reuse");
+ }else puts("SKIP: surface import reuse (no host import)");
  assert(frameCounts.allocations>before);
  printf("PASS: image memory reuse after fence only, new-image layout/defined state, pixels, cap/idle/pressure/charge/close; Operation=%zu BufferBind=%zu bindings=%zu\n",sizeof(Operation),sizeof(BufferBind),sizeof(Operation::buffers));
 }

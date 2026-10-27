@@ -5,7 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 namespace fuxi {
-inline std::atomic<uint64_t> texturePoolHits{0},texturePoolMisses{0},texturePoolTrims{0},texturePoolBytes{0},texturePoolWasted{0},texturePoolIdleTrims{0},texturePoolPressureTrims{0},texturePoolRejectFull{0},texturePoolRejectBudget{0};
+inline std::atomic<uint64_t> surfaceImportHits{0},surfaceImportMisses{0},texturePoolHits{0},texturePoolMisses{0},texturePoolTrims{0},texturePoolBytes{0},texturePoolWasted{0},texturePoolIdleTrims{0},texturePoolPressureTrims{0},texturePoolRejectFull{0},texturePoolRejectBudget{0};
 inline std::array<std::atomic<uint64_t>,40> texturePoolClassHits{},texturePoolClassMisses{};
 // Memory is allocated at a size class (1/8 steps above 32 KiB, 4 KiB below) and bound at offset 0 to any image whose requirement fits.
 inline uint64_t memorySizeClass(uint64_t n){

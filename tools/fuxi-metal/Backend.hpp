@@ -6,6 +6,7 @@
 #include <dlfcn.h>
 #include <algorithm>
 #include <array>
+#include <map>
 #include <cstdlib>
 #include <cfloat>
 #include <cmath>
@@ -85,7 +86,7 @@ struct Texture : TextureLevels {VkImage image{};VkDeviceMemory memory{};VkImageV
  uint32_t memoryType{};VkImageUsageFlags usage{};uint32_t format=80;VkFormat vkFormat=VK_FORMAT_B8G8R8A8_UNORM;
  // layout is level zero; levelLayouts[1..levels) track the remaining mips.
  VkImageTiling tiling=VK_IMAGE_TILING_OPTIMAL;VkImageLayout layout=VK_IMAGE_LAYOUT_UNDEFINED;std::array<VkImageLayout,32> levelLayouts{};void *mapped{};bool imported=false,borrowedMemory=false;
- MemoryKey recycleKey{};bool recyclable=false;
+ MemoryKey recycleKey{};bool recyclable=false;std::array<uint64_t,7> importKey{};bool importCached=false;
  Buffer *backingBuffer{};size_t backingOffset{},backingRow{};bool shadow=false;
  std::vector<VkImageView> attachmentViews;bool canGenerate=false,filterable=true,blendable=false;};
 struct Sampler {size_t references=1;VkSampler sampler{};uint32_t filters=1;float lodMin=0,lodMax=0;};
@@ -238,6 +239,7 @@ public:
  static inline std::atomic<uint64_t> submits{0},submitPrepareNanos{0},submitWaitNanos{0},submitRetireNanos{0};
  static inline std::atomic<uint64_t> submitObjectsNanos{0},submitDescriptorsNanos{0},submitRecordNanos{0},shadowCopyNanos{0},submitFlushNanos{0},submitInvalidateNanos{0};
  static inline std::atomic<uint64_t> flushCalls{0},invalidateCalls{0},emptySubmits{0},submitObjectCreates{0},submitPoolCreates{0},submitFrameCreates{0},submitViewCreates{0};
+ std::map<std::array<uint64_t,7>,Texture *> imports;
  struct ReuseCounts {uint64_t commandPools{},commandBuffers{},fences{},queries{},descriptors{},frames{},views{};} reuseCounts;
 #ifdef FUXI_MTL_HOST_TEST
  // Test-only reference mode and deterministic recording failure; no production environment switches.
@@ -507,6 +509,7 @@ public:
  }
  bool destroyTextureUnlocked(Texture *t) {
   if(!t || --t->references)return !poisoned;
+  if(t->importCached)imports.erase(t->importKey);
   if(!poisoned) {clearFrames(t);clearViews(t);if(t->mapped && !t->borrowedMemory)frameKernelCall([&]{return UnmapMemory(device,t->memory);});for(auto v:t->attachmentViews)if(v)DestroyImageView(device,v,nullptr);if(t->view)DestroyImageView(device,t->view,nullptr);if(t->image)DestroyImage(device,t->image,nullptr);if(t->memory && !t->borrowedMemory){
    if(t->recyclable && textureMemory.put(t->recycleKey,t->memory,memoryNow()))t->charged=0;
    else {frameKernelCall([&]{return FreeMemory(device,t->memory,nullptr);});--liveMemoryObjects;liveMemoryBytes-=t->memoryBytes;}
@@ -540,8 +543,13 @@ public:
  // The caller retains/locks the IOSurface; ABI 2 pins its task pages and handles
  // non-coherent cache handoff inside kernel submit/retirement.
  // No staging copy: only an external host allocation with exactly matching linear layout.
- Texture *importTexture(void *base,size_t bytes,size_t row,uint32_t width=256,uint32_t height=256,size_t offset=0) {
+ // A nonzero identity (the IOSurface ID) shares one live import per surface mapping, size and plane layout: Core Animation re-wraps the
+ // same surfaces every frame, and each wrap otherwise allocates and maps a fresh host-pointer memory object. The cache holds no reference;
+ // an entry lives exactly as long as some wrapper or pending command holds the texture.
+ Texture *importTexture(void *base,size_t bytes,size_t row,uint32_t width=256,uint32_t height=256,size_t offset=0,uint64_t identity=0) {
   std::unique_lock<std::mutex> guard(mutex);requireLive();
+  std::array<uint64_t,7> key{identity,uint64_t(uintptr_t(base)),bytes,row,offset,width,height};
+  if(identity){auto hit=imports.find(key);if(hit!=imports.end()){++hit->second->references;++surfaceImportHits;return hit->second;}++surfaceImportMisses;}
   if(!supportsHostImport())throw std::runtime_error("IOSurface same-memory import requires VK_EXT_external_memory_host / NativeAdreno HostImport");
   constexpr VkFormatFeatureFlags required=VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT|VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT|
    VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT|VK_FORMAT_FEATURE_TRANSFER_SRC_BIT|VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
@@ -579,7 +587,7 @@ public:
    check(frameKernelCall([&]{return AllocateMemory(device,&ai,nullptr,&t->memory);}));if(systemTranslationPolicy().frameTrace)++frameCounts.allocations;++liveMemoryObjects;liveMemoryBytes+=ai.allocationSize;t->memoryBytes=ai.allocationSize;t->allocated=bytes;check(frameKernelCall([&]{return BindImageMemory(device,t->image,t->memory,offset);}));
    check(frameKernelCall([&]{return MapMemory(device,t->memory,0,VK_WHOLE_SIZE,0,&t->mapped);}));
    VkImageViewCreateInfo vi{};vi.sType=VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;vi.image=t->image;vi.viewType=VK_IMAGE_VIEW_TYPE_2D;vi.format=info.format;
-   vi.subresourceRange={VK_IMAGE_ASPECT_COLOR_BIT,0,1,0,1};check(CreateImageView(device,&vi,nullptr,&t->view));return t;
+   vi.subresourceRange={VK_IMAGE_ASPECT_COLOR_BIT,0,1,0,1};check(CreateImageView(device,&vi,nullptr,&t->view));if(identity){t->importKey=key;t->importCached=true;imports.emplace(key,t);}return t;
   }catch(...) {guard.unlock();destroy(t);throw;}
  }
  static size_t texelBytes(uint32_t f){return metalTexelBytes(f);}

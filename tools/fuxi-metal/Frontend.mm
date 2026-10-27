@@ -932,6 +932,10 @@ static thread_local FuxiCommandBuffer *completionCommand;
  FuxiTexture *_samples[fuxi::resourceSlots];FuxiSampler *_samplers[fuxi::resourceSlots];uint32_t _load,_store;size_t _lastOp;
  fuxi::Operation _state; }
 @end
+// A refused pass still yields an object: RenderBox caches encoder IMPs with methodForSelector:, which is NULL on nil and crashes the caller.
+// Every selector forwards to rejectSelector:, so the command buffer stays rejected and commits with an error.
+@interface FuxiRefusedRender : FuxiLabeledObject { @public FuxiCommandBuffer *_command; }
+@end
 // Preserve first-use ordering and command-buffer ownership, retaining each
 // object once. Commit shadow refresh/scanout leasing then visits each once too.
 static void retainCommandResource(FuxiCommandBuffer *command,id resource,bool bounded=false,fuxi::ShadowFullReason reason=fuxi::ShadowFullReason::other,bool sampledOnly=false){
@@ -989,6 +993,11 @@ static uint64_t refreshCommandShadows(FuxiCommandBuffer *command){
 // Scope client methods, including nested convenience adapters. No clock reads
 // or atomic updates when this command buffer is not being traced.
 #define FRONTEND_TIME(command) fuxi::FrontendTimer frontendTime((command)->_frameTrace && (command)->_status==MTLCommandBufferStatusNotEnqueued?&(command)->_frontendTimes:nullptr)
+@implementation FuxiRefusedRender
+- (void)rejectSelector:(SEL)s {unsupported(self,s);[_command rejectSelector:s];}
+- (void)endEncoding {CENSUS();}
+- (void)dealloc {[_command release];[super dealloc];}
+@end
 @implementation FuxiRender
 - (void)rejectSelector:(SEL)s {FRONTEND_TIME(_command);DescriptorContext descriptor(_passText);unsupported(self,s);[_command rejectSelector:s];}
 - (void)dealloc {[_command release];[_target release];for(auto t:_targets)[t release];[_passText release];[_pipeline release];for(unsigned i=0;i<fuxi::resourceSlots;++i){[_samples[i] release];[_samplers[i] release];}[super dealloc];}
@@ -1222,11 +1231,12 @@ static NSString *renderPassText(MTLRenderPassDescriptor *d){
  if(_rejected || _status!=MTLCommandBufferStatusNotEnqueued || _encoding) {unsupported(self,_cmd);return nil;}
  FuxiBlit *e=[FuxiBlit new];e->_command=[self retain];_encoding=YES;return [e autorelease];
 }
+- (id)refusedRender {if(!_rejected)[self rejectSelector:@selector(renderCommandEncoderWithDescriptor:)];FuxiRefusedRender *e=[FuxiRefusedRender new];e->_command=[self retain];return [e autorelease];}
 - (id)renderCommandEncoderWithDescriptor:(MTLRenderPassDescriptor *)d {FRONTEND_TIME(self);@try {CENSUS();
- if(clientMode==fuxi::ClientMode::census || _rejected)return nil;
+ if(clientMode==fuxi::ClientMode::census)return nil;if(_rejected)return [self refusedRender];
  NSString *passText=renderPassText(d);DescriptorContext context(passText);
  if(!stage4Value("renderEncoder","commandStatus",_status,_status==MTLCommandBufferStatusNotEnqueued) ||
-    !stage4Value("renderEncoder","encoding",_encoding,!_encoding))return nil;
+    !stage4Value("renderEncoder","encoding",_encoding,!_encoding))return [self refusedRender];
 #define CHECK(field,value,accepted) do {__typeof__(value) actual=(value);stage4Require("renderPass",field,(uint64_t)actual,(accepted));}while(0)
  CHECK("descriptor",d,actual!=nil);
  unsigned first=8;uint32_t colorCount=1,colorMask=0;
@@ -1272,7 +1282,7 @@ static NSString *renderPassText(MTLRenderPassDescriptor *d){
  for(unsigned i=1;i<colorCount;++i){auto c=d.colorAttachments[i];auto texture=(FuxiTexture *)c.texture;if(!texture)continue;e->_targets[i-1]=[texture retain];auto clear=c.clearColor;
   e->_state.colors[i-1]={texture->_texture,texture->_baseLevel+(uint32_t)c.level,(uint32_t)c.loadAction,(uint32_t)c.storeAction,{(float)clear.red,(float)clear.green,(float)clear.blue,(float)clear.alpha}};}
  _encoding=YES;return [e autorelease];
-} @catch(NSException *e) {(void)e;[self rejectSelector:_cmd];return nil;}}
+} @catch(NSException *e) {(void)e;[self rejectSelector:_cmd];return [self refusedRender];}}
 - (void)addScheduledHandler:(MTLCommandBufferHandler)handler {FRONTEND_TIME(self);CENSUS();
  if(!handler){[self rejectSelector:_cmd];return;}
  @synchronized(self){if(!_scheduled){if(_status<MTLCommandBufferStatusCompleted){id copied=[handler copy];[_scheduledHandlers addObject:copied];[copied release];}return;}}
@@ -1900,7 +1910,7 @@ static NSString *surfaceDescriptorText(IOSurfaceRef surface,NSUInteger plane){
   void *base=IOSurfaceGetBaseAddress(surface);void *start=planes?IOSurfaceGetBaseAddressOfPlane(surface,plane):base;
   if(!base || !start || uintptr_t(start)<uintptr_t(base))throw std::runtime_error("IOSurface plane base address");
   size_t offset=uintptr_t(start)-uintptr_t(base);
-  t->_texture=owner(self)->backend->importTexture(base,IOSurfaceGetAllocSize(surface),row,(uint32_t)width,(uint32_t)height,offset);
+  t->_texture=owner(self)->backend->importTexture(base,IOSurfaceGetAllocSize(surface),row,(uint32_t)width,(uint32_t)height,offset,IOSurfaceGetID(surface));
  }catch(const std::exception &e) {failureLog("FUXI MTL: texture reject IOSurfaceImport 0 desc=%s %s reason=%s\n",textureDescriptorText(d).UTF8String,layout.UTF8String,e.what());[t release];return nil;}
  if(gpuScanout){IOSurfaceUnlock(surface,0,nullptr);t->_surfaceLockHeld=NO;}
  fprintf(stderr,"FUXI MTL: IOSurface import PASS BGRA8 %lux%lu same-memory %s\n",(unsigned long)d.width,(unsigned long)d.height,layout.UTF8String);return t;
