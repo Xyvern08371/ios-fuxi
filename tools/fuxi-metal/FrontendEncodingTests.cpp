@@ -20,5 +20,13 @@ int main(){
  auto moved=std::move(copy);assert(moved.c_str()==original && copy.empty());assert(std::string("desc=")+moved=="desc="+original);
  diagnostic.clear();assert(diagnostic.empty());diagnostic="";assert(diagnostic.empty());diagnostic=nullptr;assert(diagnostic.empty());
  OperationDiagnostic equal;equal=original.c_str();assert(equal==moved);equal="different";assert(!(equal==moved));
+ { // lazy diagnostic text: produced on first use, once, shared by copies
+  int made=0;LazyText text([&]{++made;return std::string("lazy pass text");});OperationDiagnostic lazy;lazy=text;auto copy2=lazy;
+  assert(!lazy.empty() && made==0 && LazyText().empty() && !*LazyText().c_str());
+  assert(std::string(copy2.c_str())=="lazy pass text" && std::string(lazy.c_str())=="lazy pass text" && made==1);
+  OperationDiagnostic same;same=text;assert(same==lazy && made==1);OperationDiagnostic other;other="lazy pass text";assert(other==lazy);other="x";assert(!(other==lazy));
+  lazy="plain";assert(std::string(lazy.c_str())=="plain" && std::string(copy2.c_str())=="lazy pass text");lazy.clear();assert(lazy.empty());
+  LazyText thrower([]()->std::string{throw 1;});assert(!*thrower.c_str());
+ }
  puts("PASS: resource cache collisions, bounded/full escalation and distinct reasons, command reset, immutable diagnostic copy/move/lifetime");
 }

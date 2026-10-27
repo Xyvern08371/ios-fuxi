@@ -37,6 +37,7 @@
 #include <stdexcept>
 #include <vector>
 #include <unordered_map>
+#include <unordered_set>
 #include "Translator.hpp"
 #include "DrawPlanCache.hpp"
 #include "CompileBoost.hpp"
@@ -203,8 +204,9 @@ private:
  static constexpr size_t aliasScratchLimit=1024*1024;
  struct FrameEntry {std::array<Texture *,8> textures;VkRenderPass render;std::array<uint32_t,8> levels;VkFramebuffer frame;};
  struct ViewEntry {Texture *texture;VkFormat format;std::array<uint32_t,4> components;uint32_t base,count;VkImageView view;};
- std::vector<FrameEntry> frameCache;std::vector<ViewEntry> viewCache;
- static constexpr size_t frameCacheLimit=128,viewCacheLimit=128;
+ std::vector<FrameEntry> frameCache;std::vector<ViewEntry> viewCache;std::unordered_multimap<uint64_t,size_t> viewIndex; // key: texture/format/components/range hash -> viewCache position
+ static constexpr size_t frameCacheLimit=128,viewCacheLimit=512;
+ static uint64_t viewKey(const Texture *t,VkFormat format,const std::array<uint32_t,4> &c,uint32_t base,uint32_t count){uint64_t h=0xcbf29ce484222325ull;for(uint64_t x:{uint64_t(uintptr_t(t)),uint64_t(format),uint64_t(c[0])|uint64_t(c[1])<<8|uint64_t(c[2])<<16|uint64_t(c[3])<<24,uint64_t(base)<<32|count})h=(h^x)*0x100000001b3ull;return h;}
  void clearSubmitObjects(SubmitSlot &slot) {
   auto &descriptorPool=slot.descriptorPool;auto &queryPool=slot.queryPool;auto &submitFence=slot.submitFence;auto &commandPool=slot.commandPool;auto &command=slot.command;auto &descriptorSets=slot.descriptorSets;auto &descriptorCapacity=slot.descriptorCapacity;
   if(descriptorPool)DestroyDescriptorPool(device,descriptorPool,nullptr);
@@ -222,6 +224,7 @@ private:
   for(auto i=viewCache.begin();i!=viewCache.end();) {
    if(!texture || i->texture==texture){DestroyImageView(device,i->view,nullptr);i=viewCache.erase(i);}else ++i;
   }
+  viewIndex.clear();for(size_t n=0;n<viewCache.size();++n)viewIndex.emplace(viewKey(viewCache[n].texture,viewCache[n].format,viewCache[n].components,viewCache[n].base,viewCache[n].count),n);
  }
  bool coherent(uint32_t type) const {return memory.memoryTypes[type].propertyFlags&VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;}
 
@@ -958,7 +961,7 @@ public:
   auto submitStart=std::chrono::steady_clock::now();auto submitQueued=submitStart;
   auto since=[](std::chrono::steady_clock::time_point t){return (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-t).count();};
   auto *timing=systemTranslationPolicy().frameTrace?currentFrame:nullptr;
-  std::unique_lock<std::mutex> guard(mutex);
+  std::unique_lock<std::mutex> guard(mutex,std::defer_lock);{PhaseTimer phase(SubPhase::wait);guard.lock();}
   if(currentFrame)currentFrame->backendLock+=since(submitStart);
   requireLive();std::vector<HostUse> hostUses,writes,uses;
   auto addUse=[](std::vector<HostUse> &list,VkDeviceMemory memory,const void *address,size_t bytes,uint8_t kind=1,Buffer *buffer=nullptr){for(auto &old:list)if(old.memory==memory && old.address==address && old.bytes==bytes){old.kind|=kind;return;}list.push_back({memory,address,bytes,kind,buffer});};
@@ -994,7 +997,7 @@ public:
   // maintenance still excludes every shared allocation; undeclared prepare drains.
   unsigned kindSeen=0;bool sawDrain=false,sawIndex=false,sawUpload=false,sawPrepare=false,sawUnknown=false,sawPrepConflict=false,sawDrainWait=false,sawConflict=false,sawSlots=false,otherIndices=false;
   if(currentFrame){bool upload=false;for(auto &op:ops)if(op.indices)(op.indices->upload?upload:otherIndices)=true;currentFrame->indexUploadSubmits+=upload;}
-  auto slotStart=FrameClock::now();
+  auto slotStart=FrameClock::now();auto waitPhase=std::make_unique<PhaseTimer>(SubPhase::wait);
   submitWake.wait(guard,[&]{if(poisoned)return true;bool index=indexHazard(),unknown=prepare && !declared,prepConflict=declared && prepareConflicts(),drain=unknown || index,busy=slots[0].busy || slots[1].busy,conflict=conflicts() || prepConflict,full=slots[0].busy && (!retirement || slots[1].busy);
    if(currentFrame){auto once=[](bool value,bool &seen,uint64_t &count){if(value && !seen){++count;seen=true;}};
     once(drain,sawDrain,currentFrame->drainSubmits);once(index,sawIndex,currentFrame->indexGPUWritableDrains);once(indexHazard(true),sawUpload,currentFrame->indexUploadDrains);once(bool(prepare),sawPrepare,currentFrame->prepareDrains);once(unknown,sawUnknown,currentFrame->prepareUnknownDrains);once(prepConflict,sawPrepConflict,currentFrame->prepareConflictWaits);
@@ -1002,6 +1005,7 @@ public:
     if(conflict || index){unsigned m=conflictKinds()|(index?16u:0u);for(unsigned k=0;k<5;++k)if((m>>k&1) && !(kindSeen>>k&1)){kindSeen|=1u<<k;++currentFrame->conflictKinds[k];}}}
    return !full && (!drain || !busy) && !conflict;
   });
+  waitPhase.reset();
   if(currentFrame){currentFrame->indexGPUWritableSubmits+=sawIndex;currentFrame->indexReadOnlySubmits+=otherIndices && !sawIndex;}
   if(currentFrame)currentFrame->slotWait+=since(slotStart);
   requireLive();
@@ -1019,7 +1023,7 @@ public:
   imageTransitions.clear();sampleViewUses.clear();
 #endif
   auto locked=currentFrame?FrameClock::now():FrameClock::time_point{};if(currentFrame){auto ns=uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(locked-submitStart).count());currentFrame->leaseLock+=ns;currentFrame->leaseBack+=ns;}
-  if(prepare){prepare();if(currentFrame)locked=FrameClock::now();}
+  if(prepare){{PhaseTimer phase(SubPhase::prepare);prepare();}if(currentFrame)locked=FrameClock::now();}
   auto *cpuTiming=systemTranslationPolicy().frameCPU && timing && !timing->cpuSampledSubmits?timing:nullptr;
   if(cpuTiming)++cpuTiming->cpuSampledSubmits;
   else if(timing && systemTranslationPolicy().frameCPU)++timing->cpuOmittedSubmits;
@@ -1057,8 +1061,9 @@ public:
    std::vector<std::array<MipRange,resourceSlots>> accessed(ops.size());
    std::vector<std::array<bool,resourceSlots>> generalSamples(ops.size());
    std::vector<Buffer *> buffers;
-   auto addBuffer=[&](Buffer *b){if(b){auto f=std::find(buffers.begin(),buffers.end(),b);scanAdd(ScanKind::useProbes,size_t(f-buffers.begin())+1);if(f==buffers.end())buffers.push_back(b);}};
-   auto addTexture=[&](Texture *t){if(t){auto f=std::find(textures.begin(),textures.end(),t);scanAdd(ScanKind::useProbes,size_t(f-textures.begin())+1);if(f==textures.end())textures.push_back(t);}if(t && t->backingBuffer)addBuffer(t->backingBuffer);};
+   std::unordered_set<Buffer *> bufferSeen;std::unordered_set<Texture *> textureSeen;bufferSeen.reserve(ops.size()*2+8);textureSeen.reserve(ops.size()*2+8);
+   auto addBuffer=[&](Buffer *b){if(b){scanAdd(ScanKind::useProbes,1);if(bufferSeen.insert(b).second)buffers.push_back(b);}};
+   auto addTexture=[&](Texture *t){if(t){scanAdd(ScanKind::useProbes,1);if(textureSeen.insert(t).second)textures.push_back(t);}if(t && t->backingBuffer)addBuffer(t->backingBuffer);};
    for(size_t n=0;n<ops.size();++n){diagnosticOp=n;auto &op=ops[n];addBuffer(op.src);addBuffer(op.dst);addBuffer(op.indices);addTexture(op.texture);addTexture(op.sourceTexture);
     if(op.texture && op.texture->shadow && (op.pipeline || op.clearOnly || op.upload || op.sourceTexture || op.generateMips))throw std::runtime_error("read-only linear shadow GPU write refused");
     if(op.texture && op.dstLevel>=op.texture->levels)throw std::runtime_error("destination mip level");
@@ -1328,10 +1333,11 @@ public:
    }
    if(neutralSize){Measure measure{objectNanos,SubPhase::objects};neutralBuffer=allocateUnlocked(neutralSize);addBuffer(neutralBuffer);}
    for(auto *t:textures)oldTextures.push_back({t,t->layout,t->levelLayouts,t->defined,t->definedLevels});
-   auto flushStart=std::chrono::steady_clock::now();
+   auto flushStart=std::chrono::steady_clock::now();auto flushPhase=std::make_unique<PhaseTimer>(SubPhase::flush);
    // Direct shared host writes are not tracked. Only Vulkan HOST_COHERENT permits omission.
    for(auto *t:textures)if(t->mapped && !coherent(t->memoryType)) {VkMappedMemoryRange r{};r.sType=VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;r.memory=t->memory;r.size=VK_WHOLE_SIZE;++flushCalls;check(FlushMappedMemoryRanges(device,1,&r));}
    for(auto *b:buffers)if(!coherent(b->memoryType)) {VkMappedMemoryRange r{};r.sType=VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;r.memory=b->memory;r.size=VK_WHOLE_SIZE;++flushCalls;check(FlushMappedMemoryRanges(device,1,&r));}
+   flushPhase.reset();
    {auto ns=since(flushStart);submitFlushNanos+=ns;if(currentFrame)currentFrame->flush+=ns;}
    {Measure measure{objectNanos,SubPhase::objects};
     if(!commandPool){VkCommandPoolCreateInfo pi{};pi.sType=VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;pi.queueFamilyIndex=family;check(CreateCommandPool(device,&pi,nullptr,&commandPool));++reuseCounts.commandPools;++submitObjectCreates;++submitPoolCreates;
@@ -1412,7 +1418,7 @@ public:
     bool operator==(const BindingValue &b) const {return binding==b.binding && type==b.type && image.sampler==b.image.sampler && image.imageView==b.image.imageView && image.imageLayout==b.image.imageLayout && buffer.buffer==b.buffer.buffer && buffer.offset==b.buffer.offset && buffer.range==b.buffer.range;}
    };
    struct BoundSet {VkDescriptorSetLayout layout;unsigned count;uint64_t hash;std::array<BindingValue,16> bindings;VkDescriptorSet set;};
-   std::vector<BoundSet> boundSets;if(systemTranslationPolicy().submitFast)boundSets.reserve(std::min<size_t>(ops.size(),256));
+   std::vector<BoundSet> boundSets;std::unordered_multimap<uint64_t,size_t> boundIndex;static constexpr size_t boundSetLimit=4096;if(systemTranslationPolicy().submitFast){boundSets.reserve(std::min<size_t>(ops.size(),boundSetLimit));boundIndex.reserve(std::min<size_t>(ops.size(),boundSetLimit)*2);}
    auto copyShadow=[&](Texture *t){
     VkBufferImageCopy region{};region.bufferOffset=t->backingOffset;region.bufferRowLength=t->backingRow/texelBytes(t->format);
     region.imageSubresource={VK_IMAGE_ASPECT_COLOR_BIT,0,0,1};region.imageExtent={t->width,t->height,1};
@@ -1536,10 +1542,10 @@ public:
         VkImageViewCreateInfo vi{};vi.sType=VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;vi.image=t->image;vi.viewType=viewTypeFor(t->textureType);vi.format=(VkFormat)d.format;vi.components={(VkComponentSwizzle)d.components[0],(VkComponentSwizzle)d.components[1],(VkComponentSwizzle)d.components[2],(VkComponentSwizzle)d.components[3]};uint32_t base=op.sampleBase[d.slot],count=op.sampleCount[d.slot]?op.sampleCount[d.slot]:t->levels-base;vi.subresourceRange={VK_IMAGE_ASPECT_COLOR_BIT,base,count,0,1};
         VkImageView view{};
         {Measure measure{objectNanos,SubPhase::objects};std::array<uint32_t,4> components{d.components[0],d.components[1],d.components[2],d.components[3]};
-         uint64_t viewProbes=0;auto found=std::find_if(viewCache.begin(),viewCache.end(),[&](const auto &c){++viewProbes;return c.texture==t && c.format==vi.format && c.components==components && c.base==base && c.count==count;});
+         uint64_t viewProbes=0;auto found=viewCache.end();{auto range=viewIndex.equal_range(viewKey(t,vi.format,components,base,count));for(auto it=range.first;it!=range.second;++it){++viewProbes;auto &c=viewCache[it->second];if(c.texture==t && c.format==vi.format && c.components==components && c.base==base && c.count==count){found=viewCache.begin()+it->second;break;}}}
          scanAdd(ScanKind::viewProbes,viewProbes);if(found!=viewCache.end())view=found->view;
          else {check(CreateImageView(device,&vi,nullptr,&view));++reuseCounts.views;++submitObjectCreates;++submitViewCreates;
-          try {if(viewCache.size()<viewCacheLimit)viewCache.push_back({t,vi.format,components,base,count,view});else sampleViews.push_back(view);}catch(...){DestroyImageView(device,view,nullptr);throw;}}
+          try {if(viewCache.size()<viewCacheLimit){viewCache.push_back({t,vi.format,components,base,count,view});viewIndex.emplace(viewKey(t,vi.format,components,base,count),viewCache.size()-1);}else sampleViews.push_back(view);}catch(...){if(!viewCache.empty() && viewCache.back().view==view)viewCache.pop_back();DestroyImageView(device,view,nullptr);throw;}}
          }image={d.type==VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER && sam?sam->sampler:VK_NULL_HANDLE,view,sampleGeneral(opIndex,d.slot)?VK_IMAGE_LAYOUT_GENERAL:VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};write.pImageInfo=&image;
 #ifdef FUXI_MTL_HOST_TEST
         sampleViewUses.push_back({t,base,count,image.imageLayout});
@@ -1549,12 +1555,12 @@ public:
        else {Measure measure{descriptorNanos,SubPhase::descriptors};UpdateDescriptorSets(device,1,&write,0,nullptr);}
       }
       if(fast){Measure measure{descriptorNanos,SubPhase::descriptors};uint64_t probes=0,compares=0,hash=0xcbf29ce484222325ull;for(unsigned i=0;i<draw.descriptorCount;++i){auto &v=(*bindings)[i];for(uint64_t x:{uint64_t(v.binding)<<32|v.type,uint64_t(uintptr_t(v.image.sampler)),uint64_t(uintptr_t(v.image.imageView))^uint64_t(v.image.imageLayout)<<56,uint64_t(uintptr_t(v.buffer.buffer)),uint64_t(v.buffer.offset),uint64_t(v.buffer.range)})hash=(hash^x)*0x100000001b3ull;}hash^=uint64_t(uintptr_t(op.pipeline->setLayout));
-       auto found=std::find_if(boundSets.begin(),boundSets.end(),[&](const auto &entry){++probes;return entry.hash==hash && (++compares,true) && entry.layout==op.pipeline->setLayout && entry.count==draw.descriptorCount && std::equal(bindings->begin(),bindings->begin()+draw.descriptorCount,entry.bindings.begin());});
+       auto found=boundSets.end();{auto range=boundIndex.equal_range(hash);for(auto it=range.first;it!=range.second;++it){++probes;auto &entry=boundSets[it->second];++compares;if(entry.layout==op.pipeline->setLayout && entry.count==draw.descriptorCount && std::equal(bindings->begin(),bindings->begin()+draw.descriptorCount,entry.bindings.begin())){found=boundSets.begin()+it->second;break;}}}
        scanAdd(ScanKind::boundSetProbes,probes);scanAdd(ScanKind::boundSetCompares,compares);scanMax(ScanKind::boundSetMax,boundSets.size());
        if(found!=boundSets.end())set=found->set;
        else {check(AllocateDescriptorSets(device,&sai,&set));if(systemTranslationPolicy().frameTrace)++frameCounts.descriptors;
         for(unsigned i=0;i<draw.descriptorCount;++i)writes[i].dstSet=set;UpdateDescriptorSets(device,draw.descriptorCount,writes.data(),0,nullptr);
-        if(boundSets.size()<256)boundSets.push_back({op.pipeline->setLayout,draw.descriptorCount,hash,*bindings,set});
+        if(boundSets.size()<boundSetLimit){boundIndex.emplace(hash,boundSets.size());boundSets.push_back({op.pipeline->setLayout,draw.descriptorCount,hash,*bindings,set});}
        }
       }
       if(set!=boundSet || op.pipeline->layout!=boundLayout){CmdBindDescriptorSets(cmd,VK_PIPELINE_BIND_POINT_GRAPHICS,op.pipeline->layout,0,1,&set,0,nullptr);boundSet=set;boundLayout=op.pipeline->layout;}

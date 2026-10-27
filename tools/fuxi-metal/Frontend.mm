@@ -201,10 +201,12 @@ extern "C" uint64_t fuxi_metal_submit_pool_creates() {return fuxi::Backend::subm
 extern "C" uint64_t fuxi_metal_submit_frame_creates() {return fuxi::Backend::submitFrameCreates.load();}
 extern "C" uint64_t fuxi_metal_sampling_skipped_draws() {return fuxi::skippedSamplingDraws.load();}
 extern "C" uint64_t fuxi_metal_submit_view_creates() {return fuxi::Backend::submitViewCreates.load();}
-static thread_local NSString *descriptorContext=nil;
+struct DescriptorText {NSString *text=nil;const fuxi::LazyText *lazy=nullptr;};
+static thread_local DescriptorText descriptorContext;
 struct DescriptorContext {
- NSString *previous;
- explicit DescriptorContext(NSString *text):previous(descriptorContext){descriptorContext=text;}
+ DescriptorText previous;
+ explicit DescriptorContext(NSString *text):previous(descriptorContext){descriptorContext={text,nullptr};}
+ explicit DescriptorContext(const fuxi::LazyText &text):previous(descriptorContext){descriptorContext={nil,&text};}
  ~DescriptorContext(){descriptorContext=previous;}
 };
 static qos_class_t compositorQoS(){return strcmp(clientProcess,"backboardd")?QOS_CLASS_DEFAULT:QOS_CLASS_USER_INTERACTIVE;}
@@ -212,8 +214,8 @@ static void failureLog(const char *format,...) {
  fuxi::backboardGate.fault();uint64_t n=failureCount.fetch_add(1);
  char message[fuxi::Survey::messageBytes];va_list args;va_start(args,format);vsnprintf(message,sizeof(message),format,args);va_end(args);
  // Context is captured in the refusal itself, before the normal immediate exit.
- if(descriptorContext){size_t len=strlen(message);if(len && message[len-1]=='\n')message[--len]=0;
-  snprintf(message+len,sizeof(message)-len," desc=%s\n",descriptorContext.UTF8String);}
+ if(descriptorContext.text || descriptorContext.lazy){size_t len=strlen(message);if(len && message[len-1]=='\n')message[--len]=0;
+  snprintf(message+len,sizeof(message)-len," desc=%s\n",descriptorContext.text?descriptorContext.text.UTF8String:descriptorContext.lazy->c_str());}
  // Keep each refusal a single complete console line, including translator errors.
  size_t length=strlen(message);for(size_t i=0;i+1<length;++i)if(message[i]=='\n' || message[i]=='\r')message[i]=' ';
  if(!length || message[length-1]!='\n'){if(length>=sizeof(message)-1)length=sizeof(message)-2;message[length++]='\n';message[length]=0;}
@@ -929,7 +931,7 @@ static thread_local FuxiCommandBuffer *completionCommand;
 @end
 @interface FuxiBlit : FuxiLabeledObject { @public FuxiCommandBuffer *_command; BOOL _ended; }
 @end
-@interface FuxiRender : FuxiLabeledObject { @public FuxiCommandBuffer *_command; FuxiTexture *_target;FuxiTexture *_targets[7];NSString *_passText; FuxiPipeline *_pipeline; MTLClearColor _clear; BOOL _ended,_drawn;
+@interface FuxiRender : FuxiLabeledObject { @public FuxiCommandBuffer *_command; FuxiTexture *_target;FuxiTexture *_targets[7];fuxi::LazyText _passText; FuxiPipeline *_pipeline; MTLClearColor _clear; BOOL _ended,_drawn;
  FuxiTexture *_samples[fuxi::resourceSlots];FuxiSampler *_samplers[fuxi::resourceSlots];uint32_t _load,_store;size_t _lastOp;
  fuxi::Operation _state; }
 @end
@@ -1001,7 +1003,7 @@ static uint64_t refreshCommandShadows(FuxiCommandBuffer *command){
 @end
 @implementation FuxiRender
 - (void)rejectSelector:(SEL)s {FRONTEND_TIME(_command);DescriptorContext descriptor(_passText);unsupported(self,s);[_command rejectSelector:s];}
-- (void)dealloc {[_command release];[_target release];for(auto t:_targets)[t release];[_passText release];[_pipeline release];for(unsigned i=0;i<fuxi::resourceSlots;++i){[_samples[i] release];[_samplers[i] release];}[super dealloc];}
+- (void)dealloc {[_command release];[_target release];for(auto t:_targets)[t release];[_pipeline release];for(unsigned i=0;i<fuxi::resourceSlots;++i){[_samples[i] release];[_samplers[i] release];}[super dealloc];}
 - (void)active {FRONTEND_TIME(_command);stage4Require("renderEncoder","ended",_ended,!_ended);stage4Require("renderEncoder","encoding",_command->_encoding,_command->_encoding);
  stage4Require("renderEncoder","commandStatus",_command->_status,_command->_status==MTLCommandBufferStatusNotEnqueued);}
 - (void)setRenderPipelineState:(id)p {FRONTEND_TIME(_command);FUXI_PHASE(pipeline);@try {CENSUS();DescriptorContext descriptor(_passText);[self active];
@@ -1010,7 +1012,8 @@ static uint64_t refreshCommandShadows(FuxiCommandBuffer *command){
  if(!stage4Class("renderEncoder","pipeline.class",p,[FuxiPipeline class]))invalid(@"renderEncoder pipeline.class");
  stage4Require("renderEncoder","pipeline.device",(uint64_t)[p device],[p device]==_command->_queue->_device);
  if(p==_pipeline)return;
- _state.diagnostic=[NSString stringWithFormat:@"%@ %@",_passText,((FuxiPipeline *)p)->_descriptorText?:@"pipeline=model"].UTF8String;
+ {auto pass=_passText;std::shared_ptr<void> hold((void *)[(((FuxiPipeline *)p)->_descriptorText?:@"pipeline=model") retain],[](void *x){[(id)x release];});
+  _state.diagnostic=fuxi::LazyText([pass,hold]{return std::string(pass.c_str())+" "+[(NSString *)hold.get() UTF8String];});}
  [p retain];[_pipeline release];_pipeline=p;
 } @catch(NSException *e) {(void)e;[self rejectSelector:_cmd];}}
 - (void)setFragmentTexture:(id)t atIndex:(NSUInteger)i {FRONTEND_TIME(_command);FUXI_PHASE(texSamp);@try {CENSUS();DescriptorContext descriptor(_passText);[self active];
@@ -1169,7 +1172,7 @@ static uint64_t refreshCommandShadows(FuxiCommandBuffer *command){
  if(type!=MTLIndexTypeUInt16 || !b)invalid(@"index type/buffer");[self record:t start:0 count:count indices:b offset:offset width:type==MTLIndexTypeUInt16?2:4];} @catch(NSException *e){(void)e;[self rejectSelector:_cmd];}}
 - (void)endEncoding {FRONTEND_TIME(_command);FUXI_PHASE(encEnd);@try {CENSUS();DescriptorContext descriptor(_passText);[self active];
  DescriptorContext context(_passText);
- if(!_drawn){fuxi::Operation op=_state;op.diagnostic=_passText.UTF8String;op.texture=_target->_texture;op.clearOnly=true;op.load=_load;op.store=_store;
+ if(!_drawn){fuxi::Operation op=_state;op.diagnostic=_passText;op.texture=_target->_texture;op.clearOnly=true;op.load=_load;op.store=_store;
  op.clear[0]=_clear.red;op.clear[1]=_clear.green;op.clear[2]=_clear.blue;op.clear[3]=_clear.alpha;
  retainCommandTexture(_command,_target,false);for(unsigned i=1;i<op.colorCount;++i)if(_targets[i-1])retainCommandTexture(_command,_targets[i-1],false);_command->_ops.push_back(op);
  }else {auto &op=_command->_ops[_lastOp];op.store=_store;for(unsigned i=1;i<op.colorCount;++i)op.colors[i-1].store=_state.colors[i-1].store;}
@@ -1177,19 +1180,20 @@ static uint64_t refreshCommandShadows(FuxiCommandBuffer *command){
 
 
 @end
-static NSString *passAttachmentText(MTLRenderPassAttachmentDescriptor *a){
- id t=a.texture;NSString *texture=@"nil";
- if([t isKindOfClass:[FuxiTexture class]]){auto ft=(FuxiTexture *)t;texture=[NSString stringWithFormat:@"{%@ viewBase=%u viewLevels=%lu}",ft->_descriptorText?:@"model",ft->_baseLevel,(unsigned long)[ft mipmapLevelCount]];}
- else if(t)texture=[NSString stringWithFormat:@"class=%s",object_getClassName(t)];
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wdeprecated-declarations"
- return [NSString stringWithFormat:@"texture=%@ level=%lu slice=%lu plane=%lu load=%lu store=%lu options=%lu resolve=%s/%lu/%lu/%lu",texture,(unsigned long)a.level,(unsigned long)a.slice,(unsigned long)a.depthPlane,(unsigned long)a.loadAction,(unsigned long)a.storeAction,(unsigned long)a.storeActionOptions,a.resolveTexture?object_getClassName(a.resolveTexture):"nil",(unsigned long)a.resolveLevel,(unsigned long)a.resolveSlice,(unsigned long)a.resolveDepthPlane];
-#pragma clang diagnostic pop
-}
-static NSString *renderPassText(MTLRenderPassDescriptor *d){
- NSMutableString *text=[NSMutableString stringWithFormat:@"renderPass area=%lux%lu array=%lu samples=%lu visibility=%u tile=%lux%lu imageblock=%lu threadgroup=%lu rateMap=%u colors=[",(unsigned long)d.renderTargetWidth,(unsigned long)d.renderTargetHeight,(unsigned long)d.renderTargetArrayLength,(unsigned long)d.defaultRasterSampleCount,d.visibilityResultBuffer!=nil,(unsigned long)d.tileWidth,(unsigned long)d.tileHeight,(unsigned long)d.imageblockSampleLength,(unsigned long)d.threadgroupMemoryLength,d.rasterizationRateMap!=nil];
- for(unsigned i=0;i<8;++i){auto a=d.colorAttachments[i];auto c=a.clearColor;[text appendFormat:@"%u:%@ clear=%.17g,%.17g,%.17g,%.17g;",i,passAttachmentText(a),c.red,c.green,c.blue,c.alpha];}
- [text appendFormat:@"] depth={%@ clear=%.17g} stencil={%@ clear=%u}",passAttachmentText(d.depthAttachment),d.depthAttachment.clearDepth,passAttachmentText(d.stencilAttachment),d.stencilAttachment.clearStencil];return text;
+// Only the attached targets are captured at encoder creation; text is formatted lazily for failure logs.
+struct PassSnap {
+ NSUInteger width=0,height=0;
+ struct Color {id texture=nil;NSUInteger level=0,slice=0,load=0,store=0;double clear[4]{};} colors[8];
+ PassSnap()=default;PassSnap(const PassSnap &)=delete;PassSnap &operator=(const PassSnap &)=delete;
+ ~PassSnap(){for(auto &c:colors)[c.texture release];}
+};
+static std::string passSnapText(const PassSnap &s) {
+ NSMutableString *text=[NSMutableString stringWithFormat:@"renderPass area=%lux%lu colors=[",(unsigned long)s.width,(unsigned long)s.height];
+ for(unsigned i=0;i<8;++i){auto &c=s.colors[i];if(!c.texture)continue;NSString *texture;
+  if([c.texture isKindOfClass:[FuxiTexture class]]){auto ft=(FuxiTexture *)c.texture;texture=[NSString stringWithFormat:@"{%@ viewBase=%u viewLevels=%lu}",ft->_descriptorText?:@"model",ft->_baseLevel,(unsigned long)[ft mipmapLevelCount]];}
+  else texture=[NSString stringWithFormat:@"class=%s",object_getClassName(c.texture)];
+  [text appendFormat:@"%u:texture=%@ level=%lu slice=%lu load=%lu store=%lu clear=%.17g,%.17g,%.17g,%.17g;",i,texture,(unsigned long)c.level,(unsigned long)c.slice,(unsigned long)c.load,(unsigned long)c.store,c.clear[0],c.clear[1],c.clear[2],c.clear[3]];}
+ [text appendString:@"]"];return text.UTF8String;
 }
 @implementation FuxiQueue
 - (void)dealloc {_uploadStorage.clear([](FuxiBuffer *b){[b release];});for(auto q:{_completionQueue,_submitQueue,_retireQueue,_finishQueue,_deliveryQueue})if(q)dispatch_release(q);if(_inflight)dispatch_release(_inflight);[_device release];[super dealloc];}
@@ -1235,19 +1239,23 @@ static NSString *renderPassText(MTLRenderPassDescriptor *d){
 - (id)refusedRender {if(!_rejected)[self rejectSelector:@selector(renderCommandEncoderWithDescriptor:)];FuxiRefusedRender *e=[FuxiRefusedRender new];e->_command=[self retain];return [e autorelease];}
 - (id)renderCommandEncoderWithDescriptor:(MTLRenderPassDescriptor *)d {FRONTEND_TIME(self);FUXI_PHASE(encBegin);@try {CENSUS();
  if(clientMode==fuxi::ClientMode::census)return nil;if(_rejected)return [self refusedRender];
- NSString *passText=renderPassText(d);DescriptorContext context(passText);
+ auto checksPhase=std::make_unique<fuxi::PhaseTimer>(fuxi::EncPhase::encChecks);
+ auto snap=std::make_shared<PassSnap>();fuxi::LazyText passText([snap]{return passSnapText(*snap);});DescriptorContext context(passText);
+ snap->width=d.renderTargetWidth;snap->height=d.renderTargetHeight;
+ for(unsigned i=0;i<8;++i){auto ca=d.colorAttachments[i];id texture=ca.texture;if(!texture)continue;auto &c=snap->colors[i];auto clear=ca.clearColor;
+  c.texture=[texture retain];c.level=ca.level;c.slice=ca.slice;c.load=ca.loadAction;c.store=ca.storeAction;c.clear[0]=clear.red;c.clear[1]=clear.green;c.clear[2]=clear.blue;c.clear[3]=clear.alpha;}
  if(!stage4Value("renderEncoder","commandStatus",_status,_status==MTLCommandBufferStatusNotEnqueued) ||
     !stage4Value("renderEncoder","encoding",_encoding,!_encoding))return [self refusedRender];
 #define CHECK(field,value,accepted) do {__typeof__(value) actual=(value);stage4Require("renderPass",field,(uint64_t)actual,(accepted));}while(0)
  CHECK("descriptor",d,actual!=nil);
  unsigned first=8;uint32_t colorCount=1,colorMask=0;
  for(unsigned i=0;i<8;++i)if(d.colorAttachments[i].texture){if(first==8)first=i;colorCount=i+1;colorMask|=1u<<i;}
- for(unsigned i=0;i<8;++i)if(!d.colorAttachments[i].texture){char field[80];snprintf(field,sizeof(field),"colorAttachments[%u].resolveTexture",i);CHECK(field,d.colorAttachments[i].resolveTexture,!actual);}
+ for(unsigned i=0;i<8;++i)if(!d.colorAttachments[i].texture && d.colorAttachments[i].resolveTexture){char field[80];snprintf(field,sizeof(field),"colorAttachments[%u].resolveTexture",i);CHECK(field,d.colorAttachments[i].resolveTexture,!actual);}
  CHECK("colorAttachments.empty",colorMask,actual);
  auto a=d.colorAttachments[first];id t=a.texture;
  if(!stage4Class("renderPass","primaryTexture.class",t,[FuxiTexture class]))invalid(@"renderPass texture.class");
  for(unsigned i=0;i<colorCount;++i){auto c=d.colorAttachments[i];id texture=c.texture;char field[96];if(!texture){CHECK("absent.resolveTexture",c.resolveTexture,!actual);continue;}
-#define COLOR_CHECK(name,value,accepted) do{snprintf(field,sizeof(field),"colorAttachments[%u]." name,i);CHECK(field,value,accepted);}while(0)
+#define COLOR_CHECK(name,value,accepted) do{__typeof__(value) actual=(value);if(!(accepted)){snprintf(field,sizeof(field),"colorAttachments[%u]." name,i);stage4Require("renderPass",field,(uint64_t)actual,false);}}while(0)
   snprintf(field,sizeof(field),"colorAttachments[%u].texture.class",i);if(!stage4Class("renderPass",field,texture,[FuxiTexture class]))invalid(@"renderPass texture.class");
   COLOR_CHECK("device",[texture device],actual==[self device]);
   COLOR_CHECK("usage",((FuxiTexture *)texture)->_usage,!actual || (actual&MTLTextureUsageRenderTarget));
@@ -1278,7 +1286,8 @@ static NSString *renderPassText(MTLRenderPassDescriptor *d){
  MTLSamplePosition ignoredPosition{};CHECK("samplePositions.count",[d getSamplePositions:&ignoredPosition count:0],!actual);
 
 #undef CHECK
- FuxiRender *e=[FuxiRender new];e->_state={};e->_state.encoderID=++_renderEncoderID;e->_state.colorCount=colorCount;e->_state.colorMask=colorMask;e->_passText=[passText copy];e->_command=[self retain];e->_target=[t retain];e->_clear=a.clearColor;e->_load=(uint32_t)a.loadAction;e->_store=(uint32_t)a.storeAction;
+ checksPhase.reset();
+ FuxiRender *e=[FuxiRender new];e->_state={};e->_state.encoderID=++_renderEncoderID;e->_state.colorCount=colorCount;e->_state.colorMask=colorMask;e->_passText=passText;e->_command=[self retain];e->_target=[t retain];e->_clear=a.clearColor;e->_load=(uint32_t)a.loadAction;e->_store=(uint32_t)a.storeAction;
  e->_state.viewport={0,(float)areaH,(float)areaW,-(float)areaH,0,1};e->_state.scissor={{0,0},{areaW,areaH}};e->_state.dstLevel=((FuxiTexture *)t)->_baseLevel+(uint32_t)a.level;e->_state.areaWidth=areaW;e->_state.areaHeight=areaH;
  for(unsigned i=1;i<colorCount;++i){auto c=d.colorAttachments[i];auto texture=(FuxiTexture *)c.texture;if(!texture)continue;e->_targets[i-1]=[texture retain];auto clear=c.clearColor;
   e->_state.colors[i-1]={texture->_texture,texture->_baseLevel+(uint32_t)c.level,(uint32_t)c.loadAction,(uint32_t)c.storeAction,{(float)clear.red,(float)clear.green,(float)clear.blue,(float)clear.alpha}};}
