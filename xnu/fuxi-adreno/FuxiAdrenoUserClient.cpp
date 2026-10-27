@@ -296,6 +296,7 @@ class FuxiAdrenoUserClient : public IOUserClient {
   IOMemoryDescriptor *memory=IOMemoryDescriptor::withAddressRange(r.address,r.bytes,
       kIODirectionInOut|kIOMemoryMapperNone|kIOMemoryPersistent,task_);
   bool ro=false;
+  uint64_t probe=0;
   if (!memory) {
    /* withAddressRange hides the VM error (memory entry creation: hole, read-only or max-protection mismatch).
     * Probe with the same flags: detail bit0 first page, bit1 last page, bit2 whole range read-only (kIODirectionOut). */
@@ -307,9 +308,9 @@ class FuxiAdrenoUserClient : public IOUserClient {
    if (fuxi_gpu_abi_roimport()) memory=IOMemoryDescriptor::withAddressRange(r.address,r.bytes,kIODirectionOut|flags,task_);
    else { p=IOMemoryDescriptor::withAddressRange(r.address,r.bytes,kIODirectionOut|flags,task_); if (p) { detail|=4; p->release(); } }
    if (!memory) return refuse(4,kIOReturnNoMemory,detail);
-   ro=true;
+   ro=true; probe=detail|8;
   }
-  if (memory->prepare(ro ? kIODirectionOut : kIODirectionInOut)!=kIOReturnSuccess) { memory->release(); return refuse(5,kIOReturnBadArgument,0); }
+  if (memory->prepare(ro ? kIODirectionOut : kIODirectionInOut)!=kIOReturnSuccess) { memory->release(); return refuse(5,kIOReturnBadArgument,probe); }
   bool valid=memory->getLength()==r.bytes;
   uint64_t why=valid ? 0 : (6ULL<<56);
   /* One segment lookup per physical run (UniXNU Adreno740 pattern); the cache-class predicate stays per 16K page. */
@@ -327,12 +328,15 @@ class FuxiAdrenoUserClient : public IOUserClient {
   IOMemoryMap *mapping=valid ? memory->createMappingInTask(kernel_task,0,kIOMapAnywhere|kIOMapDefaultCache|(ro ? kIOMapReadOnly : 0)) : nullptr;
   if (!mapping || !mapping->getVirtualAddress() || mapping->getLength()!=r.bytes) {
    if (mapping) mapping->release();
-   memory->complete(); memory->release(); return refuse(valid ? 8 : (why>>56),kIOReturnBadArgument,why&((1ULL<<56)-1));
+   memory->complete(); memory->release(); return refuse(valid ? 8 : (why>>56),kIOReturnBadArgument,(why&((1ULL<<56)-1))|(valid ? probe<<48 : 0));
   }
   // Fault/wire the kernel alias as well: pmap lookup and watchdog cache
   // maintenance must never depend on a pageable/demand-faulted KVA mapping.
-  if (mapping->wireRange(ro ? kIODirectionOut : kIODirectionInOut,0,r.bytes)!=kIOReturnSuccess) {
-   mapping->release(); memory->complete(); memory->release(); return refuse(9,kIOReturnNoMemory,0);
+  /* wireRange passes (options&3) as vm_prot_t: kIODirectionIn=READ, kIODirectionOut=WRITE. A read-only alias
+   * must wire READ only; asking for WRITE (the old kIODirectionOut) is a protection failure. */
+  IOReturn wired=mapping->wireRange(ro ? kIODirectionIn : kIODirectionInOut,0,r.bytes);
+  if (wired!=kIOReturnSuccess) {
+   mapping->release(); memory->complete(); memory->release(); return refuse(9,kIOReturnNoMemory,(uint64_t)(uint32_t)wired|(probe<<32));
   }
   b->importMemory=memory; b->importMap=mapping; b->importRo=ro; b->bytes=b->allocated=r.bytes;
   b->handle=nextHandle_++; wired_+=r.bytes; out.handle=b->handle;

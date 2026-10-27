@@ -32,7 +32,7 @@ using task_t=unsigned;using IOOptionBits=unsigned;
 constexpr task_t kernel_task=99;
 constexpr int kIOReturnSuccess=0,kIOReturnBadArgument=1,kIOReturnNoResources=2,
  kIOReturnNoMemory=3,kIOReturnBusy=4,kIOReturnIOError=5;
-constexpr unsigned kIODirectionNone=0,kIODirectionOut=2,kIODirectionInOut=3,kIOMapReadOnly=4096,kIOMemoryMapperNone=8,kIOMemoryPersistent=16,
+constexpr unsigned kIODirectionNone=0,kIODirectionIn=1,kIODirectionOut=2,kIODirectionInOut=3,kIOMapReadOnly=4096,kIOMemoryMapperNone=8,kIOMemoryPersistent=16,
  kIOMapAnywhere=32,kIOMapDefaultCache=0;
 #define bzero(p,n) memset(p,0,n)
 static task_t caller=7;
@@ -82,11 +82,11 @@ struct IOMemoryDescriptor {
  IOMemoryMap *createMappingInTask(task_t,uint64_t,unsigned);
 };
 struct IOMemoryMap {
- IOMemoryDescriptor *md;bool wired=false;
- IOMemoryMap(IOMemoryDescriptor *m):md(m) {maps++;md->retain();}
+ IOMemoryDescriptor *md;bool wired=false,ro=false;
+ IOMemoryMap(IOMemoryDescriptor *m,bool r=false):md(m),ro(r) {maps++;md->retain();}
  int wireRange(unsigned options,uint64_t off,uint64_t n) {
   assert(!off && n==md->length);
-  if(options==kIODirectionInOut || options==kIODirectionOut) {assert(!wired);if(fail==13)return 1;wired=true;wireOut+=options==kIODirectionOut;}
+  if(options==kIODirectionInOut || options==kIODirectionIn) {assert(!wired);if(fail==13||(ro&&(options&kIODirectionOut)))return 1;wired=true;wireOut+=options==kIODirectionIn;}
   else {assert(!options && wired);if(fail==14)return 1;wired=false;}
   return 0;
  }
@@ -97,7 +97,7 @@ struct IOMemoryMap {
 IOMemoryMap *IOMemoryDescriptor::createMappingInTask(task_t task,uint64_t a,unsigned options) {
  assert(wired && task==kernel_task && !a && (options&~kIOMapReadOnly)==(kIOMapAnywhere|kIOMapDefaultCache));
  lastMapRo=!!(options&kIOMapReadOnly);
- return fail==9?nullptr:new IOMemoryMap(this);
+ return fail==9?nullptr:new IOMemoryMap(this,!!(options&kIOMapReadOnly));
 }
 struct IOBufferMemoryDescriptor {void release(){assert(false);}};
 struct FuxiAdrenoBoView {void release(){assert(false);}};
