@@ -798,7 +798,7 @@ static bool textureDescriptorAccepted(MTLTextureDescriptor *d,uint32_t dimension
 #undef CHECK
  FuxiTexture *t=[FuxiTexture new];t->_descriptorText=[textureDescriptorText(d) copy];t->_cacheMode=d.cpuCacheMode;t->_device=[_device retain];t->_usage=d.usage;t->_shared=YES;
  if(d.textureType!=MTLTextureType2D){failureLog("FUXI MTL: texture reject linearTextureType %lu desc=%s\n",(unsigned long)d.textureType,textureDescriptorText(d).UTF8String);[t release];return nil;}
- try {t->_texture=owner(_device)->backend->linearTexture(_buffer,(uint32_t)d.pixelFormat,(uint32_t)d.usage,(uint32_t)d.width,(uint32_t)d.height,offset,row);}
+ try {t->_texture=owner(_device)->backend->linearTexture(_buffer,(uint32_t)d.pixelFormat,(uint32_t)d.usage,(uint32_t)d.width,(uint32_t)d.height,offset,row,_shadow==YES);}
  catch(const std::exception &e){failureLog("FUXI MTL: texture reject linearAllocation 0 desc=%s offset=%lu row=%lu image=%lu reason=%s\n",textureDescriptorText(d).UTF8String,(unsigned long)offset,(unsigned long)row,(unsigned long)image,e.what());[t release];return nil;}
  t->_backingBuffer=[self retain];t->_backingOffset=offset;t->_backingRow=row;return t;
 }

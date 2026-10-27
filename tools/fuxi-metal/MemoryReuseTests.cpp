@@ -95,6 +95,15 @@ int main(int argc,char **){
   assert(buf->shadowKey()==oldContents);
   // Bound directly (possible GPU writes): never renamed, the prepare waits and the conflicting kind is reported.
   buf->directUse=true;FrameSample waited;flight(true,waited);assert(!waited.shadowRenames && waited.conflictWaits==1 && waited.conflictKinds[1]==1 && !waited.conflictKinds[0]);
+  // CA's sampled linear view of a shadowed buffer takes the shadow-copy path (renameable); an in-place alias pins the buffer and is reported as a texture decline.
+  {auto *sb2=rb.allocate(16384);auto *viaShadow=rb.linearTexture(sb2,80,1,16,16,0,64,true);assert(viaShadow->shadow && sb2->shadowBacking && !sb2->aliased);
+   auto *sb3=rb.allocate(16384);auto *viaAlias=rb.linearTexture(sb3,80,1,16,16,0,64,false);assert(!viaAlias->shadow && sb3->aliased);
+   Operation read{};read.texture=dst;read.sourceTexture=viaAlias;read.width=16;read.height=16;std::function<void()> a,b2;rb.submit({read},{},&a);
+   std::vector<PrepareWrite> aliasWrites{{sb3,0,64}};FrameSample trace;std::promise<void> started;
+   auto f=std::async(std::launch::async,[&]{FrameTraceScope scope(&trace);started.set_value();rb.submit({read},{},&b2,[&]{},&aliasWrites);});
+   started.get_future().wait();assert(f.wait_for(std::chrono::milliseconds(100))==std::future_status::timeout);a();f.get();b2();
+   assert(trace.renameDeclined[3]==1 && trace.conflictKinds[2]==1 && !trace.shadowRenames);
+   rb.destroy(viaShadow);rb.destroy(viaAlias);rb.destroy(sb2);rb.destroy(sb3);}
   rb.destroy(copy.sourceTexture);rb.destroy(dst);rb.destroy(buf);rb.close();
   puts("PASS: shadow storage rename (no wait, bytes preserved, old storage untouched, direct use refused, conflict kind reported)");
  }

@@ -80,7 +80,7 @@ inline void importCheck(VkResult r,int line=__builtin_LINE()) {
  X(CreatePipelineLayout) X(DestroyPipelineLayout) X(CreateGraphicsPipelines) X(DestroyPipeline) \
  X(CreatePipelineCache) X(DestroyPipelineCache) X(GetPipelineCacheData) \
  X(CmdBindVertexBuffers) X(CmdBindIndexBuffer) X(CmdDrawIndexed) X(CmdSetViewport) X(CmdSetScissor) X(CmdPushConstants) X(CmdBeginRenderPass) X(CmdEndRenderPass) X(CmdBindPipeline) X(CmdDraw) X(CmdCopyImageToBuffer) X(CmdPipelineBarrier) X(CreateFence) X(DestroyFence) X(QueueSubmit) X(WaitForFences)
-struct Buffer { VkBuffer buffer{}; VkDeviceMemory memory{}; void *contents{};void *key{};Buffer *spare{};void *shadowKey() const{return key?key:contents;}bool shadowBacking=false,directUse=false,spareFailed=false; size_t length{}, allocated{},charged{},memoryBytes{},memoryOffset{},references=1;uint32_t memoryType{};bool imported=false,upload=false; };
+struct Buffer { VkBuffer buffer{}; VkDeviceMemory memory{}; void *contents{};void *key{};Buffer *spare{};void *shadowKey() const{return key?key:contents;}bool shadowBacking=false,directUse=false,spareFailed=false,aliased=false; size_t length{}, allocated{},charged{},memoryBytes{},memoryOffset{},references=1;uint32_t memoryType{};bool imported=false,upload=false; };
 // Host ranges a submit's prepare callback will write; absent means unknown (full drain).
 struct PrepareWrite {Buffer *buffer;uint64_t offset,bytes;};
 struct Texture : TextureLevels {VkImage image{};VkDeviceMemory memory{};VkImageView view{};size_t allocated{},charged{},memoryBytes{},references=1;
@@ -465,7 +465,7 @@ public:
    failed(layout.rowPitch!=row,"rowPitch Vulkan="+std::to_string(layout.rowPitch)+" Metal="+std::to_string(row));
    return mismatch;
  }
- Texture *linearTexture(Buffer *b,uint32_t format,uint32_t usage,uint32_t width,uint32_t height,size_t offset,size_t row) {
+ Texture *linearTexture(Buffer *b,uint32_t format,uint32_t usage,uint32_t width,uint32_t height,size_t offset,size_t row,bool shadowed=false) {
   std::unique_lock<std::mutex> guard(mutex);requireLive();
   if(!b || !limits.linearRows(width,height,texelBytes(format),row,offset,b->length) || !usage || usage&~5u || format==81 || (format==1 && (usage&4)))throw std::runtime_error("linear texture descriptor/extent/stride");
   auto *t=new Texture{};t->format=format;t->vkFormat=pixelFormat(format);t->width=width;t->height=height;t->tiling=VK_IMAGE_TILING_LINEAR;
@@ -481,9 +481,11 @@ public:
     if(t->image)DestroyImage(device,t->image,nullptr);delete t;t=nullptr;
     auto *shadow=allocateTextureUnlocked(format,1,width,height);
     shadow->shadow=true;b->shadowBacking=true;shadow->backingBuffer=b;++b->references;shadow->backingOffset=offset;shadow->backingRow=row;
-    fprintf(stderr,"FUXI MTL: linear texture shadow format=%u %ux%u offset=%zu row=%zu reason=%s\n",format,width,height,offset,row,reason.c_str());return shadow;
+    if(reason[0]!='s')fprintf(stderr,"FUXI MTL: linear texture shadow format=%u %ux%u offset=%zu row=%zu reason=%s\n",format,width,height,offset,row,reason.c_str());return shadow;
    };
    if((formatProperties.linearTilingFeatures&required)!=(uint32_t)required)return fallback("linear texture format features unavailable");
+   // A shadowed buffer's bytes are rewritten each frame; sampling it in place would pin the buffer to every flight reading it. A copy through a shadow image lets the storage be renamed.
+   if(shadowed && usage==1 && systemTranslationPolicy().shadowRename && !b->imported)return fallback("shadowed buffer samples through a copy (rename)");
    if(b->imported){
     ci.pNext=&external;
     VkPhysicalDeviceExternalImageFormatInfo extInfo{};extInfo.sType=VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_IMAGE_FORMAT_INFO;extInfo.handleType=VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
@@ -497,7 +499,7 @@ public:
    VkImageSubresource sub{VK_IMAGE_ASPECT_COLOR_BIT,0,0};VkSubresourceLayout layout{};GetImageSubresourceLayout(device,t->image,&sub,&layout);
    auto mismatch=linearAliasMismatch(req,layout,b->memoryType,b->allocated,offset,row,b->memoryOffset);
    if(!mismatch.empty())return fallback("linear texture Vulkan memory/layout mismatch: "+mismatch);
-   check(frameKernelCall([&]{return BindImageMemory(device,t->image,b->memory,b->memoryOffset+offset);}));t->memory=b->memory;t->memoryType=b->memoryType;t->borrowedMemory=true;t->allocated=req.size;
+   check(frameKernelCall([&]{return BindImageMemory(device,t->image,b->memory,b->memoryOffset+offset);}));t->memory=b->memory;t->memoryType=b->memoryType;t->borrowedMemory=true;b->aliased=true;t->allocated=req.size;
    t->mapped=(uint8_t *)b->contents+offset;t->layout=ci.initialLayout;t->defined=true;t->usage=ci.usage;
    VkImageViewCreateInfo vi{};vi.sType=VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;vi.image=t->image;vi.viewType=VK_IMAGE_VIEW_TYPE_2D;vi.format=t->vkFormat;vi.subresourceRange={VK_IMAGE_ASPECT_COLOR_BIT,0,1,0,1};
    check(CreateImageView(device,&vi,nullptr,&t->view));t->blendable=formatProperties.linearTilingFeatures&VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT;t->filterable=formatProperties.linearTilingFeatures&VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT;t->backingBuffer=b;++b->references;return t;
@@ -982,6 +984,8 @@ public:
   auto spareBusy=[&](Buffer *b){return b->spare && busyUse({b->spare->memory,b->spare->contents,b->spare->length});};
   auto prepareConflicts=[&]{for(auto &pending:slots)if(pending.busy)for(auto old:pending.uses)for(auto write:prepared)if(aliases(old,write)){if(renameable(write.buffer) && write.buffer->spare && !spareBusy(write.buffer))continue;return true;}return false;};
   auto conflictKinds=[&]{unsigned m=0;for(auto &pending:slots)if(pending.busy){for(auto old:pending.uses)for(auto write:prepared)if(aliases(old,write))m|=old.kind;for(auto old:pending.hostUses)for(auto use:hostUses)if(aliases(old,use))m|=old.kind;}return m;};
+  unsigned declinedSeen=0;if(currentFrame)for(auto &w:prepared)if(busyUse(w)){ // why a conflicting write cannot be renamed, once per submit and cause
+   auto *x=w.buffer;unsigned c=!renaming?0:x->aliased?3:!x->shadowBacking?1:x->directUse?2:x->spareFailed?4:5;if(c==5 && renameable(x))continue;if(!(declinedSeen>>c&1)){declinedSeen|=1u<<c;++currentFrame->renameDeclined[c];}}
   if(renaming)for(auto &w:prepared)if(renameable(w.buffer) && !w.buffer->spare && busyUse(w)){ // first conflict: create the spare storage
    try{w.buffer->spare=allocateUnlocked(w.buffer->length);}catch(const std::exception &){w.buffer->spareFailed=true;}}
   auto indexHazard=[&](bool uploadOnly=false){for(auto &op:ops)if(op.indices && (!uploadOnly || op.indices->upload))for(auto &pending:slots)if(pending.busy)for(auto old:pending.writes)if(aliases(old,{op.indices->memory,op.indices->contents,op.indices->length}))return true;return false;};

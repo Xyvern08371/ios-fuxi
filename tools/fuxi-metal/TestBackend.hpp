@@ -80,7 +80,7 @@ public:
   limits.reserve(bytes);auto *t=new Texture{};t->width=width;t->height=height;t->allocated=t->charged=bytes;t->defined=true;return t;
  }
  Buffer *importBuffer(void *,size_t) {throw std::runtime_error("no modeled host buffer import");}
- Texture *linearTexture(Buffer *b,uint32_t format,uint32_t usage,uint32_t width,uint32_t height,size_t offset,size_t row) {
+ Texture *linearTexture(Buffer *b,uint32_t format,uint32_t usage,uint32_t width,uint32_t height,size_t offset,size_t row,bool=false) {
   requireLive();auto pixel=texelBytes(format);
   if(!b || usage!=1 || !limits.linearRows(width,height,pixel,row,offset,b->length))throw std::runtime_error("linear texture descriptor/extent/stride");
   auto *t=allocateTexture(format,usage,width,height);t->shadow=true;t->backingBuffer=b;t->backingOffset=offset;t->backingRow=row;return t;

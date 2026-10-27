@@ -2836,3 +2836,15 @@ buffer of a read-only shadow texture (never bound directly, tracked by
 there, the write goes to the new storage, and the flight keeps reading the old one. The
 snapshot key is `Buffer::shadowKey()` so queued snapshots follow the swap. New fields:
 `shadow_renames/frame`, `shadow_rename_bytes/frame`.
+
+**Why the first rename never engaged (P169; fix not yet observed).** `conflict_kinds`
+reported shadow and texture together at the same count because the busy use was one
+linear alias texture: `linearTexture` binds an image directly to the shadowed buffer's
+memory (it adds the `texture` use for the mapped range and the `shadow` use for its
+`backingBuffer`). Such a buffer is sampled in place, so its storage cannot be swapped
+under the bound image, and `Buffer::aliased` now declines it. With rename enabled,
+`FuxiBuffer`'s sample-only linear textures over a shadowed buffer take the shadow-copy
+path (`shadowed` argument), after which the buffer is a plain shadow backing and
+renameable. The policy init logs `FUXI MTL: policy shadow_rename=N source=boot|env|none`,
+and `rename_declined=off,not_backing,direct_use,texture,budget,other` counts conflicting
+writes that could not be renamed.
