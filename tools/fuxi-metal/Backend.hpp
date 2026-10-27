@@ -22,6 +22,7 @@
 #endif
 #include "ResourceLimits.hpp"
 #include "TransientMemory.hpp"
+#include "SlabMemory.hpp"
 #include "ClientSetup.hpp"
 #include "DrawSafety.hpp"
 #include "TextureLevels.hpp"
@@ -86,7 +87,7 @@ struct Texture : TextureLevels {VkImage image{};VkDeviceMemory memory{};VkImageV
  uint32_t memoryType{};VkImageUsageFlags usage{};uint32_t format=80;VkFormat vkFormat=VK_FORMAT_B8G8R8A8_UNORM;
  // layout is level zero; levelLayouts[1..levels) track the remaining mips.
  VkImageTiling tiling=VK_IMAGE_TILING_OPTIMAL;VkImageLayout layout=VK_IMAGE_LAYOUT_UNDEFINED;std::array<VkImageLayout,32> levelLayouts{};void *mapped{};bool imported=false,borrowedMemory=false;
- MemoryKey recycleKey{};bool recyclable=false;std::array<uint64_t,7> importKey{};bool importCached=false;
+ MemoryKey recycleKey{};bool recyclable=false,slabbed=false;uint64_t memOffset{},memExtent{};SlabMemory<VkDeviceMemory>::Block slabBlock{};std::array<uint64_t,7> importKey{};bool importCached=false;
  Buffer *backingBuffer{};size_t backingOffset{},backingRow{};bool shadow=false;
  std::vector<VkImageView> attachmentViews;bool canGenerate=false,filterable=true,blendable=false;};
 struct Sampler {size_t references=1;VkSampler sampler{};uint32_t filters=1;float lodMin=0,lodMax=0;};
@@ -172,15 +173,22 @@ class Backend {
   driverHits=driverMisses=driverUnknown=objectHits=objectMisses=0;return checkpoint;
  }
  ObjectCache<Pipeline> objects;ResourceLimits limits;DrawPlanCache<Pipeline> drawPlans;
- TransientMemory<VkDeviceMemory> textureMemory;
+ TransientMemory<VkDeviceMemory> textureMemory;SlabMemory<VkDeviceMemory> slabMemory;
+public:
+ bool slabsEnabled=!systemTranslationPolicy().noSlab;
+ // Two textures overlap in memory only if they share an allocation and (for sub-allocations) an offset range.
+ static bool memoryAlias(const Texture *a,const Texture *b){return a->memory==b->memory && (!a->slabbed || !b->slabbed || (a->memOffset<b->memOffset+b->memExtent && b->memOffset<a->memOffset+a->memExtent));}
+private:
  static uint64_t memoryNow(){return std::chrono::duration_cast<std::chrono::nanoseconds>(CacheClock::now().time_since_epoch()).count();}
  void trimMemoryUnlocked(bool all=false,uint64_t now=memoryNow()){
   if(poisoned)return;
   textureMemory.trim(now,all,[&](VkDeviceMemory h,size_t bytes){freePooledUnlocked(h,bytes);});
+  slabMemory.trim(now,all,[&](VkDeviceMemory h,size_t bytes){freePooledUnlocked(h,bytes);});
  }
  void freePooledUnlocked(VkDeviceMemory h,size_t bytes){frameKernelCall([&]{FreeMemory(device,h,nullptr);});--liveMemoryObjects;liveMemoryBytes-=bytes;limits.release(bytes);}
  void reserveMemoryUnlocked(size_t bytes){
-  if(bytes>ResourceLimits::budget-limits.used && !poisoned)textureMemory.reclaim(bytes-(ResourceLimits::budget-limits.used),[&](VkDeviceMemory h,size_t n){freePooledUnlocked(h,n);});
+  if(bytes>ResourceLimits::budget-limits.used && !poisoned){textureMemory.reclaim(bytes-(ResourceLimits::budget-limits.used),[&](VkDeviceMemory h,size_t n){freePooledUnlocked(h,n);});
+   if(bytes>ResourceLimits::budget-limits.used)slabMemory.reclaim(bytes-(ResourceLimits::budget-limits.used),[&](VkDeviceMemory h,size_t n){freePooledUnlocked(h,n);});}
   limits.reserve(bytes);
  }
  // Two independently resettable lanes. A busy lane belongs to its retirement.
@@ -511,7 +519,8 @@ public:
   if(!t || --t->references)return !poisoned;
   if(t->importCached)imports.erase(t->importKey);
   if(!poisoned) {clearFrames(t);clearViews(t);if(t->mapped && !t->borrowedMemory)frameKernelCall([&]{return UnmapMemory(device,t->memory);});for(auto v:t->attachmentViews)if(v)DestroyImageView(device,v,nullptr);if(t->view)DestroyImageView(device,t->view,nullptr);if(t->image)DestroyImage(device,t->image,nullptr);if(t->memory && !t->borrowedMemory){
-   if(t->recyclable && textureMemory.put(t->recycleKey,t->memory,memoryNow()))t->charged=0;
+   if(t->slabbed)slabMemory.release(t->slabBlock,memoryNow());
+   else if(t->recyclable && textureMemory.put(t->recycleKey,t->memory,memoryNow()))t->charged=0;
    else {frameKernelCall([&]{return FreeMemory(device,t->memory,nullptr);});--liveMemoryObjects;liveMemoryBytes-=t->memoryBytes;}
   }}limits.release(t->charged);destroyUnlocked(t->backingBuffer);delete t;return !poisoned;
  }
@@ -601,6 +610,26 @@ public:
   std::unique_lock<std::mutex> guard(mutex);requireLive();
   return allocateTextureUnlocked(format,usage,width,height,levels,type,depth);
  }
+ // Binds `t` to a slab range when the request is small; false means use a dedicated (pooled) block.
+ bool trySlabUnlocked(Texture *t,const VkMemoryRequirements &req,uint32_t memoryType){
+  SlabMemory<VkDeviceMemory>::Block blk{};auto align=req.alignment?req.alignment:1;
+  auto r=slabMemory.alloc(req.size,align,req.memoryTypeBits,blk);
+  if(r==SlabMemory<VkDeviceMemory>::ineligible)return false;
+  if(r==SlabMemory<VkDeviceMemory>::grow){
+   constexpr uint64_t slab=SlabMemory<VkDeviceMemory>::slabSize;
+   if(!slabMemory.canGrow())return false;
+   if(slab>ResourceLimits::budget-limits.used){textureMemory.reclaim(slab-(ResourceLimits::budget-limits.used),[&](VkDeviceMemory h,size_t n){freePooledUnlocked(h,n);});}
+   if(slab>ResourceLimits::budget-limits.used)slabMemory.reclaim(slab-(ResourceLimits::budget-limits.used),[&](VkDeviceMemory h,size_t n){freePooledUnlocked(h,n);});
+   if(slab>ResourceLimits::budget-limits.used)return false;
+   VkMemoryAllocateInfo ai{};ai.sType=VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;ai.allocationSize=slab;ai.memoryTypeIndex=memoryType;VkDeviceMemory m{};
+   auto result=frameKernelCall([&]{return AllocateMemory(device,&ai,nullptr,&m);});
+   if(result!=VK_SUCCESS)return false;
+   limits.reserve(slab);if(systemTranslationPolicy().frameTrace)++frameCounts.allocations;++liveMemoryObjects;liveMemoryBytes+=slab;
+   if(!slabMemory.add(m,memoryType,memoryNow())){frameKernelCall([&]{FreeMemory(device,m,nullptr);});--liveMemoryObjects;liveMemoryBytes-=slab;limits.release(slab);return false;}
+   if(slabMemory.alloc(req.size,align,req.memoryTypeBits,blk)!=SlabMemory<VkDeviceMemory>::ok)return false;
+  }
+  t->memory=blk.memory;t->memOffset=blk.offset;t->memExtent=blk.size;t->slabbed=true;t->slabBlock=blk;t->memoryType=memoryType;t->charged=0;return true;
+ }
  Texture *allocateTextureUnlocked(uint32_t format,uint32_t usage,uint32_t width,uint32_t height,uint32_t levels=1,uint32_t type=2,uint32_t depth=1) {
   if(!textureShapeAccepted(type,height,usage,depth,levels))throw std::runtime_error("texture dimension/usage");
   if(!levels || levels>mipCount(width,height))throw std::runtime_error("texture mip count");
@@ -631,6 +660,13 @@ public:
    if(memoryType==memory.memoryTypeCount)throw std::runtime_error("no device-local texture memory");
    VkMemoryAllocateInfo ai{};ai.sType=VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;ai.allocationSize=memorySizeClass(req.size);if(ai.allocationSize>ResourceLimits::single)ai.allocationSize=req.size;ai.memoryTypeIndex=memoryType;t->memoryType=memoryType;
    trimMemoryUnlocked();MemoryKey got{};
+   // Small images are sub-allocated from shared device-local slabs: a miss costs a free-list search, not a kernel allocation.
+   // Frees come only from destroyTextureUnlocked, i.e. after the submit that pinned the texture has retired.
+   if(slabsEnabled && trySlabUnlocked(t,req,memoryType)){
+    t->memoryBytes=0;check(frameKernelCall([&]{return BindImageMemory(device,t->image,t->memory,t->memOffset);}));
+    VkImageViewCreateInfo vi{};vi.sType=VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;vi.image=t->image;vi.viewType=viewTypeFor(t->textureType);vi.format=ii.format;
+    vi.subresourceRange={VK_IMAGE_ASPECT_COLOR_BIT,0,levels,0,1};check(CreateImageView(device,&vi,nullptr,&t->view));t->recyclable=true;return t;
+   }
    // Pooled blocks are plain device-local allocations (no dedicated/imported); offset 0 satisfies any alignment.
    if(textureMemory.take(req.size,req.memoryTypeBits,t->memory,got)){t->recycleKey=got;t->memoryType=got.type;ai.allocationSize=got.bytes;t->charged=got.bytes;}
    else {
@@ -1032,7 +1068,7 @@ public:
       if(op.pipeline && (op.pipeline->fetchMask&(1u<<i)) && c.load==0)throw std::runtime_error("fetch from DontCare attachment");
       if(!(t->usage&VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) || t->textureType!=2)throw std::runtime_error("texture is not a 2D render attachment");
       if(op.pipeline && op.pipeline->options.color(i).blend && !t->blendable)throw std::runtime_error("attachment blending unavailable");
-      for(unsigned j=0;j<i;++j){auto other=op.color(j);if(!other.texture)continue;if(t->memory==other.texture->memory || hostRangesOverlap(t->mapped,t->allocated,other.texture->mapped,other.texture->allocated))throw std::runtime_error("render attachment alias");}
+      for(unsigned j=0;j<i;++j){auto other=op.color(j);if(!other.texture)continue;if(memoryAlias(t,other.texture) || hostRangesOverlap(t->mapped,t->allocated,other.texture->mapped,other.texture->allocated))throw std::runtime_error("render attachment alias");}
       for(unsigned stage=0;stage<2;++stage)for(auto binding:op.buffers[stage])if(binding.buffer && (binding.buffer->memory==t->memory || hostRangesOverlap(binding.buffer->contents,binding.buffer->length,t->mapped,t->allocated)))throw std::runtime_error("attachment/buffer feedback");
      }
     }
@@ -1099,7 +1135,7 @@ public:
     auto &plan=draws[n];bool skipDraw=false;
     for(unsigned slot=0;slot<resourceSlots;++slot){auto *sample=op.samples[slot];if(!slot && !sample)sample=op.sourceTexture;if(!sample)continue;
      auto base=op.sampleBase[slot],count=op.sampleCount[slot]?op.sampleCount[slot]:sample->levels-base;
-     bool aliases=false,viewOverlap=false;for(unsigned k=0;k<op.colorCount;++k){auto *target=op.color(k).texture;if(target && (sample==target || sample->image==target->image || sample->memory==target->memory || hostRangesOverlap(sample->mapped,sample->allocated,target->mapped,target->allocated))){aliases=true;auto l=op.color(k).level;if(l>=base && l-base<count)viewOverlap=true;}}
+     bool aliases=false,viewOverlap=false;for(unsigned k=0;k<op.colorCount;++k){auto *target=op.color(k).texture;if(target && (sample==target || sample->image==target->image || memoryAlias(sample,target) || hostRangesOverlap(sample->mapped,sample->allocated,target->mapped,target->allocated))){aliases=true;auto l=op.color(k).level;if(l>=base && l-base<count)viewOverlap=true;}}
      auto &range=accessed[n][slot];
      // Nonalias draws retain their established conservative definition checks.
      if(!aliases){range.add(base,base+count-1);continue;}
@@ -1140,7 +1176,7 @@ public:
      bool sameImage=false,alias=false;
      for(unsigned k=0;k<op.colorCount;++k){auto c=op.color(k);auto *target=c.texture;if(!target)continue;
       if(sample==target || sample->image==target->image){if(range.contains(c.level)){unsafe=true;sameImage=true;}}
-      else if(sample->memory==target->memory || hostRangesOverlap(sample->mapped,sample->allocated,target->mapped,target->allocated)){unsafe=true;alias=true;}
+      else if(memoryAlias(sample,target) || hostRangesOverlap(sample->mapped,sample->allocated,target->mapped,target->allocated)){unsafe=true;alias=true;}
      }
      if(unsafe){
       auto reason="attachmentFeedback slot="+std::to_string(slot)+" view="+std::to_string(base)+"+"+std::to_string(count)+" possibleRead="+(range.empty()?std::string("none"):std::to_string(range.first)+".."+std::to_string(range.last));
@@ -1203,7 +1239,7 @@ public:
        if((d.stages&(stage?16u:1u)) && (d.binding>=16 || !(op.pipeline->readOnlyStorage[stage]&(1u<<d.binding))))return MergeSplit::storage;
      }
      for(unsigned slot=0;slot<resourceSlots;++slot){auto *sample=op.samples[slot];if(!slot && !sample)sample=op.sourceTexture;if(!sample)continue;
-      for(unsigned i=0;i<op.colorCount;++i){auto *t=op.color(i).texture;if(t && (sample==t || sample->image==t->image || sample->memory==t->memory || hostRangesOverlap(sample->mapped,sample->allocated,t->mapped,t->allocated)))return MergeSplit::attachmentSample;}
+      for(unsigned i=0;i<op.colorCount;++i){auto *t=op.color(i).texture;if(t && (sample==t || sample->image==t->image || memoryAlias(sample,t) || hostRangesOverlap(sample->mapped,sample->allocated,t->mapped,t->allocated)))return MergeSplit::attachmentSample;}
      }
      return MergeSplit::none;
     };
@@ -1302,7 +1338,7 @@ public:
      imageTransitions.push_back({t,l,layout,next});
 #endif
      if(boundaryPerf){
-      for(size_t i=0;i<pendingTextures.size();++i){auto *old=pendingTextures[i];if(old->image==t->image?pendingImages[i].subresourceRange.baseMipLevel==l:old->memory==t->memory || hostRangesOverlap(old->mapped,old->allocated,t->mapped,t->allocated)){flushImages();break;}}
+      for(size_t i=0;i<pendingTextures.size();++i){auto *old=pendingTextures[i];if(old->image==t->image?pendingImages[i].subresourceRange.baseMipLevel==l:memoryAlias(old,t) || hostRangesOverlap(old->mapped,old->allocated,t->mapped,t->allocated)){flushImages();break;}}
       pendingImages.push_back(ib);pendingTextures.push_back(t);
      }else CmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT|VK_PIPELINE_STAGE_HOST_BIT,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,0,0,nullptr,0,nullptr,1,&ib);layout=next;
     }

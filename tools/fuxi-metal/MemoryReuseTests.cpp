@@ -3,7 +3,7 @@
 #include <cassert>
 #include <cstdio>
 int main(int argc,char **){
- using namespace fuxi;Backend backend;auto objects=liveMemoryObjects.load();
+ using namespace fuxi;Backend backend;backend.slabsEnabled=false;auto objects=liveMemoryObjects.load();
  if(argc>1){
   auto *idle=backend.allocateTexture(80,5,16,16);backend.destroy(idle);auto cached=texturePoolBytes.load();assert(cached);
   auto *t=backend.allocateTexture(80,5,64,64);auto *buffer=backend.allocate(16384);
@@ -24,8 +24,8 @@ int main(int argc,char **){
  upload.texture=c;Operation read{};read.texture=c;read.dst=out;backend.submit({upload,read});assert(!memcmp(up->contents,out->contents,1024));
  backend.destroy(b);backend.destroy(c);backend.destroy(stillLive);assert(backend.resourceBytes()==bytes*3+up->charged+out->charged);
  backend.trimMemoryForTest(UINT64_MAX);assert(backend.resourceBytes()==up->charged+out->charged);
- std::vector<Texture *> textures;for(unsigned i=0;i<66;++i)textures.push_back(backend.allocateTexture(80,5,16,16));for(auto *t:textures)backend.destroy(t);
- assert(texturePoolBytes==bytes*64);backend.trimMemory();assert(!texturePoolBytes);
+ std::vector<Texture *> textures;for(unsigned i=0;i<TransientMemory<VkDeviceMemory>::maxEntries+2;++i)textures.push_back(backend.allocateTexture(80,5,16,16));for(auto *t:textures)backend.destroy(t);
+ assert(texturePoolBytes==bytes*TransientMemory<VkDeviceMemory>::maxEntries);backend.trimMemory();assert(!texturePoolBytes);
  // Nearby sizes share a class: a 17x16 texture reuses the pooled block without a new allocation.
  {auto *p=backend.allocateTexture(80,5,16,16);auto *q=backend.allocateTexture(80,5,17,16);auto m=p->memory;auto classBytes=p->charged;backend.destroy(p);auto allocs=frameCounts.allocations,h2=texturePoolHits.load();auto *r=backend.allocateTexture(80,5,17,16);
   assert(r->memory==m && texturePoolHits==h2+1 && frameCounts.allocations==allocs && r->charged==classBytes && classBytes>=r->allocated);backend.destroy(q);backend.destroy(r);backend.trimMemory();}
@@ -44,6 +44,38 @@ int main(int argc,char **){
   auto *shrunk=backend2.importTexture(host,allocation,row,w,h-1,0,77);assert(shrunk!=again);auto *plain=backend2.importTexture(host,allocation,row,w,h);assert(plain!=again && plain->references==1);
   backend2.destroy(again);backend2.destroy(shrunk);backend2.destroy(plain);assert(!backend2.resourceBytes());free(host);puts("PASS: surface import reuse");
  }else puts("SKIP: surface import reuse (no host import)");
+
+ // Slab sub-allocation: small images share one kernel allocation at distinct, aligned, non-overlapping offsets.
+ {
+  Backend sb;auto live0=liveMemoryObjects.load();auto grows=slabGrows.load(),hitsBefore=slabHits.load();auto allocs0=frameCounts.allocations;
+  auto *s1=sb.allocateTexture(80,5,16,16);assert(s1->slabbed && slabGrows==grows+1 && sb.resourceBytes()==SlabMemory<VkDeviceMemory>::slabSize && liveMemoryObjects==live0+1);
+  auto allocs1=frameCounts.allocations;auto *s2=sb.allocateTexture(80,5,16,16);auto *s3=sb.allocateTexture(80,5,64,64);
+  assert(s2->memory==s1->memory && s3->memory==s1->memory && frameCounts.allocations==allocs1 && slabHits==hitsBefore+3 && liveMemoryObjects==live0+1 && allocs1==allocs0+1);
+  for(auto *t:{s1,s2,s3})assert(t->memExtent>=t->allocated && !t->charged && t->memOffset+t->memExtent<=SlabMemory<VkDeviceMemory>::slabSize);
+  assert(!Backend::memoryAlias(s1,s2) && !Backend::memoryAlias(s2,s3) && !Backend::memoryAlias(s1,s3) && Backend::memoryAlias(s1,s1));
+  // Distinct textures in one allocation keep independent pixels.
+  auto *up1=sb.allocate(1024),*up2=sb.allocate(1024),*o1=sb.allocate(1024),*o2=sb.allocate(1024);memset(up1->contents,0x11,1024);memset(up2->contents,0x22,1024);
+  Operation u1{};u1.texture=s1;u1.src=up1;u1.upload=true;Operation u2{};u2.texture=s2;u2.src=up2;u2.upload=true;Operation r1{};r1.texture=s1;r1.dst=o1;Operation r2{};r2.texture=s2;r2.dst=o2;
+  sb.submit({u1,u2,r1,r2});assert(!memcmp(o1->contents,up1->contents,1024) && !memcmp(o2->contents,up2->contents,1024));
+  // Fence safety: a destroyed texture's range is not handed out until the submit that pinned it retires.
+  Operation pin{};pin.texture=s1;pin.src=up1;pin.upload=true;std::function<void()> retire;sb.submit({pin},{},&retire);
+  auto off=s1->memOffset;sb.destroy(s1);auto *during=sb.allocateTexture(80,5,16,16);assert(during->memOffset!=off || during->memory!=s2->memory);
+  retire();auto *after=sb.allocateTexture(80,5,16,16);assert(after->memOffset==off && after->memory==s2->memory);
+  // Steady-state frames: allocate/free cycles never reach the kernel again.
+  auto steady=frameCounts.allocations;for(unsigned i=0;i<200;++i){auto *a=sb.allocateTexture(80,5,100+i%7,100);auto *b=sb.allocateTexture(80,5,256,64+i%5);sb.destroy(a);sb.destroy(b);}
+  assert(frameCounts.allocations==steady);
+  // Budget: demand beyond one slab grows by whole slabs, stays within the cap, and falls back to dedicated blocks past it.
+  std::vector<Texture *> many;auto maxBytes=sb.resourceBytes();
+  for(unsigned i=0;i<12;++i){many.push_back(sb.allocateTexture(80,5,1024,1024));maxBytes=std::max(maxBytes,sb.resourceBytes());assert(sb.resourceBytes()<=ResourceLimits::budget);}
+  size_t slabbed=0;for(auto *t:many)slabbed+=t->slabbed;assert(slabbed==12 && sb.resourceBytes()>SlabMemory<VkDeviceMemory>::slabSize && slabBytes<=SlabMemory<VkDeviceMemory>::maxSlabs*SlabMemory<VkDeviceMemory>::slabSize);
+  for(unsigned i=0;i<28;++i)many.push_back(sb.allocateTexture(80,5,1024,1024)); // 40 x 4 MiB: slabs cap at 8 x 16 MiB, the rest take dedicated blocks
+  slabbed=0;for(auto *t:many)slabbed+=t->slabbed;assert(slabbed>=28 && slabbed<40 && slabBytes==SlabMemory<VkDeviceMemory>::maxSlabs*SlabMemory<VkDeviceMemory>::slabSize && sb.resourceBytes()<=ResourceLimits::budget);
+  auto *big=sb.allocateTexture(80,5,2048,1024);assert(!big->slabbed);
+  for(auto *t:many)sb.destroy(t);sb.destroy(big);sb.destroy(during);sb.destroy(after);sb.destroy(s2);sb.destroy(s3);
+  sb.trimMemoryForTest(0);assert(sb.resourceBytes()>=SlabMemory<VkDeviceMemory>::slabSize); // idle trim keeps the newest slab warm
+  sb.destroy(up1);sb.destroy(up2);sb.destroy(o1);sb.destroy(o2);sb.trimMemory();assert(!sb.resourceBytes() && liveMemoryObjects==live0);sb.close();
+  puts("PASS: slab sub-allocation (shared allocation, aligned disjoint offsets, pixels, fence-gated reuse, steady state, budget)");
+ }
  assert(frameCounts.allocations>before);
  printf("PASS: image memory reuse after fence only, new-image layout/defined state, pixels, cap/idle/pressure/charge/close; Operation=%zu BufferBind=%zu bindings=%zu\n",sizeof(Operation),sizeof(BufferBind),sizeof(Operation::buffers));
 }

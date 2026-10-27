@@ -20,14 +20,21 @@ int main(){
  MemoryKey big{key.bytes+8192,1};assert(pool.put(big,2,0) && pool.put(key,3,0));assert(pool.take(100000,2,h,got) && h==3 && pool.bytes()==big.bytes);
  assert(pool.take(100000,2,h,got) && h==2 && !pool.bytes());
  unsigned freed=0;auto free=[&](unsigned,size_t){++freed;};
- for(unsigned i=1;i<=64;++i)assert(pool.put(key,i,0));assert(!pool.put(key,65,0) && texturePoolRejectFull==1);
- pool.trim(pool.idleNanos-1,false,free);assert(!freed);pool.trim(pool.idleNanos,false,free);assert(freed==64 && !pool.bytes() && texturePoolIdleTrims==64);
+ MemoryKey tiny{4096,1};constexpr unsigned cap=TransientMemory<unsigned>::maxEntries;for(unsigned i=1;i<=cap;++i)assert(pool.put(tiny,i,0));assert(!pool.put(tiny,cap+1,0) && texturePoolRejectFull==1);
+ pool.trim(pool.idleNanos-1,false,free);assert(!freed);pool.trim(pool.idleNanos,false,free);assert(freed==cap && !pool.bytes() && texturePoolIdleTrims==cap && pool.idleNanos>=30ull*1000*1000*1000);
+ // Miss causes: a re-request after the entry was trimmed/rejected is attributed to that event, not to cold demand.
+ {std::array<uint64_t,missCauses> before{};for(unsigned i=0;i<missCauses;++i)before[i]=texturePoolMissCause[i].load();auto n=[&](MissCause c){return texturePoolMissCause[c].load()-before[c];};
+  assert(!pool.take(4096,~0u,h,got) && n(missIdleTrim)==1);                                   // idle-trimmed class
+  assert(!pool.take(3000000,~0u,h,got) && n(missCold)==1);                                    // never seen
+  assert(!pool.take(3000000,~0u,h,got) && n(missInflight)==1);                                // seen, nothing pooled: blocks are out
+  MemoryKey wide{memorySizeClass(1000000),1};assert(pool.put(wide,7,0));assert(!pool.take(wide.bytes*3/5,~0u,h,got) && n(missSlack)==1);assert(!pool.take(wide.bytes*4/3,~0u,h,got) && n(missSmall)==1);
+  assert(!pool.take(wide.bytes,1u<<3,h,got) && n(missType)==1);pool.trim(0,true,free);assert(!pool.bytes());}
  auto large=key;large.bytes=pool.budget;assert(pool.put(large,40,100));assert(!pool.put(key,41,100) && texturePoolRejectBudget==1);
- pool.trim(99,false,free);assert(pool.bytes()==pool.budget);pool.trim(100,true,free);assert(!pool.bytes() && freed==65);
+ pool.trim(99,false,free);assert(pool.bytes()==pool.budget);pool.trim(100,true,free);assert(!pool.bytes() && freed==cap+2);
  // Pressure reclaims only as much as needed, longest-idle first.
  MemoryKey m{1<<20,0};for(unsigned i=0;i<4;++i)assert(pool.put(m,10+i,10-i));freed=0;unsigned last=0;auto track=[&](unsigned v,size_t){++freed;last=v;};
  pool.reclaim(m.bytes+1,track);assert(freed==2 && last==12 && pool.bytes()==2*m.bytes);pool.reclaim(0,track);assert(freed==2);pool.reclaim(UINT64_MAX,track);assert(freed==4 && !pool.bytes());
- assert(texturePoolHits==3 && texturePoolMisses==4 && !texturePoolBytes && texturePoolClassHits[memoryClassBucket(key.bytes)]==3 && texturePoolPressureTrims==5);
+ assert(texturePoolHits==3 && texturePoolMisses==10 && !texturePoolBytes && texturePoolClassHits[memoryClassBucket(key.bytes)]==3 && texturePoolPressureTrims==6);
  CommandStorage<std::shared_ptr<int>> storage;auto a=storage.acquire();auto *identity=a.data();auto owned=std::make_shared<int>(12);a.push_back(owned);
  auto b=storage.acquire();assert(b.data()!=identity);storage.release(a);assert(owned.use_count()==1);
  auto c=storage.acquire();assert(c.empty() && c.data()==identity && c.capacity()>=256);

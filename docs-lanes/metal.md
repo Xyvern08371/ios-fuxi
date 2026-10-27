@@ -2360,6 +2360,21 @@ returning allocation and do not count as cached-object trims. There is no new
 per-frame logging. Existing frame-trace `allocations` counts actual Vulkan
 allocations, so a hit contributes zero.
 
+**Slab sub-allocation (N167 follow-up; device effect not yet observed).** Device-local
+images up to 4 MiB are bound at aligned offsets inside shared 16 MiB `VkDeviceMemory`
+slabs (`SlabMemory.hpp`, at most 8 slabs, charged to the resource budget when the slab
+is created). A texture's range is returned only from `destroyTextureUnlocked`, i.e.
+after the submit that pinned it has retired, so a block is never reissued while the
+GPU may use it. Larger images keep the exact-class block pool (now 256 entries, 30 s
+idle trim). Texture aliasing checks compare memory plus offset range
+(`Backend::memoryAlias`). Empty slabs are freed after 30 s idle except the newest per
+type, and under budget pressure. `fuxigpunoslab=1` restores the pool-only path.
+The backboardd line appends **`tex_pool_miss_causes`** (cold, inflight, type, slack,
+small, idle_trim, pressure, reject_full, reject_budget; each pool miss counted once),
+and **`slab_hits`, `slab_grows`, `slab_grow_cold/frag/full`, `slab_grow_refused`,
+`slab_frees`, `slab_trims`, `slab_bytes`, `slab_free_bytes`**. A slab grow is one
+kernel allocation; steady state should show `slab_hits` growing with `slab_grows` flat.
+
 `record` previously copied the **2 x 16 `BufferBind` array, 768 bytes** with its
 explicit `memcpy(op.buffers, _buffers, sizeof(_buffers))`. These are pointers,
 offsets and flags, not CA's vertex/index payload. It also copied `_state` into
