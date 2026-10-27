@@ -73,6 +73,8 @@ static void task_lock(task_t t){assert(t==&task && !locks);locks++;}
 static void task_unlock(task_t t){assert(t==&task && locks && !schedlock);locks--;}
 #define queue_iterate(q,t,type,field) for((t)=*(q);(t);(t)=(t)->next)
 static vm_map_t get_task_map(task_t t){return t;}
+static task_t current_task(void){return &task;}
+static thread_t current_thread(void){return task.threads;}
 static arm_saved_state_t *find_user_regs(thread_t t){assert(locks);return t->ss;}
 static int is_saved_state64(arm_saved_state_t *s){return s->valid && !non64;}
 static spl_t splsched(void){assert(!high);high=1;return 0;}

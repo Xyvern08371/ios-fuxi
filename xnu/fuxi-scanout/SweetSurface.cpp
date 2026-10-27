@@ -74,6 +74,8 @@ static SweetSurface *sweet_surface_table[SWEET_SURFACE_MAX_ID];
 static uint32_t      sweet_surface_users[SWEET_SURFACE_MAX_ID];
 static uint32_t      sweet_surface_next_id = 1;
 static uint32_t      sweet_surface_creates_logged;
+static SInt32        sweet_surface_bts_logged;
+extern "C" void sweet_prof_user_bt(const char *tag);
 static uint64_t      sweet_surface_wired;       /* bytes of buffer surfaces */
 #define SWEET_SURFACE_WIRED_MAX         (1536ull << 20)
 
@@ -997,6 +999,14 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
 		IOLog("SWEET SURF: %s create id %u %ux%u fmt 0x%x bpe %u bpr %u planes %u size %u keys %u -> 0x%x\n",
 		    name, s->id, s->width, s->height, s->pixelFormat, s->bytesPerElement,
 		    s->bytesPerRow, s->planeCount, s->allocSize, props->getCount(), ret);
+	}
+	/* Which client code asks for multi-plane non-BGRA layouts (App Library 'b3a8'): first 8, with a user backtrace. */
+	if (ret == kIOReturnSuccess && s->planeCount > 1 && s->pixelFormat != 0x42475241u &&
+	    OSIncrementAtomic(&sweet_surface_bts_logged) < 8) {
+		char name[32], tag[96];
+		proc_selfname(name, sizeof(name));
+		snprintf(tag, sizeof(tag), "SWEET SURF: bt %s id %u fmt 0x%x", name, s->id, s->pixelFormat);
+		sweet_prof_user_bt(tag);
 	}
 	props->release();
 	if (ret != kIOReturnSuccess) {

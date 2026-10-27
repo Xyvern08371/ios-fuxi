@@ -9,8 +9,12 @@
  #define SWEET_SURFACE_STATE_SEED        0xc     /* u32 in the state page */
  #define kIOSurfaceLockReadOnly          0x1
  
-@@ -74,6 +76,32 @@
+@@ -72,8 +74,36 @@
+ static uint32_t      sweet_surface_users[SWEET_SURFACE_MAX_ID];
+ static uint32_t      sweet_surface_next_id = 1;
  static uint32_t      sweet_surface_creates_logged;
++static SInt32        sweet_surface_bts_logged;
++extern "C" void sweet_prof_user_bt(const char *tag);
  static uint64_t      sweet_surface_wired;       /* bytes of buffer surfaces */
  #define SWEET_SURFACE_WIRED_MAX         (1536ull << 20)
 +
@@ -42,7 +46,7 @@
  
  OSDefineMetaClassAndStructors(SweetSurface, OSObject);
  
-@@ -86,11 +114,18 @@
+@@ -86,11 +116,18 @@
   uint64_t length, pageGeneration, generation, age;
   bool quarantine;
  };
@@ -62,7 +66,7 @@
  static unsigned sweet_gpu_slot;
  static uint64_t sweet_gpu_begin;
  static bool sweet_gpu_init(void)
-@@ -99,6 +134,11 @@
+@@ -99,6 +136,11 @@
    IOLock *lock = IOLockAlloc();
    if (!lock) return false;
    if (!OSCompareAndSwapPtr(NULL, lock, &sweet_gpu_lock)) IOLockFree(lock);
@@ -74,7 +78,7 @@
   }
   return true;
  }
-@@ -134,7 +174,17 @@
+@@ -134,7 +176,17 @@
   uint64_t cpu = thread_get_runtime_self(), start = mach_absolute_time();
   IOLockLock(sweet_gpu_lock);
   if (sweet_gpu_inflight) { IOLockUnlock(sweet_gpu_lock); return 2; }
@@ -93,7 +97,7 @@
   unsigned slot = FG_CACHE_SLOTS, victim = 0, replacement = FG_CACHE_SLOTS;
   uint64_t length = s->memory->getLength()-s->offset;
   uintptr_t source = src+s->offset;
-@@ -174,6 +224,7 @@
+@@ -174,6 +226,7 @@
   sweet_gpu_cache[slot].age = ++sweet_gpu_age;
   result = fuxi_gpu_copy(slot, sweet_gpu_cache[slot].generation, source, length,
       s->bytesPerRow, sx, sy, dx, dy, width, height, &sweet_gpu_times);
@@ -101,7 +105,7 @@
   if (result == 2) {
    s->retain();
    sweet_gpu_inflight = s;
-@@ -182,10 +233,14 @@
+@@ -182,10 +235,14 @@
   }
   if (result < 0) {
    sweet_gpu_cache[slot].quarantine = true;
@@ -117,7 +121,7 @@
   sweet_gpu_times.cpu += thread_get_runtime_self()-cpu;
   IOLockUnlock(sweet_gpu_lock);
   return result;
-@@ -203,14 +258,16 @@
+@@ -203,14 +260,16 @@
    result = fuxi_gpu_poll(&sweet_gpu_times);
    if (result) {
     *elapsed = mach_absolute_time()-sweet_gpu_begin;
@@ -136,7 +140,7 @@
    }
   }
   sweet_gpu_times.cpu += thread_get_runtime_self()-cpu;
-@@ -218,21 +275,73 @@
+@@ -218,21 +277,73 @@
   if (release) release->release(); /* free() takes the cache lock */
   return result;
  }
@@ -219,7 +223,7 @@
  }
  void sweet_surface_gpu_stats(struct fg_times *t)
  {
-@@ -528,6 +637,7 @@
+@@ -528,6 +639,7 @@
  	IOMemoryMap  *data;
  	IOMemoryMap  *state;
  	uint32_t      count;
@@ -227,7 +231,7 @@
  
  	bool init() APPLE_KEXT_OVERRIDE { return OSObject::init(); }
  	void free() APPLE_KEXT_OVERRIDE;
-@@ -541,6 +651,10 @@
+@@ -541,6 +653,10 @@
  	OSSafeReleaseNULL(data);
  	OSSafeReleaseNULL(state);
  	if (surface != NULL) {
@@ -238,7 +242,7 @@
  		sweet_surface_put(surface);
  		surface->release();
  		surface = NULL;
-@@ -591,7 +705,9 @@
+@@ -591,7 +707,9 @@
  	    void *reference) APPLE_KEXT_OVERRIDE;
  	IOExternalTrap *getTargetAndTrapForIndex(IOService **targetP, UInt32 index) APPLE_KEXT_OVERRIDE;
  
@@ -249,7 +253,22 @@
  	IOReturn trapLock(void *id, void *options, void *seedOut, void *, void *, void *);
  	IOReturn trapUnlock(void *id, void *options, void *seedOut, void *, void *, void *);
  	IOReturn trapRelease(void *id, void *, void *, void *, void *, void *);
-@@ -956,11 +1072,34 @@
+@@ -882,6 +1000,14 @@
+ 		    name, s->id, s->width, s->height, s->pixelFormat, s->bytesPerElement,
+ 		    s->bytesPerRow, s->planeCount, s->allocSize, props->getCount(), ret);
+ 	}
++	/* Which client code asks for multi-plane non-BGRA layouts (App Library 'b3a8'): first 8, with a user backtrace. */
++	if (ret == kIOReturnSuccess && s->planeCount > 1 && s->pixelFormat != 0x42475241u &&
++	    OSIncrementAtomic(&sweet_surface_bts_logged) < 8) {
++		char name[32], tag[96];
++		proc_selfname(name, sizeof(name));
++		snprintf(tag, sizeof(tag), "SWEET SURF: bt %s id %u fmt 0x%x", name, s->id, s->pixelFormat);
++		sweet_prof_user_bt(tag);
++	}
+ 	props->release();
+ 	if (ret != kIOReturnSuccess) {
+ 		s->release();
+@@ -956,11 +1082,34 @@
  	}
  }
  
@@ -289,7 +308,7 @@
  }
  
  static IOReturn
-@@ -1001,7 +1140,7 @@
+@@ -1001,7 +1150,7 @@
  		return kIOReturnNotFound;
  	}
  #if defined(FUXI)
@@ -298,7 +317,7 @@
    s->release(); return kIOReturnNotReady;
   }
  #endif
-@@ -1041,8 +1180,8 @@
+@@ -1041,8 +1190,8 @@
  }
  
  static IOExternalTrap sweet_surface_traps[] = {

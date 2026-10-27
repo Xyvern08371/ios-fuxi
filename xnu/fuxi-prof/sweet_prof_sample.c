@@ -46,6 +46,23 @@ static void sp_sweep(task_t task,struct sp_table *p) {
  }
  task_unlock(task);p->sweeps++;
 }
+/* Diagnostic: the calling thread's user frames plus the shared cache slide, one console line. */
+void sweet_prof_user_bt(const char *tag);
+void sweet_prof_user_bt(const char *tag) {
+ thread_t thread=current_thread();task_t task=current_task();arm_saved_state_t *ss=find_user_regs(thread);
+ if(!ss || !is_saved_state64(ss))return;
+ uint64_t slide=0,bt[12]={0};vm_shared_region_t sr=vm_shared_region_get(task);
+ if(sr){slide=sr->sr_slide;vm_shared_region_deallocate(sr);}
+ vm_map_t map=get_task_map(task);uint64_t fp=get_saved_state_fp(ss),base=fp;unsigned n=0;
+ for(;n<12 && fp && !(fp&7) && fp>=base && fp-base<1024*1024;n++) {
+  uint64_t frame[2];
+  if(vm_map_read_user(map,fp,frame,sizeof(frame))!=KERN_SUCCESS)break;
+  bt[n]=frame[1];if(frame[0]<=fp){n++;break;}fp=frame[0];
+ }
+ printf("%s slide 0x%llx pc 0x%llx lr 0x%llx bt",tag,(unsigned long long)slide,(unsigned long long)get_saved_state_pc(ss),(unsigned long long)get_saved_state_lr(ss));
+ for(unsigned i=0;i<n;i++)printf(" 0x%llx",(unsigned long long)bt[i]);
+ printf("\n");
+}
 void sweet_prof_task(task_t task,int pid) {
  uint64_t deadline,period,leeway,duration;
  struct sp_table *p=kalloc_data(sizeof(*p),Z_WAITOK|Z_ZERO);
