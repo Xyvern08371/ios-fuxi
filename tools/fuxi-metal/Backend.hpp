@@ -925,7 +925,7 @@ public:
 #ifdef FUXI_MTL_HOST_TEST
   imageTransitions.clear();sampleViewUses.clear();
 #endif
-  auto locked=currentFrame?FrameClock::now():FrameClock::time_point{};if(currentFrame)currentFrame->leaseLock+=uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(locked-submitStart).count());
+  auto locked=currentFrame?FrameClock::now():FrameClock::time_point{};if(currentFrame){auto ns=uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(locked-submitStart).count());currentFrame->leaseLock+=ns;currentFrame->leaseBack+=ns;}
   if(prepare){prepare();if(currentFrame)locked=FrameClock::now();}
   auto *cpuTiming=systemTranslationPolicy().frameCPU && timing && !timing->cpuSampledSubmits?timing:nullptr;
   if(cpuTiming)++cpuTiming->cpuSampledSubmits;

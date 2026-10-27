@@ -58,6 +58,8 @@ struct FrameSample {
  uint64_t pipe=0,desc=0,record=0,kernelIO=0;
  uint64_t backendLockCPU=0,slotWaitCPU=0,pipeCPU=0,descCPU=0,recordCPU=0,flushCPU=0,kernelIOCPU=0,queueSubmitCPU=0;
  uint64_t wall=0,cpuBeforeCommit=0,shadowCopy=0,leaseLock=0,backendSubmit=0,gpuWait=0,gpuExec=0;
+ // lease_lock split: frontend lease vs backend lock/slot; exclusion wait vs kernel lock by role; surfaces by role.
+ uint64_t leaseFront=0,leaseBack=0,leaseExclWait=0,leaseLockWrite=0,leaseLockRead=0,leaseWrites=0,leaseReads=0;
  uint64_t inflight=0,completionLatency=0;
  uint64_t schedWait=0,commitCall=0,commitGap=0,admissionWait=0,snapshot=0,submitQueue=0;
  uint64_t backendLock=0,slotWait=0,flush=0,queueSubmit=0,retireQueue=0,retireLock=0,invalidate=0,retireHost=0,surfaceRelease=0,scheduledHandlers=0;
@@ -145,6 +147,9 @@ public:
  FrontendTimer &operator=(const FrontendTimer &)=delete;
 };
 // Only BackboardGate accesses this, under its existing reporter/completion lock.
+template<class Lease> inline void addLeaseTrace(FrameSample &t,const Lease &l,uint64_t frontNs){
+ t.leaseLock+=frontNs;t.leaseFront+=frontNs;t.leaseExclWait+=l.stats.waitNs;t.leaseLockWrite+=l.stats.lockNs[1];t.leaseLockRead+=l.stats.lockNs[0];t.leaseWrites+=l.stats.count[1];t.leaseReads+=l.stats.count[0];
+}
 class FrameTraceWindow {
  static constexpr size_t capacity=1024;
  std::array<FrameSample,capacity> samples{};
@@ -165,7 +170,7 @@ public:
   totals.cpuSampledSubmits+=s.cpuSampledSubmits;totals.cpuOmittedSubmits+=s.cpuOmittedSubmits;
   totals.textureShadowBytes+=s.textureShadowBytes;totals.textureRepitchedBytes+=s.textureRepitchedBytes;for(size_t i=0;i<totals.textureShadowUses.size();++i)totals.textureShadowUses[i]+=s.textureShadowUses[i];
   totals.snapshotBytes+=s.snapshotBytes;totals.shadowCopyBytes+=s.shadowCopyBytes;totals.shadowScannedIndices+=s.shadowScannedIndices;for(size_t i=0;i<totals.shadowFullReasons.size();++i)totals.shadowFullReasons[i]+=s.shadowFullReasons[i];
-  totals.frontendDrawSamples+=s.frontendDrawSamples;
+  totals.frontendDrawSamples+=s.frontendDrawSamples;totals.leaseWrites+=s.leaseWrites;totals.leaseReads+=s.leaseReads;
   totals.planHits+=s.planHits;totals.planMisses+=s.planMisses;
   totals.queueSubmits+=s.queueSubmits;totals.imageBarriers+=s.imageBarriers;totals.readBarriersSkipped+=s.readBarriersSkipped;totals.crossEncoderMerges+=s.crossEncoderMerges;
   totals.drainWaits+=s.drainWaits;totals.conflictWaits+=s.conflictWaits;totals.slotWaits+=s.slotWaits;
@@ -208,6 +213,8 @@ public:
   auto stage=[&](const char *name,uint64_t FrameSample::*field){fprintf(out," %s=%.3f/%.3f",name,p(field,50),p(field,90));};
   stage("sched_wait",&FrameSample::schedWait);stage("commit_call",&FrameSample::commitCall);stage("commit_gap",&FrameSample::commitGap);stage("admission_wait",&FrameSample::admissionWait);stage("snapshot",&FrameSample::snapshot);stage("submit_queue",&FrameSample::submitQueue);
   stage("backend_lock",&FrameSample::backendLock);stage("slot_wait",&FrameSample::slotWait);stage("flush",&FrameSample::flush);stage("queue_submit",&FrameSample::queueSubmit);stage("retire_queue",&FrameSample::retireQueue);stage("retire_lock",&FrameSample::retireLock);stage("invalidate",&FrameSample::invalidate);stage("retire_host",&FrameSample::retireHost);stage("surface_release",&FrameSample::surfaceRelease);stage("scheduled_handlers",&FrameSample::scheduledHandlers);
+  stage("lease_front",&FrameSample::leaseFront);stage("lease_back",&FrameSample::leaseBack);stage("lease_excl_wait",&FrameSample::leaseExclWait);stage("lease_lock_write",&FrameSample::leaseLockWrite);stage("lease_lock_read",&FrameSample::leaseLockRead);
+  fprintf(out," lease_surfaces/frame=write:%.2f,read:%.2f",totals.leaseWrites/n,totals.leaseReads/n);
   stage("prior_delivery",&FrameSample::priorDelivery);stage("prior_handlers",&FrameSample::priorHandlers);stage("prior_wait_completed",&FrameSample::priorWaitCompleted);
   stage("backend_cpu",&FrameSample::backendCPU);stage("frontend_cpu",&FrameSample::frontendCPU);stage("frontend_wall",&FrameSample::frontendWall);
   fprintf(out," frontend_draw_ns/frame=%.0f/%.0f frontend_draw_samples/frame=%.2f",double(percentile(&FrameSample::frontendDraw,50)),double(percentile(&FrameSample::frontendDraw,90)),totals.frontendDrawSamples/n);

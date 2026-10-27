@@ -497,6 +497,11 @@ FUXI MTL: frame trace n=100 samples=100 wall=12.000/25.000/80.000 ms cpu_before_
   `lease_lock`: surface lease acquisition plus backend mutex acquisition over
   all operation segments. Surface unlock and post-fence retirement contribute
   to wall but are not included in this pair.
+  Split (p50/p90 ms, not yet observed on device): `lease_front` is the frontend
+  lease, `lease_back` the backend mutex/slot/admission part, `lease_excl_wait`
+  the user-level exclusion wait inside `lease_front`, `lease_lock_write` and
+  `lease_lock_read` the IOSurfaceLock time for written vs sampled-only surfaces,
+  and `lease_surfaces/frame` the surface counts by role.
 - `backend_submit`: after acquiring the backend mutex through return from
   `vkQueueSubmit`, including validation, flush, allocation, translation,
   recording and descriptor work. `gpu_wait`: time inside `vkWaitForFences`.

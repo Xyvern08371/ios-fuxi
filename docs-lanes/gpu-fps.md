@@ -43,10 +43,15 @@ clears, transfers, and GPU idle time between the two GPU timestamps.
   cache maintenance can delay the next submit. The synchronous event-segment
   path still waits under the mutex. Signals/waits split a Metal command into
   synchronous segments; only its final segment gets deferred retirement.
-* All referenced IOSurfaces receive an exclusive `SurfaceLease` in overlap
-  mode, including sampled surfaces. Reusing any surface can wait for the
-  preceding flight's lease release, even for two readers. Removing that
-  exclusion requires a separate read/write lease and kernel ownership design.
+* Every referenced IOSurface is leased. Surfaces whose textures were only
+  sampled by draws take a read lease: a shared user-level hold (readers do not
+  block readers, writers wait for readers and writers) and a ReadOnly
+  IOSurfaceLock, which skips the kernel writer count and never sleeps behind a
+  scanout copy. Any other use (target, blit, useResource, unmarked) is a
+  writer: exclusive, kernel writer lock that waits for the scanout
+  copy/present of that surface. The lease no longer holds its mutex across the
+  kernel lock, so retirement can release other leases meanwhile. Device effect
+  not yet observed; `lease_front/back/excl_wait/lock_write/lock_read` split it.
 * Scheduled handlers run inline on the submit queue. Completed handlers run
   on a separate serial delivery queue, possibly targeted at CA's supplied
   completion queue. `presentDrawable*` is a completed handler: it presents only

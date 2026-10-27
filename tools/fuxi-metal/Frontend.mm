@@ -55,9 +55,9 @@ static dispatch_queue_t pipelineCompilationQueue() {
  static dispatch_queue_t queue=dispatch_queue_create("org.fuxi.metal.pipelines",DISPATCH_QUEUE_SERIAL);return queue;
 }
 
-static int lockScanoutSurface(uintptr_t p) {return fuxi::frameKernelCall([&]{return IOSurfaceLock((IOSurfaceRef)p,0,nullptr);});}
-static int lockScanoutPendingSurface(uintptr_t p) {return fuxi::frameKernelCall([&]{return IOSurfaceLock((IOSurfaceRef)p,kIOSurfaceLockAvoidSync,nullptr);});}
-static void unlockScanoutSurface(uintptr_t p) {fuxi::frameKernelCall([&]{(void)IOSurfaceUnlock((IOSurfaceRef)p,0,nullptr);});}
+static int lockScanoutSurface(uintptr_t p,bool write) {return fuxi::frameKernelCall([&]{return IOSurfaceLock((IOSurfaceRef)p,write?0:kIOSurfaceLockReadOnly,nullptr);});}
+static int lockScanoutPendingSurface(uintptr_t p,bool) {return fuxi::frameKernelCall([&]{return IOSurfaceLock((IOSurfaceRef)p,kIOSurfaceLockAvoidSync,nullptr);});}
+static void unlockScanoutSurface(uintptr_t p,bool write) {fuxi::frameKernelCall([&]{(void)IOSurfaceUnlock((IOSurfaceRef)p,write?0:kIOSurfaceLockReadOnly,nullptr);});}
 static fuxi::MetalBackend selectedBackend=fuxi::MetalBackend::fuxi;
 #ifndef FUXI_MTL_BOOTARGS
 #define FUXI_MTL_BOOTARGS(out,size) fuxi::systemString("kern.bootargs",out,size)
@@ -915,7 +915,7 @@ static thread_local FuxiCommandBuffer *completionCommand;
  std::function<void()> _retirement;std::shared_ptr<fuxi::SurfaceLease> _lease,_pendingLease;
  struct ShadowUse {FuxiBuffer *buffer;fuxi::ShadowRanges ranges;uint32_t textureUses=0;ShadowUse(FuxiBuffer *b):buffer(b),ranges(b->_wrappedLength){}};
  std::unordered_map<fuxi::Buffer *,ShadowUse> _shadowUses;fuxi::ShadowSnapshot _shadows;
- std::unordered_set<void *> _resourceSet;fuxi::CommandResourceCache _resourceCache;
+ std::unordered_set<void *> _resourceSet,_sampledRes,_otherRes;fuxi::CommandResourceCache _resourceCache;
  fuxi::FrontendTimes _frontendTimes;
  BOOL _frameTrace;fuxi::FrameClock::time_point _traceCreated;fuxi::FrameCounts _traceCounts;std::thread::id _traceThread;
  fuxi::UploadRing<FuxiBuffer *> _uploads;
@@ -930,18 +930,29 @@ static thread_local FuxiCommandBuffer *completionCommand;
 @end
 // Preserve first-use ordering and command-buffer ownership, retaining each
 // object once. Commit shadow refresh/scanout leasing then visits each once too.
-static void retainCommandResource(FuxiCommandBuffer *command,id resource,bool bounded=false,fuxi::ShadowFullReason reason=fuxi::ShadowFullReason::other){
+static void retainCommandResource(FuxiCommandBuffer *command,id resource,bool bounded=false,fuxi::ShadowFullReason reason=fuxi::ShadowFullReason::other,bool sampledOnly=false){
+ if(gpuScanout && resource)(sampledOnly?command->_sampledRes:command->_otherRes).insert((void *)resource); // Role per resource; unmarked means writer.
  if(command->_resourceCache.seen((void *)resource,bounded,reason))return;
  FuxiBuffer *buffer=nil;if([resource isKindOfClass:[FuxiBuffer class]])buffer=resource;else if([resource isKindOfClass:[FuxiTexture class]])buffer=[(FuxiTexture *)resource buffer];
  if(buffer && buffer->_shadow){auto &use=command->_shadowUses.try_emplace(buffer->_buffer,buffer).first->second;if(!bounded)use.ranges.full(reason);if(!bounded && [resource isKindOfClass:[FuxiTexture class]])use.textureUses|=4;}
  if(resource && command->_resourceSet.insert((void *)resource).second)[command->_resources addObject:resource];
 }
 static void retainCommandTexture(FuxiCommandBuffer *command,FuxiTexture *texture,bool sampled){
- retainCommandResource(command,texture,true);FuxiBuffer *buffer=(FuxiBuffer *)[texture buffer];if(!buffer || !buffer->_shadow)return;
+ retainCommandResource(command,texture,true,fuxi::ShadowFullReason::other,sampled);FuxiBuffer *buffer=(FuxiBuffer *)[texture buffer];if(!buffer || !buffer->_shadow)return;
  auto &use=command->_shadowUses.at(buffer->_buffer);use.textureUses|=sampled?1:2;
  if(sampled && [texture usage]==MTLTextureUsageShaderRead && [texture mipmapLevelCount]==1 && [texture textureType]==MTLTextureType2D)
   use.ranges.texture([texture bufferOffset],[texture bufferBytesPerRow],[texture width],[texture height],fuxi::Backend::texelBytes((uint32_t)[texture pixelFormat]));
  else use.ranges.full();
+}
+// IOSurfaces this command touches, sorted. A surface is a reader only when every texture on it was solely sampled by draws.
+static std::vector<std::pair<uintptr_t,bool>> commandSurfaces(FuxiCommandBuffer *command){
+ std::vector<std::pair<uintptr_t,bool>> out;
+ for(id r in command->_resources){if(![r isKindOfClass:[FuxiTexture class]])continue;
+  uintptr_t surface=(uintptr_t)[(FuxiTexture *)r iosurface];if(!surface)continue;
+  bool write=!command->_sampledRes.count((void *)r) || command->_otherRes.count((void *)r);out.push_back({surface,write});}
+ std::sort(out.begin(),out.end());
+ size_t n=0;for(size_t i=0;i<out.size();++i){if(n && out[n-1].first==out[i].first)out[n-1].second|=out[i].second;else out[n++]=out[i];}
+ out.resize(n);return out;
 }
 static void trackShadowDraw(FuxiCommandBuffer *command,const fuxi::Operation &op,fuxi::ShadowIndexCache &cache,uint64_t &scanned){
  fuxi::ShadowIndexRange indices;bool inspected=false;
@@ -1317,9 +1328,8 @@ static NSString *renderPassText(MTLRenderPassDescriptor *d){
  if(gpuScanout)backend->requireLive();
  auto leaseStart=_frameTrace?fuxi::FrameClock::now():fuxi::FrameClock::time_point{};
  fuxi::SurfaceLease lease(gpuScanout,lockScanoutSurface,unlockScanoutSurface,&backend->poisoned);
- if(gpuScanout)for(id resource in _resources)if([resource isKindOfClass:[FuxiTexture class]])
-  lease.add((uintptr_t)[(FuxiTexture *)resource iosurface]);
- if(_frameTrace)trace.leaseLock+=fuxi::frameNanos(leaseStart);
+ if(gpuScanout)for(auto &entry:commandSurfaces(self))lease.add(entry.first,entry.second);
+ if(_frameTrace)fuxi::addLeaseTrace(trace,lease,fuxi::frameNanos(leaseStart));
  auto shadowStart=std::chrono::steady_clock::now();
  prepareCommandShadows(self,_frameTrace?&trace:nullptr);if(_frameTrace)trace.snapshotBytes+=_shadows.bytes();uint64_t shadowBytes=refreshCommandShadows(self);if(_frameTrace)trace.shadowCopyBytes+=shadowBytes;
  auto shadowNanos=fuxi::frameNanos(shadowStart);fuxi::Backend::shadowCopyNanos+=shadowNanos;if(_frameTrace)trace.shadowCopy+=shadowNanos;
@@ -1364,7 +1374,7 @@ static NSString *renderPassText(MTLRenderPassDescriptor *d){
   for(MTLCommandBufferHandler handler in scheduled)handler((id)self);[scheduled release];}
  NSArray *handlers=[_handlers copy];[_handlers removeAllObjects];
  [self deliverCompletedHandlers:handlers];
- [handlers release];[_scheduledHandlers removeAllObjects];[_resources removeAllObjects];_resourceCache.clear();_resourceSet.clear();_queue->_operationStorage.release(_ops);_uploads.release(_queue->_uploadStorage,owner(_queue->_device)->backend && !owner(_queue->_device)->backend->poisoned,[](FuxiBuffer *b){[b release];});_events.clear();_shadowUses.clear();
+ [handlers release];[_scheduledHandlers removeAllObjects];[_resources removeAllObjects];_resourceCache.clear();_resourceSet.clear();_sampledRes.clear();_otherRes.clear();_queue->_operationStorage.release(_ops);_uploads.release(_queue->_uploadStorage,owner(_queue->_device)->backend && !owner(_queue->_device)->backend->poisoned,[](FuxiBuffer *b){[b release];});_events.clear();_shadowUses.clear();
 }
 - (void)commit {CENSUS();
  if(!_overlap){[self commitSynchronous];return;}
@@ -1388,7 +1398,7 @@ static NSString *renderPassText(MTLRenderPassDescriptor *d){
  auto snapshotStart=_frameTrace?fuxi::FrameClock::now():fuxi::FrameClock::time_point{};
  try{if(_earlySubmit){auto *backend=owner(_queue->_device)->backend;backend->requireLive();
    _pendingLease=std::make_shared<fuxi::SurfaceLease>(true,lockScanoutPendingSurface,unlockScanoutSurface,&backend->poisoned);
-   for(id r in _resources)if([r isKindOfClass:[FuxiTexture class]])_pendingLease->add((uintptr_t)[(FuxiTexture *)r iosurface]);
+   for(auto &entry:commandSurfaces(self))if(entry.second)_pendingLease->add(entry.first); // Sampled-only surfaces need no producer reservation.
   }
   prepareCommandShadows(self,_frameTrace?&_flightTrace:nullptr);for(auto &entry:_shadowUses){auto &use=entry.second;_shadows.add(use.buffer->_buffer->contents,use.buffer->_wrapped,use.ranges);}
   _shadows.capture(_queue->_shadowPool);if(_frameTrace)_flightTrace.snapshotBytes+=_shadows.bytes();
@@ -1419,10 +1429,8 @@ static NSString *renderPassText(MTLRenderPassDescriptor *d){
   if(gpuScanout)backend->requireLive();
   auto leaseStart=fuxi::FrameClock::now();
   _lease=std::make_shared<fuxi::SurfaceLease>(gpuScanout,lockScanoutSurface,unlockScanoutSurface,&backend->poisoned,_overlap);
-  std::vector<uintptr_t> surfaces;
-  if(gpuScanout)for(id r in _resources)if([r isKindOfClass:[FuxiTexture class]])surfaces.push_back((uintptr_t)[(FuxiTexture *)r iosurface]);
-  std::sort(surfaces.begin(),surfaces.end());for(auto surface:surfaces)_lease->add(surface);
-  if(_frameTrace)_flightTrace.leaseLock+=fuxi::frameNanos(leaseStart);
+  if(gpuScanout)for(auto &entry:commandSurfaces(self))_lease->add(entry.first,entry.second);
+  if(_frameTrace)fuxi::addLeaseTrace(_flightTrace,*_lease,fuxi::frameNanos(leaseStart));
   auto refresh=[&]{auto start=fuxi::FrameClock::now();
    uint64_t bytes=_overlap?_shadows.apply(_queue->_shadowPool):refreshCommandShadows(self);if(_frameTrace)_flightTrace.shadowCopyBytes+=bytes;
    auto ns=fuxi::frameNanos(start);fuxi::Backend::shadowCopyNanos+=ns;if(_frameTrace)_flightTrace.shadowCopy+=ns;
@@ -1484,7 +1492,7 @@ static NSString *renderPassText(MTLRenderPassDescriptor *d){
  }
  @synchronized(self){_finished=YES;if(_status!=MTLCommandBufferStatusError)_status=MTLCommandBufferStatusCompleted;
   NSArray *handlers=[_handlers copy];[_handlers removeAllObjects];[self deliverCompletedHandlers:handlers];[handlers release];}
- @synchronized(self){[_scheduledHandlers removeAllObjects];}[_resources removeAllObjects];_resourceCache.clear();_resourceSet.clear();_queue->_operationStorage.release(_ops);_uploads.release(_queue->_uploadStorage,owner(_queue->_device)->backend && !owner(_queue->_device)->backend->poisoned,[](FuxiBuffer *b){[b release];});_events.clear();_shadows.release(_queue->_shadowPool);_shadowUses.clear();
+ @synchronized(self){[_scheduledHandlers removeAllObjects];}[_resources removeAllObjects];_resourceCache.clear();_resourceSet.clear();_sampledRes.clear();_otherRes.clear();_queue->_operationStorage.release(_ops);_uploads.release(_queue->_uploadStorage,owner(_queue->_device)->backend && !owner(_queue->_device)->backend->poisoned,[](FuxiBuffer *b){[b release];});_events.clear();_shadows.release(_queue->_shadowPool);_shadowUses.clear();
  if(_overlap)dispatch_group_leave(_completionGroup);
 }
 - (void)waitUntilCompleted {CENSUS();if(completionCommand!=self){auto start=_frameTrace?fuxi::FrameClock::now():fuxi::FrameClock::time_point{};dispatch_group_wait(_completionGroup,DISPATCH_TIME_FOREVER);if(_frameTrace)_queue->_traceWaitCompleted=std::max<uint64_t>(1,fuxi::frameNanos(start));}}
