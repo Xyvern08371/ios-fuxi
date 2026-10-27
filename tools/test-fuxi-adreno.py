@@ -34,7 +34,8 @@ static unsigned fg_client_busy, fg_scanout_owned, fg_scanout_writable, fg_scanou
 static unsigned fg_scanout_double_active,fg_scanout_front,fg_scanout_back_ready,fg_scanout_ready_drops,fg_scanout_triple_requested,fg_scanout_ready,fg_scanout_copy;
 static uintptr_t fg_scanout_source;
 static unsigned fg_scanout_pitch,fg_scanout_sx,fg_scanout_sy,fg_scanout_dx,fg_scanout_dy,fg_scanout_w,fg_scanout_h;
-static unsigned scanoutStops,verifyBad;
+static unsigned scanoutStops,verifyBad,dcvsKicks;
+static void fg_dcvs_kick(void) {dcvsKicks++;}
 static int fg_scanout_verify(void) {return !verifyBad;}
 static int fg_scanout_stop(const char *reason) {(void)reason;scanoutStops++;fg_scanout_writable=0;return -1;}
 #include <stdint.h>

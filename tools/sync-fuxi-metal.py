@@ -20,6 +20,7 @@ FILES = {
     'bsd/dev/fuxi_gpu_scanout.inc': 'fuxi_gpu_scanout.inc',
     'bsd/dev/LICENSE.NativeMetal': 'LICENSE.NativeMetal',
     'bsd/dev/fuxi_gpu_abi_backend.inc': 'fuxi_gpu_abi_backend.inc',
+    'bsd/dev/fuxi_gpu_dcvs.h': 'fuxi_gpu_dcvs.h',
     'osfmk/arm/fuxi_adreno_host.c': 'fuxi_adreno_host.c',
 }
 for folder in ('bsd/dev', 'iokit/Kernel/arm'):

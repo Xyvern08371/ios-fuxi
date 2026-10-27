@@ -102,6 +102,7 @@ int main() {
 '''
 BACKEND_PREFIX = r'''
 static unsigned fg_scanout_reserved,fg_scanout_owned,scanoutStops;
+static unsigned dcvsKicks;static void fg_dcvs_kick(void) {dcvsKicks++;}
 static int fg_scanout_stop(const char *reason) {(void)reason;scanoutStops++;return -1;}
 #include <assert.h>
 #include <stdint.h>

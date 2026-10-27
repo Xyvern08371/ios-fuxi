@@ -313,3 +313,53 @@ For a separately authorized device session:
    Confirm invalid `fuxigpulevel=9` logs rejection and selects legacy level 0;
    DDR 9 must be rejected and retain the selected level's bandwidth default;
    evaluate thermal and performance limits before considering any default change.
+
+## Opt-in idle governor (`fuxigpulevel` bit 4)
+
+2026-10-27. Offline only: host-tested by `tools/test-fuxi-gpu-dcvs.py`; **not yet
+observed on the device** (frequency, heat, frame time).
+
+Idea after UniXNU-sheng `package/GpuPowerProbe.cpp` (BSD-2-Clause-Patent; its
+GMU-busy governor votes a level plus that level's bandwidth over HFI
+GX_BW_PERF_VOTE, with an idle floor and a wake boost). Source revision read:
+UniXNU-sheng working tree under the local research mirror, no commit recorded
+there; UniXNU-sm8550-common `ShengGmuPerfVote` pairs each OPP with the
+bandwidth row of its `opp-peak-kBps`, which our `g_gpu_bw_index` already does.
+No code was copied; `xnu/fuxi-adreno/fuxi_gpu_dcvs.h` is our own policy.
+
+What we were missing: the boot level was the only vote for the whole session,
+so GX held the rail voltage and the DDR row of the chosen level even with the
+screen static (`GPU_SET` is held; no idle collapse). The governor makes the
+boot level a **cap**:
+
+- `fuxigpulevel=L|0x10|(H<<8)`: L = 2..8 (the existing level and DDR rule),
+  `0x10` enables it, H is the idle hold in 10 ms units (0 means 10, 100 ms).
+  Example: `fuxigpulevel=0x16` = cap level 6, hold 100 ms. No new boot arg.
+- Both ring doorbells (scanout copy submit, ABI client submit) call
+  `fg_dcvs_kick()`. At the floor that queues one thread call, which votes the
+  cap (`GX_BW_PERF_VOTE {0,1,L,bw row}`) and arms a timer for the hold.
+- When the hold ends with no doorbell the worker votes level 1 (220 MHz, the
+  2.1 GB/s row, lowest ARC level) and **stops**: no timer, no polling at the
+  floor. The vote can never exceed the cap, so it cannot add heat over the
+  fixed policy.
+- Failed vote: the cap stays (down fails) or the floor stays until the next
+  doorbell (up fails). Eight failures in a row disable the governor and try to
+  put the cap back. Boot HFI record e[56..59] is preserved across votes.
+- Cost of the idea, to measure: the first work after an idle gap can start at
+  220 MHz for the HFI round trip before the cap lands (a doorbell is the only
+  trigger; there is no input pre-wake yet).
+
+Log lines (new): `FUXI GPU DCVS: cap level L floor 1 hold N ms (not yet
+observed)`, then at power-of-two change counts `level X cap L ups U downs D
+fails F floor_ms M`, `vote level X failed, HFI err`, and `disabled after N
+failed votes`.
+
+Device test: add `0x16` style value to the existing `fuxigpulevel` (keep
+`fuxigpuddr` as is), compare `floor_ms` share against `FUXI PERF` temperatures
+and `FUXI MTL: frame trace` gpu_exec/wall p50/p90 with the J163 baseline. Stop
+and drop the bit if wall p90 worsens or any `vote ... failed` appears.
+
+Not ported (no evidence they help at 60 fps, and they trade latency for heat
+without a way to measure): the load-based 50 % busy step-up/step-down and the
+GMU XO busy counter (`0x1f844`), the 2x-clock/578 MHz wake boost, and the
+touch top-level hold. Our cap is already the level the user chose.

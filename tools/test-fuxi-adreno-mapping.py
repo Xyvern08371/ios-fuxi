@@ -54,6 +54,12 @@ typedef struct { void (*func)(void *,void *); } thread_call_data_t;
 #define THREAD_CALL_PRIORITY_KERNEL 1
 #define THREAD_CALL_OPTIONS_ONCE 1
 #define NSEC_PER_SEC 1000000000u
+#define NSEC_PER_MSEC 1000000u
+static unsigned fg_dcvs_on, fg_dcvs_cap, fg_dcvs_hold_ms, dcvs_starts;
+static uint64_t fg_dcvs_hold;
+static void fg_dcvs_start(void) {dcvs_starts++;}
+static void __attribute__((unused)) dcvs_use(void) {uint64_t r;(void)fgd_want(0,0,0,0,&r);}
+static void nanoseconds_to_absolutetime(uint64_t ns, uint64_t *t) {*t=ns;}
 #define kSuccess 0
 typedef int DTEntry;
 static uint64_t fg_faults;
@@ -319,7 +325,7 @@ def main():
     functions += 'static thread_call_data_t fg_init_call;\n#define G_PTR(pa) fg_pointer(pa)\n#define G_PTR_RANGE(pa, bytes) fg_pointer_range(pa, bytes)\n'
     functions += ''.join(submit.function(adapter, n) for n in ('fg_thread', 'fuxi_gpu_start'))
     handoff = (ROOT / 'shim/fuxi-probe/gpu-handoff.h').read_text()
-    clock = (ROOT / 'shim/fuxi-probe/gpu-clock.h').read_text()
+    clock = (ROOT / 'shim/fuxi-probe/gpu-clock.h').read_text() + (ROOT / 'xnu/fuxi-adreno/fuxi_gpu_dcvs.h').read_text()
     with tempfile.TemporaryDirectory() as d:
         path = Path(d) / 'mapping.c'
         path.write_text('#include <stdint.h>\n' + handoff + clock + PREFIX + declarations + functions + MODEL)

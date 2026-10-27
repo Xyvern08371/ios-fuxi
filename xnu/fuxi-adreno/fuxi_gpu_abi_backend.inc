@@ -445,6 +445,7 @@ static int fg_abi_submit_locked(const uint64_t *iovas, const uint64_t *sizes,
  __asm__ volatile("dsb sy" ::: "memory");
  fg_client_deadline=rsr("cntpct_el0")+rsr("cntfrq_el0")/10;
  fg_client_busy=1;
+ fg_dcvs_kick();
  if (!g3_gw(0x807,g3_wptr) || fg_access_failed) return fg_abi_fault("client doorbell");
  *fence=++fg_abi_seq;
  uint64_t deadline;

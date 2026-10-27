@@ -448,3 +448,51 @@ in the first 90 s of boot, during the shader-compile burst at 50-64 C. Some
 were one log line apart: the rise latch toggled the level between nominal and
 moderate. Rises still publish at once. A fall now waits until the level has
 held for 10 s (`fp_pressure_hold`). GUESS: fewer notify wake-ups for iOS clients.
+
+## UniXNU SM8550 comparison (2026-10-27, offline)
+
+Read: UniXNU-sm8550-common (`dts/sm8550.dtsi`, `patches/xnu/*.patch`,
+`configs`), ArmCpu, UniXNU `docs/porting/{platform,power}.md` and UniXNU-sheng
+(`dts/sheng.dts`, `patches/xnu/zzye|zzyf`, `package/{CpuFreqProbe,GpuPowerProbe}.cpp`).
+All BSD-2-Clause-Patent; nothing copied here, differences only.
+
+**Core count.** Their tree boots all eight cores because their UEFI keeps no
+monitor on any of them. Ours runs 7: the missing one is **MPIDR 0x100 (cpu1,
+Cortex-A510)**, which hosts the loader's USB monitor (`tools/mkadt-fuxi.py`
+drops `cpus.children[1]`; `SWEET_SMP_MAX_CPUS 7`). **cpu7, the X3 prime core
+at MPIDR 0x700, does start**: J163 boot.log has `SWEET CPU: cpu=6 CPU_ON
+target=0x700 ... PSCI CPU_ON rc=0 ... mpidr=0x700 came alive; SGI1 OK`, and
+`FUXI PERF` reports prime at 1708 MHz under the load. The NOTES guess
+"cpu7 is never started (cpus=7 -> cpu0-6)" is wrong: logical 6 is cpu7. Getting the
+eighth core means retiring the USB monitor on cpu@100 first (GUESS: PSCI CPU_ON
+on a core the loader still runs would fail or collide), so it is not enabled;
+it is a loader change, not an ADT or PSCI one. Their PSCI path
+is identical to ours (SMC, CPU_ON by MPIDR, GICv3 redistributor stride 0x40000).
+
+**MPIDR to cpu number.** Their `start.s` patch widens the mask to
+`0xFFFF` because SM8550 numbers cores in Aff1; ours maps via the ADT `reg`
+(logical IDs in DT order, `SweetCPU`), which already works for 0x200..0x700.
+
+**Clusters.** Their ADT tags A510 as `E` and cpu3..cpu7 as `P`, builds with
+`__ARM_AMP__`, `MAX_CPU_CLUSTERS 2`, and runs the Edge scheduler with a patch
+that keeps UI buckets on P and lets idle P cores steal E work. We keep one
+homogeneous cluster (`cluster-type 0`) and the `fuxicores=0x7c` recommendation
+mask, which keeps normal threads off the A510s. Equivalent intent; theirs also
+lets the scheduler use E cores for background load and place by cluster
+load. Not ported: it changes scheduler topology on an XNU we cannot build or
+test offline, and we have no AMP perf controller either.
+
+**Frequency governors.** Theirs (CPU: per-CPU idle time every 16 ms, 1.25
+margin, 4-window step-down; touch holds P domains at top for 1 s; GPU frames
+keep CPUs at 60 % of top for 300 ms) has **no thermal guard** and reaches
+2.8/2.96 GHz. Ours (`fuxi-perf`) is event driven with the cool caps
+(gold 1.4, prime 1.36 GHz), duty budget and the 62/68 C cuts; nothing in theirs
+beats it for the stated goal, so the CPU policy is unchanged. The one idea kept
+is on the GPU side, see `gpu-clock.md` (idle governor).
+
+**Not comparable offline.** The SM8550 DTS in their repo carries CPU nodes, PSCI,
+GIC, UFS, GPU/GMU/SMMU only: no OPP tables, interconnect, thermal zones or
+reserved memory (those come from the pinned sm8550-mainline checkout, which is
+not in the mirror). GPU registers match what we already use (`3d00000`,
+`gmu 3d6a000`, `gpu_smmu 3da0000`, `adreno-43050a01`); the 220..680 MHz OPPs and
+bandwidth rows were already ported in `gpu-clock.h`.

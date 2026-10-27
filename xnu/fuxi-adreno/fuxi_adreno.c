@@ -20,6 +20,7 @@
 #undef MACH_KERNEL_PRIVATE
 #include <kern/kern_types.h>
 #include "fuxi_adreno.h"
+#include "fuxi_gpu_dcvs.h"
 #include "gpu-handoff.h"
 #include <IOKit/IOLocks.h>
 #include "fuxi_gpu_abi.h"
@@ -474,6 +475,82 @@ static int fg_abi_live_for_scanout(void);
 #include "fuxi_gpu_scanout.inc"
 static int fg_abi_init(void);
 static thread_call_data_t fg_init_call;
+/* fuxigpulevel bit 4: governor. The boot level is the cap, so this can only
+ * lower the vote; the doorbell paths call fg_dcvs_kick(), nothing polls at the
+ * floor. Votes reuse the proven GX_BW_PERF_VOTE through the HFI queue; one
+ * thread call owns it after startup. Not yet observed on the device. */
+static thread_call_data_t fg_dcvs_call;
+static unsigned fg_dcvs_on, fg_dcvs_cap, fg_dcvs_level, fg_dcvs_hold_ms;
+static uint64_t fg_dcvs_last, fg_dcvs_hold, fg_dcvs_floor_since;
+static uint64_t fg_dcvs_floor_ns, fg_dcvs_ups, fg_dcvs_downs, fg_dcvs_fails;
+static unsigned fg_dcvs_streak;
+static void fg_dcvs_kick(void)
+{
+ if (!fg_dcvs_on) return;
+ __atomic_store_n(&fg_dcvs_last, mach_absolute_time(), __ATOMIC_RELEASE);
+ unsigned have = __atomic_load_n(&fg_dcvs_level, __ATOMIC_ACQUIRE); /* 0 until the call is set up */
+ if (have && have != fg_dcvs_cap) (void)thread_call_enter(&fg_dcvs_call);
+}
+static int fg_dcvs_vote(unsigned level)
+{
+ if (!fuxi_gpu_ready() || fg_access_failed) return 0x9ff;
+ uint32_t keep[4], vote[4] = {0,1,level,g_gpu_bw_index(level)};
+ for (unsigned i = 0; i < 4; i++) keep[i] = gpu_extra[0][56+i];
+ int err = g_hfi_send(30, vote, 4, 4);
+ for (unsigned i = 0; i < 4; i++) gpu_extra[0][56+i] = keep[i]; /* boot GX vote record */
+ return err;
+}
+static void fg_dcvs_worker(thread_call_param_t a, thread_call_param_t b)
+{
+ (void)a; (void)b;
+ uint64_t now = mach_absolute_time(), rearm, ns;
+ unsigned have = __atomic_load_n(&fg_dcvs_level, __ATOMIC_ACQUIRE);
+ unsigned want = fgd_want(now, __atomic_load_n(&fg_dcvs_last, __ATOMIC_ACQUIRE), fg_dcvs_hold, fg_dcvs_cap, &rearm);
+ if (want != have) {
+  int err = fg_dcvs_vote(want);
+  if (!err) {
+   if (want == FGD_FLOOR) { fg_dcvs_floor_since = now; fg_dcvs_downs++; }
+   else { absolutetime_to_nanoseconds(now-fg_dcvs_floor_since, &ns); fg_dcvs_floor_ns += ns; fg_dcvs_ups++; }
+   __atomic_store_n(&fg_dcvs_level, want, __ATOMIC_RELEASE);
+   fg_dcvs_streak = 0;
+   have = want;
+   unsigned n = (unsigned)(fg_dcvs_ups+fg_dcvs_downs);
+   if (!(n & (n-1)))
+    printf("FUXI GPU DCVS: level %u cap %u ups %llu downs %llu fails %llu floor_ms %llu\n",
+        want,fg_dcvs_cap,fg_dcvs_ups,fg_dcvs_downs,fg_dcvs_fails,fg_dcvs_floor_ns/1000000);
+  } else {
+   fg_dcvs_fails++;
+   if (!(fg_dcvs_fails & (fg_dcvs_fails-1)))
+    printf("FUXI GPU DCVS: vote level %u failed, HFI err %#x, fails %llu\n",want,err,fg_dcvs_fails);
+   /* Eight failures in a row: stop governing and put the cap back if possible. */
+   if (++fg_dcvs_streak >= 8) {
+    fg_dcvs_on = 0;
+    if (have != fg_dcvs_cap && !fg_dcvs_vote(fg_dcvs_cap)) __atomic_store_n(&fg_dcvs_level, fg_dcvs_cap, __ATOMIC_RELEASE);
+    printf("FUXI GPU DCVS: disabled after %u failed votes, level %u\n",fg_dcvs_streak,fg_dcvs_level);
+    return;
+   }
+  }
+ }
+ /* At the cap a timer runs until the hold ends; a failed vote retries after a
+  * hold or on the next doorbell, never in a loop. At the floor nothing runs. */
+ if (have != FGD_FLOOR) {
+  if (!rearm) rearm = fg_dcvs_hold;
+  uint64_t deadline = now + rearm;
+  (void)thread_call_enter_delayed(&fg_dcvs_call, deadline);
+ }
+}
+static void fg_dcvs_start(void)
+{
+ if (!fg_dcvs_on) return;
+ thread_call_setup_with_options(&fg_dcvs_call, fg_dcvs_worker, NULL,
+     THREAD_CALL_PRIORITY_KERNEL, THREAD_CALL_OPTIONS_ONCE);
+ __atomic_store_n(&fg_dcvs_last, mach_absolute_time(), __ATOMIC_RELEASE);
+ __atomic_store_n(&fg_dcvs_level, fg_dcvs_cap, __ATOMIC_RELEASE);
+ uint64_t deadline = mach_absolute_time() + fg_dcvs_hold;
+ (void)thread_call_enter_delayed(&fg_dcvs_call, deadline);
+ printf("FUXI GPU DCVS: cap level %u floor %u hold %u ms (not yet observed)\n",
+     fg_dcvs_cap,FGD_FLOOR,fg_dcvs_hold_ms);
+}
 static void fg_thread(thread_call_param_t arg, thread_call_param_t result)
 {
  (void)arg; (void)result;
@@ -535,6 +612,7 @@ static void fg_thread(thread_call_param_t arg, thread_call_param_t result)
  if (fg_abi_enabled && !publish_abi)
   printf("FUXI GPU ABI: initialization failed, service withheld\n");
  __atomic_store_n(&fg_state, 1, __ATOMIC_RELEASE);
+ fg_dcvs_start();
  if (publish_abi) fuxi_gpu_abi_publish();
  out: return;
 }
@@ -546,6 +624,12 @@ void fuxi_gpu_start(uint64_t fb, unsigned width, unsigned height, unsigned pitch
  fg_started = 1; fg_limit = 17;
  uint64_t requested_level = 0;
  (void)PE_parse_boot_argn("fuxigpulevel", &requested_level, sizeof(requested_level));
+ unsigned dcvs_hold_ms = 0;
+ fg_dcvs_on = fgd_decode(requested_level, G_GPU_LEVEL_MAX, &requested_level, &fg_dcvs_cap, &dcvs_hold_ms);
+ if (fg_dcvs_on) {
+  fg_dcvs_hold_ms = dcvs_hold_ms;
+  nanoseconds_to_absolutetime((uint64_t)dcvs_hold_ms*NSEC_PER_MSEC, &fg_dcvs_hold);
+ }
  g_gpu_selected = g_gpu_select(requested_level);
  if (requested_level > G_GPU_LEVEL_MAX)
   printf("FUXI GPU CLOCK: rejected fuxigpulevel=%llu (allowed 0..%u); legacy level=0\n", requested_level, G_GPU_LEVEL_MAX);
@@ -687,6 +771,7 @@ int fuxi_gpu_copy(unsigned slot, uint64_t generation, uintptr_t source, uint64_t
  g3_wptr &= 8191;
  __asm__ volatile("dsb sy" ::: "memory");
  fg_deadline = rsr("cntpct_el0") + rsr("cntfrq_el0")/10; /* six ticks */
+ fg_dcvs_kick();
  if (!g3_gw(0x807, g3_wptr)) err = 0x602;
  if (fg_force == 2) err = 0x6ff;
  t->submit += mach_absolute_time()-start;
