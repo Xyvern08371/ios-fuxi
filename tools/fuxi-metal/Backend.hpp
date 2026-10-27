@@ -1410,7 +1410,7 @@ public:
     uint32_t binding{},type{};VkDescriptorImageInfo image{};VkDescriptorBufferInfo buffer{};
     bool operator==(const BindingValue &b) const {return binding==b.binding && type==b.type && image.sampler==b.image.sampler && image.imageView==b.image.imageView && image.imageLayout==b.image.imageLayout && buffer.buffer==b.buffer.buffer && buffer.offset==b.buffer.offset && buffer.range==b.buffer.range;}
    };
-   struct BoundSet {VkDescriptorSetLayout layout;unsigned count;std::array<BindingValue,16> bindings;VkDescriptorSet set;};
+   struct BoundSet {VkDescriptorSetLayout layout;unsigned count;uint64_t hash;std::array<BindingValue,16> bindings;VkDescriptorSet set;};
    std::vector<BoundSet> boundSets;if(systemTranslationPolicy().submitFast)boundSets.reserve(std::min<size_t>(ops.size(),256));
    auto copyShadow=[&](Texture *t){
     VkBufferImageCopy region{};region.bufferOffset=t->backingOffset;region.bufferRowLength=t->backingRow/texelBytes(t->format);
@@ -1535,7 +1535,7 @@ public:
         VkImageViewCreateInfo vi{};vi.sType=VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;vi.image=t->image;vi.viewType=viewTypeFor(t->textureType);vi.format=(VkFormat)d.format;vi.components={(VkComponentSwizzle)d.components[0],(VkComponentSwizzle)d.components[1],(VkComponentSwizzle)d.components[2],(VkComponentSwizzle)d.components[3]};uint32_t base=op.sampleBase[d.slot],count=op.sampleCount[d.slot]?op.sampleCount[d.slot]:t->levels-base;vi.subresourceRange={VK_IMAGE_ASPECT_COLOR_BIT,base,count,0,1};
         VkImageView view{};
         {Measure measure{objectNanos};std::array<uint32_t,4> components{d.components[0],d.components[1],d.components[2],d.components[3]};
-         auto found=std::find_if(viewCache.begin(),viewCache.end(),[&](auto c){return c.texture==t && c.format==vi.format && c.components==components && c.base==base && c.count==count;});
+         auto found=std::find_if(viewCache.begin(),viewCache.end(),[&](const auto &c){return c.texture==t && c.format==vi.format && c.components==components && c.base==base && c.count==count;});
          if(found!=viewCache.end())view=found->view;
          else {check(CreateImageView(device,&vi,nullptr,&view));++reuseCounts.views;++submitObjectCreates;++submitViewCreates;
           try {if(viewCache.size()<viewCacheLimit)viewCache.push_back({t,vi.format,components,base,count,view});else sampleViews.push_back(view);}catch(...){DestroyImageView(device,view,nullptr);throw;}}
@@ -1547,11 +1547,12 @@ public:
        if(fast){auto &value=(*bindings)[i];value={d.binding,d.type,image,buffer};writes[i]=write;writes[i].pImageInfo=write.pImageInfo?&value.image:nullptr;writes[i].pBufferInfo=write.pBufferInfo?&value.buffer:nullptr;}
        else {Measure measure{descriptorNanos};UpdateDescriptorSets(device,1,&write,0,nullptr);}
       }
-      if(fast){Measure measure{descriptorNanos};auto found=std::find_if(boundSets.begin(),boundSets.end(),[&](const auto &entry){return entry.layout==op.pipeline->setLayout && entry.count==draw.descriptorCount && std::equal(bindings->begin(),bindings->begin()+draw.descriptorCount,entry.bindings.begin());});
+      if(fast){Measure measure{descriptorNanos};uint64_t hash=0xcbf29ce484222325ull;for(unsigned i=0;i<draw.descriptorCount;++i){auto &v=(*bindings)[i];for(uint64_t x:{uint64_t(v.binding)<<32|v.type,uint64_t(uintptr_t(v.image.sampler)),uint64_t(uintptr_t(v.image.imageView))^uint64_t(v.image.imageLayout)<<56,uint64_t(uintptr_t(v.buffer.buffer)),uint64_t(v.buffer.offset),uint64_t(v.buffer.range)})hash=(hash^x)*0x100000001b3ull;}hash^=uint64_t(uintptr_t(op.pipeline->setLayout));
+       auto found=std::find_if(boundSets.begin(),boundSets.end(),[&](const auto &entry){return entry.hash==hash && entry.layout==op.pipeline->setLayout && entry.count==draw.descriptorCount && std::equal(bindings->begin(),bindings->begin()+draw.descriptorCount,entry.bindings.begin());});
        if(found!=boundSets.end())set=found->set;
        else {check(AllocateDescriptorSets(device,&sai,&set));if(systemTranslationPolicy().frameTrace)++frameCounts.descriptors;
         for(unsigned i=0;i<draw.descriptorCount;++i)writes[i].dstSet=set;UpdateDescriptorSets(device,draw.descriptorCount,writes.data(),0,nullptr);
-        if(boundSets.size()<256)boundSets.push_back({op.pipeline->setLayout,draw.descriptorCount,*bindings,set});
+        if(boundSets.size()<256)boundSets.push_back({op.pipeline->setLayout,draw.descriptorCount,hash,*bindings,set});
        }
       }
       if(set!=boundSet || op.pipeline->layout!=boundLayout){CmdBindDescriptorSets(cmd,VK_PIPELINE_BIND_POINT_GRAPHICS,op.pipeline->layout,0,1,&set,0,nullptr);boundSet=set;boundLayout=op.pipeline->layout;}
