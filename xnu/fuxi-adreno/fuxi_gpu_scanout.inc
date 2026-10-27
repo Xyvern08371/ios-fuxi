@@ -143,6 +143,95 @@ static int fg_scanout_write(unsigned pa, unsigned value)
  uint64_t v = value;
  return !fg_access(pa, &v, 1, 0);
 }
+/* Opt-in measurement (fuxigpuncimport bit 16384): after every 8th START a thread call spins on CTL START and the INTF write line
+ * (about 10 us apart, at most 20 ms) and stamps, relative to the START write: the first TE count change ("edge"), the first
+ * START-bit-clear ("clear"), the first write-line idle after it was active ("lineend", 0 when never seen active) and "done" = the
+ * later of clear and lineend, the same condition acquire uses. The worker only stores results; accounting runs under FG_GUARD at the
+ * next publish, so a window is consistent. Read-only MMIO, no behaviour change. Not yet observed on device. */
+static unsigned fg_abi_probe;
+#define FG_PROBE_MAX 128
+static thread_call_data_t fg_scanout_probe_call;
+static unsigned fg_scanout_probe_setup, fg_scanout_probe_busy, fg_scanout_probe_ready, fg_scanout_probe_te0;
+static uint64_t fg_scanout_probe_t0, fg_scanout_probe_res[4]; /* edge, clear, lineend, done (ticks; 0 = not seen) */
+static unsigned fg_scanout_probe_n, fg_scanout_probe_timeouts, fg_scanout_probe_edges, fg_scanout_probe_hist[18];
+static unsigned fg_scanout_probe_done[FG_PROBE_MAX], fg_scanout_probe_te2d[FG_PROBE_MAX];
+static uint64_t fg_scanout_probe_sum[4];
+static void fg_scanout_probe_run(thread_call_param_t a, thread_call_param_t b)
+{
+ (void)a; (void)b;
+ uint64_t hz = rsr("cntfrq_el0"), t0 = fg_scanout_probe_t0, limit = t0 + hz/50, res[4] = {0, 0, 0, 0};
+ unsigned active = 0;
+ for (;;) {
+  unsigned count, line, start;
+  uint64_t now = rsr("cntpct_el0");
+  if (!fg_scanout_read(FG_SCAN_INTF+0x298, &count) || !fg_scanout_read(FG_SCAN_INTF+0x2b0, &line) ||
+      !fg_scanout_read(FG_SCAN_CTL+0x1c, &start)) break;
+  if (!res[0] && (count >> 16) != fg_scanout_probe_te0) res[0] = now - t0 + 1;
+  if (!res[1] && !(start & 1)) res[1] = now - t0 + 1;
+  if ((line & 65535) != 0 && (line & 65535) < 2400) active = 1;
+  else if (active && !res[2]) res[2] = now - t0 + 1;
+  if (res[1] && (res[2] || !active)) { res[3] = res[1] > res[2] ? res[1] : res[2]; break; }
+  if (now >= limit) break;
+  delay(10);
+ }
+ for (unsigned i = 0; i < 4; i++) fg_scanout_probe_res[i] = res[i];
+ __atomic_store_n(&fg_scanout_probe_ready, 1, __ATOMIC_RELEASE);
+}
+static void fg_scanout_probe_kick(unsigned te_frame)
+{
+ if (!fg_abi_probe || fg_scanout_probe_busy || (fg_scanout_starts & 7)) return;
+ if (!fg_scanout_probe_setup) {
+  thread_call_setup_with_options(&fg_scanout_probe_call, fg_scanout_probe_run, NULL, THREAD_CALL_PRIORITY_KERNEL, THREAD_CALL_OPTIONS_ONCE);
+  fg_scanout_probe_setup = 1;
+ }
+ fg_scanout_probe_busy = 1; fg_scanout_probe_te0 = te_frame;
+ (void)thread_call_enter(&fg_scanout_probe_call);
+}
+static unsigned fg_scanout_probe_us(uint64_t ticks) { return (unsigned)(ticks ? (ticks - 1)*1000000/rsr("cntfrq_el0") : 0); }
+static void fg_scanout_probe_account(void)
+{
+ if (!fg_scanout_probe_busy || !__atomic_load_n(&fg_scanout_probe_ready, __ATOMIC_ACQUIRE)) return;
+ if (!fg_scanout_probe_res[3]) fg_scanout_probe_timeouts++;
+ else if (fg_scanout_probe_n < FG_PROBE_MAX) {
+  unsigned done = fg_scanout_probe_us(fg_scanout_probe_res[3]), edge = fg_scanout_probe_us(fg_scanout_probe_res[0]);
+  unsigned bin = done < 6000 ? 0 : done >= 10000 ? 17 : 1 + (done - 6000)/250;
+  fg_scanout_probe_hist[bin]++;
+  fg_scanout_probe_done[fg_scanout_probe_n] = done;
+  fg_scanout_probe_te2d[fg_scanout_probe_n] = fg_scanout_probe_res[0] && done >= edge ? done - edge : 0;
+  fg_scanout_probe_edges += fg_scanout_probe_res[0] != 0;
+  fg_scanout_probe_n++;
+  for (unsigned i = 0; i < 4; i++) fg_scanout_probe_sum[i] += fg_scanout_probe_us(fg_scanout_probe_res[i]);
+ }
+ __atomic_store_n(&fg_scanout_probe_ready, 0, __ATOMIC_RELEASE);
+ fg_scanout_probe_busy = 0;
+}
+static unsigned fg_scanout_probe_pct(unsigned *v, unsigned n, unsigned pct)
+{
+ for (unsigned i = 1; i < n; i++) { unsigned x = v[i], j = i; while (j && v[j-1] > x) { v[j] = v[j-1]; j--; } v[j] = x; }
+ return n ? v[(n - 1)*pct/100] : 0;
+}
+static void fg_scanout_probe_report(void)
+{
+ if (!fg_abi_probe) return;
+ unsigned n = fg_scanout_probe_n, d[FG_PROBE_MAX], t[FG_PROBE_MAX], dmax = 0, tmax = 0, tn = 0;
+ uint64_t tsum = 0;
+ for (unsigned i = 0; i < n; i++) {
+  d[i] = fg_scanout_probe_done[i]; if (d[i] > dmax) dmax = d[i];
+  if (fg_scanout_probe_te2d[i]) { t[tn++] = fg_scanout_probe_te2d[i]; tsum += fg_scanout_probe_te2d[i]; if (t[tn-1] > tmax) tmax = t[tn-1]; }
+ }
+ uint64_t div = n ? n : 1, tdiv = tn ? tn : 1, ediv = fg_scanout_probe_edges ? fg_scanout_probe_edges : 1;
+ printf("FUXI SCANOUT: dsi_xfer n=%u timeouts=%u start_done_us avg=%llu p50=%u p90=%u max=%u clear_avg=%llu lineend_avg=%llu"
+     " te_edge_avg=%llu te_edges=%u te_done_us avg=%llu p50=%u p90=%u max=%u hist<6/6.25../9.75/>=10ms=%u",
+     n, fg_scanout_probe_timeouts, (unsigned long long)(fg_scanout_probe_sum[3]/div), fg_scanout_probe_pct(d, n, 50), fg_scanout_probe_pct(d, n, 90), dmax,
+     (unsigned long long)(fg_scanout_probe_sum[1]/div), (unsigned long long)(fg_scanout_probe_sum[2]/div),
+     (unsigned long long)(fg_scanout_probe_sum[0]/ediv), fg_scanout_probe_edges, (unsigned long long)(tsum/tdiv),
+     fg_scanout_probe_pct(t, tn, 50), fg_scanout_probe_pct(t, tn, 90), tmax, fg_scanout_probe_hist[0]);
+ for (unsigned i = 1; i < 18; i++) printf("/%u", fg_scanout_probe_hist[i]);
+ printf("\n");
+ fg_scanout_probe_n = fg_scanout_probe_timeouts = fg_scanout_probe_edges = 0;
+ for (unsigned i = 0; i < 18; i++) fg_scanout_probe_hist[i] = 0;
+ for (unsigned i = 0; i < 4; i++) fg_scanout_probe_sum[i] = 0;
+}
 /* Poll brackets the edge between the last old count and the first new count.
  * Two narrow, consecutive brackets establish a measured period. An IIR (1/8
  * period, 1/4 phase) rejects polling jitter without following the software
@@ -613,6 +702,7 @@ static int fg_scanout_publish(void)
   }
  }
  unsigned ar, start;
+ fg_scanout_probe_account();
  if (!fg_scanout_read(FG_SCAN_INTF+0x2b4, &ar) || (ar & 0x80000000u) ||
      !fg_scanout_read(FG_SCAN_CTL+0x1c, &start) || (start & 1))
   return fg_scanout_stop("publish transfer status");
@@ -622,6 +712,7 @@ static int fg_scanout_publish(void)
  if (fg_scanout_double_active && !fg_scanout_address(fg_scanout_pa(fg_scanout_triple_requested ? fg_scanout_ready : fg_scanout_front ^ 1u)))
   return fg_scanout_stop("double SRC0 flush");
  if (!fg_scanout_write(FG_SCAN_CTL+0x1c, 1)) return fg_scanout_stop("start transfer");
+ fg_scanout_probe_t0 = rsr("cntpct_el0");
  fg_scanout_stamps.previous_start = fg_scanout_stamps.start;
  fg_scanout_stamps.start = mach_absolute_time();
  if (fg_scanout_double_active) {
@@ -635,6 +726,7 @@ static int fg_scanout_publish(void)
  unsigned count = 0;
  __asm__ volatile("dsb sy" ::: "memory");
  if (!fg_scanout_read(FG_SCAN_INTF+0x298, &count)) return fg_scanout_stop("read te count");
+ fg_scanout_probe_kick(count >> 16);
  uint64_t now = rsr("cntpct_el0"), hz = rsr("cntfrq_el0");
  /* START-to-START gaps in actual panel periods: <=1, <=2, <=3, longer. */
  if (fg_scanout_last_start) {
@@ -655,6 +747,7 @@ static int fg_scanout_publish(void)
       fg_scanout_wait_ring, fg_scanout_wait_floor, fg_scanout_wait_xfer, fg_scanout_wait_te,
       fg_scanout_drain_us, fg_scanout_te_mode, te_dhz/10, te_dhz%10,
       fg_scanout_iv[0], fg_scanout_iv[1], fg_scanout_iv[2], fg_scanout_iv[3]);
+  fg_scanout_probe_report();
   {
    uint64_t n = fg_scanout_xfer_n ? fg_scanout_xfer_n : 1, r = fg_scanout_r2s_n ? fg_scanout_r2s_n : 1, cum = 0;
    unsigned p50 = 0;

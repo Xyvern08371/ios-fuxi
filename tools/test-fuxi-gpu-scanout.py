@@ -72,7 +72,14 @@ static int fg_abi_live_for_scanout(void) {return abiLive;}
 static int fg_abi_observe(void) {observations++;if(!abiResult)fg_client_busy=0;return abiResult;}
 static uint64_t model_counter(const char *r) {return !strcmp(r,"cntfrq_el0")?1000000:ticks;}
 #define rsr(r) model_counter(r)
-static void delay(unsigned us) {if(!frozenClock)ticks+=us;}
+static void (*probeScript)(void);
+static void delay(unsigned us) {if(!frozenClock)ticks+=us;if(probeScript)probeScript();}
+typedef void *thread_call_param_t;
+typedef struct {void (*fn)(thread_call_param_t,thread_call_param_t);} thread_call_data_t;
+enum {THREAD_CALL_PRIORITY_KERNEL=1,THREAD_CALL_OPTIONS_ONCE=1};
+static unsigned probeKicks;
+static void thread_call_setup_with_options(thread_call_data_t *c,void (*fn)(thread_call_param_t,thread_call_param_t),void *arg,unsigned pri,unsigned opt) {(void)arg;(void)pri;(void)opt;c->fn=fn;}
+static int thread_call_enter(thread_call_data_t *c) {(void)c;probeKicks++;return 0;}
 static unsigned fg_access(uint64_t pa,uint64_t *value,unsigned wr,unsigned wide) {
  assert(!wide);
  if(pa==failAddress || (wr && pa==failWriteAddress))return 1;
@@ -153,6 +160,11 @@ static void panel120_drain(uint8_t *panel) {
  assert(!fuxi_gpu_scanout_acquire() && !dsiReads && !dmaStarts);
  ticks+=20000;
 }
+static uint64_t base;
+static void probe_script(void) {uint64_t t=ticks-base;
+ if(t>=1000 && !(intf[0x298/4]>>16))intf[0x298/4]+=1u<<16; // TE edge
+ if(t>=1500 && t<8000)intf[0x2b0/4]=300; // active
+ if(t>=8000){ctl[0x1c/4]=0;intf[0x2b0/4]=2400;}}
 static void panel120_tests(uint8_t *panel) {
  // Exact boot-arg admission; no ownership means no DSI read, write, or command.
  reset();panel120_setup();modelPanel120=0;panel120_drain(panel);
@@ -222,6 +234,27 @@ static void panel120_tests(uint8_t *panel) {
  ticks+=100;fg_scanout_charge_to(FG_WHY_XFER);ticks+=50;fg_scanout_charge_to(FG_WHY_FLOOR);
  assert(fg_scanout_charge[FG_WHY_XFER]==100 && fg_scanout_charge[FG_WHY_FLOOR]==50 && fg_scanout_last_why==FG_WHY_FLOOR);
  fg_scanout_ready_at=fg_scanout_charged_at=0;
+ // DSI transfer probe (bit 16384): TE edge, START clear and write-line end are stamped relative to the START write.
+ {
+  fg_abi_probe=1;fg_scanout_probe_busy=0;fg_scanout_starts=8;probeKicks=0;
+  fg_scanout_probe_n=fg_scanout_probe_timeouts=0;memset(fg_scanout_probe_sum,0,sizeof(fg_scanout_probe_sum));
+  fg_scanout_probe_kick(0);assert(probeKicks==1 && fg_scanout_probe_busy);
+  fg_scanout_probe_kick(0);assert(probeKicks==1); // one at a time
+  fg_scanout_starts=9;fg_scanout_probe_busy=0;fg_scanout_probe_kick(0);assert(probeKicks==1); // only every 8th START
+  fg_scanout_starts=16;fg_scanout_probe_kick(0);assert(probeKicks==2);
+  ctl[0x1c/4]=1;intf[0x298/4]=0;intf[0x2b0/4]=0;ticks+=5;base=ticks;fg_scanout_probe_t0=ticks;probeScript=probe_script;
+  fg_scanout_probe_run(0,0);probeScript=0;
+  fg_scanout_probe_account();assert(!fg_scanout_probe_busy && fg_scanout_probe_n==1 && !fg_scanout_probe_timeouts);
+  assert(fg_scanout_probe_done[0]>=8000 && fg_scanout_probe_done[0]<=8020 && fg_scanout_probe_hist[1+(fg_scanout_probe_done[0]-6000)/250]==1);
+  assert(fg_scanout_probe_te2d[0]>=6980 && fg_scanout_probe_te2d[0]<=7040 && fg_scanout_probe_edges==1);
+  assert(fg_scanout_probe_sum[1]>=8000 && fg_scanout_probe_sum[2]>=8000);
+  fg_scanout_probe_report();assert(!fg_scanout_probe_n && !fg_scanout_probe_edges);
+  // A transfer that never completes times out after 20 ms and is counted, not accounted as a duration.
+  fg_scanout_probe_busy=1;ctl[0x1c/4]=1;fg_scanout_probe_t0=ticks;uint64_t t1=ticks;fg_scanout_probe_run(0,0);
+  assert(ticks-t1>=20000 && ticks-t1<=20100);fg_scanout_probe_account();assert(fg_scanout_probe_timeouts==1 && !fg_scanout_probe_n);
+  fg_scanout_probe_timeouts=0;fg_abi_probe=0;fg_scanout_probe_busy=0;fg_scanout_starts=16;fg_scanout_probe_kick(0);assert(probeKicks==2); // off by default
+  ctl[0x1c/4]=0;intf[0x2b0/4]=0;
+ }
  // Gaps now count 8.333 ms periods, including 16.667ms as two periods.
  ticks=fg_scanout_last_start+8333;assert(fuxi_gpu_scanout_publish()==1);
  ctl[0x1c/4]=0;ticks+=16667;assert(fuxi_gpu_scanout_acquire()==1 && fuxi_gpu_scanout_publish()==1);
