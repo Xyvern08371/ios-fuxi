@@ -38,11 +38,12 @@ inline TranslationPolicy systemTranslationPolicy() {
 #endif
   bool stages=false,trace=false,async=false;
   TranslationPolicy p{translationOption(args,"fuxigpustages=",&stages),translationOption(args,"fuxigputrace=",&trace),translationOption(args,"fuxigpuasync=",&async),translationOption(args,"fuxicompileboost="),translationFrameTrace(args)!=0,translationOption(args,"fuxigpupipelined="),translationOption(args,"fuxigpuskip="),translationOption(args,"fuxigpufeedback="),translationOption(args,"fuxigpuoverlap="),translationOption(args,"fuxigpusubmit="),translationOption(args,"fuxigpugmem="),translationOption(args,"fuxigpumerge="),translationPerf(args),translationFrameTrace(args)==2};
-  p.noSlab=translationOption(args,"fuxigpunoslab=");p.shadowRename=translationOption(args,"fuxigpurename=");
+  p.noSlab=translationOption(args,"fuxigpunoslab=");bool renameKey=false;p.shadowRename=translationOption(args,"fuxigpurename=",&renameKey);
   // Explicit boot keys, including =0/invalid/duplicates, take precedence.
   if(!stages){const char *v=getenv("FUXI_MTL_STAGE_CACHE");p.stages=v && !strcmp(v,"1");}
   if(!trace){const char *v=getenv("FUXI_MTL_TRANSLATION_TRACE");p.trace=v && !strcmp(v,"1");}
   if(!async){const char *v=getenv("FUXI_MTL_ASYNC_PIPELINES");p.async=v && !strcmp(v,"1");}
+  if(!renameKey){const char *v=getenv("FUXI_MTL_SHADOW_RENAME");p.shadowRename=v && !strcmp(v,"1");}
   return p;
  }();return policy;
 }

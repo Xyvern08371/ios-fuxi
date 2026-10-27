@@ -25,6 +25,11 @@ def main():
             if not a.compile_only:subprocess.run([str(d/name)],check=True,timeout=15)
             if not a.compile_only and name == 'FrameTraceTests':
                 subprocess.run([str(d/name)],env=dict(os.environ,FUXI_MTL_TEST_BOOTARGS='fuxigpuoverlap=1'),check=True,timeout=15)
+            if not a.compile_only and name == 'TranslationPolicyTests':
+                for args,env,want in (('',None,'0'),('','1','1'),('','0','0'),('fuxigpurename=1',None,'1'),('fuxigpurename=0','1','0')):
+                    e=dict(os.environ,FUXI_MTL_TEST_BOOTARGS=args);e.pop('FUXI_MTL_SHADOW_RENAME',None)
+                    if env is not None:e['FUXI_MTL_SHADOW_RENAME']=env
+                    subprocess.run([str(d/name),'rename',want],env=e,check=True,timeout=15)
             if not a.compile_only and name == 'FrameTraceTests':
                 subprocess.run([str(d/name)],env=dict(os.environ,FUXI_MTL_TEST_BOOTARGS='fuxigpumerge=1 fuxigpuoverlap=1'),check=True,timeout=15)
             if not a.compile_only and name == 'FrameCPUTests':
