@@ -30,7 +30,7 @@ PREFIX = r'''
 #include <assert.h>
 #define FG_GUARD
 #include <stdint.h>
-static unsigned fg_client_busy, fg_scanout_owned, fg_scanout_writable, fg_scanout_requested;
+static unsigned fg_abi_present_wait, fg_client_busy, fg_scanout_owned, fg_scanout_writable, fg_scanout_requested;
 static unsigned fg_scanout_double_active,fg_scanout_front,fg_scanout_back_ready,fg_scanout_ready_drops,fg_scanout_triple_requested,fg_scanout_ready,fg_scanout_copy;
 static uintptr_t fg_scanout_source;
 static unsigned fg_scanout_pitch,fg_scanout_sx,fg_scanout_sy,fg_scanout_dx,fg_scanout_dy,fg_scanout_w,fg_scanout_h;
@@ -295,7 +295,7 @@ int main(void)
  /* A client owns the ring: defer only GPU copying; the caller uses CPU. */
  fg_client_busy=1;
  assert(!fuxi_gpu_copy(0,42,(uintptr_t)source_buf,4352*2400,4352,3,2,7,6,65,70,&times));
- assert(!doorbells && !fg_busy && fg_state==1);
+ assert(!doorbells && !fg_busy && fg_state==1 && fg_abi_present_wait);fg_abi_present_wait=0;
  fg_client_busy=0;
  for(unsigned i=0;i<1000;i++)
   assert(model_copy(0,42,(uintptr_t)source_buf,4352*2400,4352,3,2,7,6,65,70,&times)==1);

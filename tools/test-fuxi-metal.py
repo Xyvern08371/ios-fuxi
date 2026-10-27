@@ -155,6 +155,7 @@ static uint64_t ticks;
 static uint64_t counter(const char *name) {return strcmp(name,"cntfrq_el0")?ticks:1000000;}
 static uint64_t mach_absolute_time(void) {return ticks;}
 #define rsr(r) counter(r)
+static unsigned fg_abi_present_wait;
 static unsigned fg_access_failed,fg_busy,fg_client_busy,g3_wptr,g3_bank=2,g3_asid=3;
 static unsigned cacheClean,cacheInvalidate,ncimportArg;
 static int PE_parse_boot_argn(const char *name,void *value,size_t bytes) {
@@ -231,7 +232,7 @@ static void seed(void) {
  memset(scratch,0x5a,sizeof(scratch)); memset(regs,0,sizeof(regs));memset(sregs,0,sizeof(sregs));
  regs[0xe07]=regs[0xe09]=0xfffff000;regs[0xe08]=regs[0xe0a]=0x1ffff;regs[0x534]=1;regs[0xe0b]=0x1000000;regs[0xe0d]=0x12ff000;regs[0xe01]=3u<<21;
  sregs[SMMU_ID2/4]=0x5511;
- state=drainGood=1;fg_busy=fg_client_busy=fg_access_failed=0;g3_wptr=0;
+ state=drainGood=1;fg_busy=fg_client_busy=fg_access_failed=fg_abi_present_wait=0;g3_wptr=0;
  fg_scanout_owned=scanoutStops=0;
  fg_abi_live=fg_abi_seq=fg_abi_completed=fg_abi_poisoned=fg_abi_timed_out=0;fg_abi_hang_dumped=0;
  fg_faults=fg_suspends=highReads=rollover=0;
@@ -534,9 +535,9 @@ int main(void) {
   puts("PASS: opt-in NC-import map handoff, indirect RW/RO policy, repeated submits, byte counters, map failure/busy and fault quarantine");
  /* fuxigpuncimport is a bitmask: 1 NC import, 64 coherent self-test, 128 ranged TLBI. Value 1 keeps its meaning;
   * the low bits 2..32 stay free for other lanes and are ignored here. */
- for(unsigned arg=0;arg<512;arg++) {
+ for(unsigned arg=0;arg<1024;arg++) {
   seed();ncimportArg=arg;assert(fg_abi_init());
-  assert(fg_abi_ncimport==(arg&1) && fg_abi_cohtest==((arg>>6)&1) && fg_abi_tlbpages==((arg>>7)&1) && fg_abi_mapwait==((arg>>8)&1) && !fg_abi_coh && !delays);
+  assert(fg_abi_ncimport==(arg&1) && fg_abi_cohtest==((arg>>6)&1) && fg_abi_tlbpages==((arg>>7)&1) && fg_abi_mapwait==((arg>>8)&1) && fg_abi_queue==((arg>>9)&1) && !fg_abi_coh && !delays);
  }
  /* Cached overlap mirror replaces the NC leaf read: exact 4K overlap refusal, nothing published on refusal, unmap/init clear. */
  reset();assert(!fuxi_gpu_abi_map(va,source,32768,3,0,2));
@@ -557,6 +558,73 @@ int main(void) {
     assert(!fuxi_gpu_abi_unmap(v,nb));
     for(unsigned w=0;w<sizeof(fg_abi_used)/sizeof(fg_abi_used[0]);w++) assert(!fg_abi_used[w]);
    }
+ }
+ /* Queue mode (fuxigpuncimport 512): a submit behind a running client job appends to the in-order ring. */
+ {
+  uint64_t sz[1]={4096},ad[1]={va},f1=0,f2=0,f3=0,f4=0,v2=0x30100000;uint32_t q[4];
+  uint32_t ttbrG=(uint32_t)G3_PT,ttbrC=(uint32_t)FG_ABI_PT;
+  #define QSTART() do { seed();ncimportArg=512;assert(fg_abi_init() && fg_abi_queue && fuxi_gpu_abi_queue_enabled());assert(!fuxi_gpu_abi_map(va,source,bytes,3,0,2)); } while(0)
+  #define DONE_UP_TO(n) g_wr(G3_FENCE_PA,FG_ABI_FENCE_OFF+4,(n))
+  /* Default (no bit) is unchanged: a second submit while busy is refused. */
+  reset();assert(!fuxi_gpu_abi_map(va,source,bytes,3,0,2) && !fuxi_gpu_abi_submit(ad,sz,1,&f1) && fuxi_gpu_abi_submit(ad,sz,1,&f2)==1 && !fuxi_gpu_abi_queue_enabled());
+  /* Queued submit: same root, no TTBR switch or TLBI, doorbell rung again, one fence per job, in-order retirement. */
+  QSTART();
+  assert(!fuxi_gpu_abi_submit(ad,sz,1,&f1) && f1==1 && sregs[(g_cb(g3_bank)+0x20)/4]==ttbrC);
+  unsigned t0=tlbs,d0=doorbells,w0=g3_wptr;
+  assert(!fuxi_gpu_abi_submit(ad,sz,1,&f2) && f2==2 && tlbs==t0 && doorbells==d0+1 && ((g3_wptr-w0)&8191)>=40 && sregs[(g_cb(g3_bank)+0x20)/4]==ttbrC);
+  assert(((ring[w0&8191]>>16)&0x7f)==0x17); /* the second frame opens like the first: sync, reset */
+  fuxi_gpu_abi_queue_stats(q);assert(q[0]==1 && q[1]==2);
+  assert(fuxi_gpu_abi_poll(1)==1 && fuxi_gpu_abi_poll(2)==1 && fuxi_gpu_abi_poll(3)==-1);
+  DONE_UP_TO(1); /* job 1 finished, job 2 running */
+  assert(!fuxi_gpu_abi_poll(1) && fuxi_gpu_abi_poll(2)==1 && fg_abi_completed==1 && fg_client_busy && sregs[(g_cb(g3_bank)+0x20)/4]==ttbrC);
+  assert(fuxi_gpu_abi_unmap(va,bytes)==1 && *fg_abi_leaf(va)); /* unmap waits for every job, not just the first */
+  assert(fuxi_gpu_abi_submit(ad,sz,1,&f3)==0 && f3==3); /* and the chain keeps accepting */
+  complete(); /* fence 3, ring idle */
+  assert(!fuxi_gpu_abi_poll(2) && !fuxi_gpu_abi_poll(3) && !fg_client_busy && fg_abi_completed==3 && sregs[(g_cb(g3_bank)+0x20)/4]==ttbrG);
+  assert(!fuxi_gpu_abi_unmap(va,bytes) && !*fg_abi_leaf(va));
+  /* Depth and ring room: at most FG_ABI_QUEUE_MAX jobs in flight, and never past the free space. */
+  QSTART();
+  for(unsigned i=0;i<FG_ABI_QUEUE_MAX;i++) assert(!fuxi_gpu_abi_submit(ad,sz,1,&f1));
+  assert(fuxi_gpu_abi_submit(ad,sz,1,&f2)==1);fuxi_gpu_abi_queue_stats(q);assert(q[0]==FG_ABI_QUEUE_MAX-1 && q[1]==FG_ABI_QUEUE_MAX && q[3]==1);
+  DONE_UP_TO(2);assert(fuxi_gpu_abi_poll(4)==1 && fg_abi_completed==2 && !fuxi_gpu_abi_submit(ad,sz,1,&f2) && f2==5);
+  QSTART();
+  assert(!fuxi_gpu_abi_submit(ad,sz,1,&f1));regs[0x806]=(g3_wptr-8100)&8191;
+  assert(fuxi_gpu_abi_submit(ad,sz,1,&f2)==1);fuxi_gpu_abi_queue_stats(q);assert(q[3]==1 && fg_abi_seq==1);
+  /* A map since the last submit drops the ASID translations once; a repeat does not. */
+  QSTART();
+  assert(!fuxi_gpu_abi_submit(ad,sz,1,&f1) && !fuxi_gpu_abi_map(v2,source,4096,3,0,2));t0=tlbs;
+  assert(!fuxi_gpu_abi_submit(ad,sz,1,&f2) && tlbs==t0+1 && !fuxi_gpu_abi_submit(ad,sz,1,&f3) && tlbs==t0+1);
+  failTlb=1;assert(!fuxi_gpu_abi_map(v2+0x10000,source,4096,3,0,2) && fuxi_gpu_abi_submit(ad,sz,1,&f4)==-1 && state==2);failTlb=0; /* fail closed */
+  /* Present interleaving: a refused present stops queueing; the chain drains, the root is restored, the flag clears. */
+  QSTART();
+  assert(!fuxi_gpu_abi_submit(ad,sz,1,&f1));fg_abi_present_wait=1;
+  assert(fuxi_gpu_abi_submit(ad,sz,1,&f2)==1);fuxi_gpu_abi_queue_stats(q);assert(q[2]==1 && fg_abi_seq==1);
+  complete();assert(!fuxi_gpu_abi_poll(1) && !fg_client_busy && !fg_abi_present_wait && sregs[(g_cb(g3_bank)+0x20)/4]==ttbrG);
+  assert(!fuxi_gpu_abi_submit(ad,sz,1,&f2) && f2==2);
+  QSTART();
+  assert(!fuxi_gpu_abi_submit(ad,sz,1,&f1) && !fuxi_gpu_abi_submit(ad,sz,1,&f2));
+  fg_busy=1;assert(fuxi_gpu_abi_submit(ad,sz,1,&f3)==1);fg_busy=0;fg_scanout_reserved=1;assert(fuxi_gpu_abi_submit(ad,sz,1,&f3)==1);fg_scanout_reserved=0;
+  /* A fault in the second job: the first stays successful, the second and later fail, the GPU is isolated once. */
+  QSTART();
+  assert(!fuxi_gpu_abi_submit(ad,sz,1,&f1) && !fuxi_gpu_abi_submit(ad,sz,1,&f2) && !fuxi_gpu_abi_submit(ad,sz,1,&f3));
+  DONE_UP_TO(1);fault=1;regs[0x928]=1;
+  assert(fuxi_gpu_abi_poll(3)==-1 && state==2 && drains==1 && !fg_client_busy && fg_abi_completed==1);
+  assert(!fuxi_gpu_abi_poll(1) && fuxi_gpu_abi_poll(2)<0 && fuxi_gpu_abi_poll(3)<0 && fuxi_gpu_abi_submit(ad,sz,1,&f4)==-1);
+  /* Timeout of the running job after its predecessor retired: deadline restarts at the retirement, then 100 ms isolate. */
+  QSTART();
+  assert(!fuxi_gpu_abi_submit(ad,sz,1,&f1) && !fuxi_gpu_abi_submit(ad,sz,1,&f2));
+  ticks=90000;DONE_UP_TO(1);assert(fuxi_gpu_abi_poll(2)==1 && fg_abi_completed==1); /* 90 ms of 100 ms spent, but job 2 got a fresh budget */
+  ticks=90000+99000;assert(fuxi_gpu_abi_poll(2)==1);
+  ticks=90000+100001;assert(fuxi_gpu_abi_poll(2)==-3 && fg_abi_timed_out && fg_abi_completed==1 && !fuxi_gpu_abi_poll(1));
+  /* Imports: every queued job hands its imports to the GPU, and each retirement drops the CPU's lines. */
+  QSTART();
+  assert(!fuxi_gpu_abi_map_import(v2,source,16384,3));
+  assert(!fuxi_gpu_abi_submit(ad,sz,1,&f1) && !fuxi_gpu_abi_submit(ad,sz,1,&f2) && cacheClean==512 && !cacheInvalidate);
+  DONE_UP_TO(1);assert(fuxi_gpu_abi_poll(2)==1 && cacheInvalidate==256 && fg_abi_host_handoff);
+  complete();assert(!fuxi_gpu_abi_poll(2) && cacheInvalidate==512 && !fg_abi_host_handoff);
+  #undef QSTART
+  #undef DONE_UP_TO
+  puts("PASS: queue mode (bit 512): queued submits keep the client root, in-order retirement with per-job deadline, depth/ring limits, TLBI only after a map, present stops queueing, fault in job 2 keeps job 1, unmap/import handoff per job");
  }
  /* Legacy opt-in (fuxigpuncimport 256): a map waits for an idle GPU again. */
  seed();ncimportArg=256;assert(fg_abi_init() && fg_abi_mapwait);

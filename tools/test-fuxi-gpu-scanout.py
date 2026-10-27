@@ -41,7 +41,7 @@ typedef int boolean_t;
 #define FALSE 0
 static int interruptsOn=1;
 static boolean_t ml_set_interrupts_enabled(boolean_t value) {int old=interruptsOn;interruptsOn=value;return old;}
-static unsigned fg_scanout_requested, fg_scanout_panel120_requested, fg_scanout_double_requested, fg_scanout_triple_requested, fg_busy, fg_client_busy;
+static unsigned fg_scanout_requested, fg_scanout_panel120_requested, fg_scanout_double_requested, fg_scanout_triple_requested, fg_busy, fg_client_busy, fg_abi_present_wait;
 static unsigned ready=1,abiLive=1,abiResult,observations,reads,writes,starts,failAddress;
 static uint64_t ticks=1000,machScale=1;
 static uint64_t mach_absolute_time(void) {return ticks*machScale;}
@@ -541,7 +541,7 @@ int main(void) {
  ctl[0x1c/4]=0;intf[0x298/4]=1200;assert(fuxi_gpu_scanout_acquire()==1 && fg_scanout_writable);
  // Existing console/display kick must not start an owned transfer, even idle.
  fuxi_display_kick();assert(!ctl[0x1c/4]);
- fg_client_busy=1;abiResult=1;assert(!fuxi_gpu_scanout_reserve() && !fg_scanout_reserved);
+ fg_client_busy=1;abiResult=1;assert(!fuxi_gpu_scanout_reserve() && !fg_scanout_reserved && fg_abi_present_wait); fg_abi_present_wait=0;
  abiResult=0;assert(fuxi_gpu_scanout_reserve() && !fg_client_busy && fg_scanout_reserved);
  assert(!fuxi_gpu_scanout_reserve());fuxi_gpu_scanout_release();assert(!fg_scanout_reserved);
  // A submitted copy cannot publish until the fence has retired.

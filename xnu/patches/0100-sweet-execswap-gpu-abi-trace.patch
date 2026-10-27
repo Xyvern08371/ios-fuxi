@@ -578,7 +578,7 @@
     if (s) return s==1 ? kIOReturnBusy : kIOReturnBadArgument;
     b->iova=r.iova; static_cast<NativeAdrenoAbiBoMapReply *>(out)->iova=r.iova; return kIOReturnSuccess;
    }
-@@ -231,9 +395,10 @@
+@@ -231,9 +395,12 @@
    }
    if (method==NativeAdrenoMethodSubmit) {
     const auto &r=*static_cast<const NativeAdrenoAbiSubmit *>(in);
@@ -587,12 +587,14 @@
 -   uint64_t iova[16], bytes[16];
 +   /* A record of the 16-IB layout (416 bytes) from an older Turnip holds only 16 buffers: never read past the bytes the caller gave. */
 +   if (!r.buffer_count || r.buffer_count>fg_abi_submit_capacity(inBytes_) || r.reserved || r.queue>=8 || !queues_[r.queue]) return kIOReturnBadArgument;
-+   if (r.wait_fence) { IOReturn s=waitUnlocked(r.wait_fence,r.wait_timeout_ns); if (s) return s; }
++   /* Queue mode: the ring is in order with a WFI after each frame, so a wait on a fence of this client's own chain adds nothing. */
++   bool chained=r.wait_fence && firstFence_ && r.wait_fence>=firstFence_ && r.wait_fence<=lastFence_ && fuxi_gpu_abi_queue_enabled();
++   if (r.wait_fence && !chained) { IOReturn s=waitUnlocked(r.wait_fence,r.wait_timeout_ns); if (s) return s; }
 +   uint64_t iova[NativeAdrenoAbiMaxBuffers], bytes[NativeAdrenoAbiMaxBuffers];
     for (unsigned i=0;i<r.buffer_count;i++) {
      const auto &ib=r.buffers[i]; Bo *b=find(ib.handle);
      if (!b || !b->iova || !fg_abi_ib_valid(b->iova,b->bytes,ib.iova,ib.bytes)) return kIOReturnBadArgument;
-@@ -246,7 +411,7 @@
+@@ -246,7 +413,7 @@
      if (!s) { if (!firstFence_) firstFence_=fence; lastFence_=fence; static_cast<NativeAdrenoAbiSubmitReply *>(out)->fence=fence; return kIOReturnSuccess; }
      if (s<0) return kIOReturnIOError;
      if (mach_absolute_time()>=deadline) return kIOReturnBusy;
@@ -601,7 +603,7 @@
     }
    }
    if (method==NativeAdrenoMethodSetMetadata || method==NativeAdrenoMethodGetMetadata) {
-@@ -254,8 +419,9 @@
+@@ -254,8 +421,9 @@
     if (!b || r.reserved || r.bytes>64) return kIOReturnBadArgument;
     if (method==NativeAdrenoMethodSetMetadata) { bcopy(r.text,b->metadata,r.bytes); b->metadataBytes=r.bytes; }
     else {
@@ -612,7 +614,7 @@
      bcopy(b->metadata,reply.text,reply.bytes);
     }
     return kIOReturnSuccess;
-@@ -277,25 +443,45 @@
+@@ -277,25 +445,45 @@
   bool initWithTask(task_t task, void *securityID, UInt32 type) override {
    if (!IOUserClient::initWithTask(task,securityID,type)) return false;
    task_=task; task_reference(task_);
@@ -663,7 +665,7 @@
   }
   IOReturn clientMemoryForType(UInt32 token, IOOptionBits *options, IOMemoryDescriptor **memory) override {
    if (!options || !memory) return kIOReturnBadArgument;
-@@ -304,7 +490,9 @@
+@@ -304,7 +492,9 @@
    if (live_) for (auto &b:bos_) if (b.handle && b.token==token && b.leases) {
     b.view->retain(); *memory=b.view; *options=kIOMapAnywhere|kIOMapWriteCombineCache; break;
    }
@@ -674,7 +676,7 @@
   }
   IOReturn clientClose() override {
    if (!lock_) return kIOReturnSuccess;
-@@ -321,24 +509,40 @@
+@@ -321,24 +511,40 @@
     IOLockLock(openLock); connected=false; IOLockUnlock(openLock);
    }
    IOLockUnlock(lock_);
@@ -718,7 +720,7 @@
    if (!handler) return kIOReturnBadArgument;
    *handler=nullptr;
    if (type!=0x4147 && type!=0) return kIOReturnUnsupported;
-@@ -351,10 +555,40 @@
+@@ -351,10 +557,40 @@
    *handler=uc; return kIOReturnSuccess;
   }
  };
@@ -761,7 +763,7 @@
   auto *service=new NativeAdrenoGpuPublished;
   if (!openLock || !service) { if (service) service->release(); return; }
   if (!service->init() || !service->attach(IOService::getPlatform()) || !service->start(IOService::getPlatform())) {
-@@ -362,7 +596,27 @@
+@@ -362,7 +598,29 @@
   }
   service->setName("NativeAdrenoGpu");
   service->setProperty("NativeAdrenoABI",(uint64_t)NativeAdrenoAbiVersion,32);
@@ -785,6 +787,8 @@
 + uint32_t ibs[4], wptr[4], stall[8];
 + fuxi_gpu_abi_sched_stats(ibs,wptr,stall);
 + if (!ibs[0]) return;
++ uint32_t q[4]; fuxi_gpu_abi_queue_stats(q);
++ if (q[0] || q[2] || q[3]) IOLog("FUXI GPU ABI: queue queued %u deepest %u refused present %u full %u\n",q[0],q[1],q[2],q[3]);
 + IOLog("FUXI GPU ABI: submits %u ibs %u max %u over16 %u peak_bos %u wptr writes %u dropped %u repeated %u stuck %u stall kicks %u drains %u acks %u/%u kick_ok %u drain_ok %u snaps %u\n",
 +     ibs[0],ibs[1],ibs[2],ibs[3],peakBos,wptr[0],wptr[1],wptr[2],wptr[3],stall[0],stall[2],stall[3],stall[4],stall[5],stall[6],stall[7]);
 +}

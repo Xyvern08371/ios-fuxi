@@ -296,7 +296,7 @@
 -}
 + return (const uint8_t *)fg_pointer_range(FG_FW_BASE + which*FG_FW_SLOT, FG_FW_SLOT);
 +}
-+static unsigned fg_abi_enabled, fg_client_busy;
++static unsigned fg_abi_enabled, fg_client_busy, fg_abi_present_wait; /* present_wait: a present/reserve was refused for a running client job (stops queueing behind it) */
 +static IOLock *fg_ring_lock;
 +/* Present callers already hold the surface lock. ABI never takes that lock;
 + * neither client waits nor BO allocations hold this short ring/table mutex. */
@@ -704,13 +704,14 @@
   t->wait += mach_absolute_time()-fg_submit_time;
   return drained ? -1 : -2;
  }
-@@ -475,41 +751,70 @@
+@@ -475,41 +751,71 @@
      unsigned pitch, unsigned sx, unsigned sy, unsigned dx, unsigned dy,
      unsigned width, unsigned height, struct fg_times *t)
  {
 - if (!fuxi_gpu_ready() || fg_busy || slot >= FG_CACHE_SLOTS || fg_generation[slot] != generation) return 0;
 + FG_GUARD;
 + if (fg_scanout_owned && !fg_scanout_writable) return 0;
++ if (fg_client_busy) fg_abi_present_wait = 1;
 + if (!fuxi_gpu_ready() || fg_busy || fg_client_busy || slot >= FG_CACHE_SLOTS || fg_generation[slot] != generation) return 0;
   if (!width || !height || width > 1080 || height > 2400 || dx > 1080-width || dy > 2400-height ||
       (source & 3) || (pitch & 3) || pitch > 131008 || ((uint64_t)sx+width)*4 > pitch ||
@@ -2028,8 +2029,8 @@
 + FG_GUARD;
 + if (!fuxi_gpu_ready()) return 1;
 + if (fg_scanout_failed || fg_scanout_reserved || fg_busy) return 0;
-+ if (fg_abi_live_for_scanout() && fg_abi_observe() != 0) return 0;
-+ if (fg_client_busy) return 0;
++ if (fg_abi_live_for_scanout() && fg_abi_observe() != 0) { if (fg_client_busy) fg_abi_present_wait = 1; return 0; }
++ if (fg_client_busy) { fg_abi_present_wait = 1; return 0; }
 + fg_scanout_reserved = 1;
 + return 1;
 +}
@@ -2091,7 +2092,7 @@
 +SOFTWARE.
 --- a/bsd/dev/fuxi_gpu_abi_backend.inc
 +++ b/bsd/dev/fuxi_gpu_abi_backend.inc
-@@ -0,0 +1,683 @@
+@@ -0,0 +1,727 @@
 +/* Built into fuxi_adreno.c, with access to its proven SMMU/ring helpers.
 + * Single privileged diagnostic client, not a security boundary for PM4.
 + * Its root has no scanout or surface-cache mappings. The kernel-only runtime
@@ -2114,13 +2115,16 @@
 + * list. Serialize cache handoff with the same GPU lock as submit/retirement.
 + * The user client owns these prepared kernel mappings until successful unmap. */
 +static struct { uint64_t iova, bytes; uintptr_t source; unsigned permissions; } fg_abi_imports[FG_ABI_MAX_IMPORTS];
-+static unsigned fg_abi_host_handoff, fg_abi_ncimport, fg_abi_unstick, fg_abi_cohtest, fg_abi_tlbpages, fg_abi_mapwait;
++static unsigned fg_abi_host_handoff, fg_abi_ncimport, fg_abi_unstick, fg_abi_cohtest, fg_abi_tlbpages, fg_abi_mapwait, fg_abi_queue;
++/* Queue mode (bit 512): jobs in flight are seq-completed, at most this many; stats: queued, deepest chain, refused for a waiting present, refused full. */
++#define FG_ABI_QUEUE_MAX 4u
++static uint32_t fg_abi_q_stats[4];
 +/* Ticks the last fuxi_gpu_abi_map spent after taking the GPU lock (the caller's total minus this is the wait for that lock). */
 +static uint64_t fg_abi_map_work;
 +/* fuxigpuncimport is a bitmask, default 0: 1 NC-import map-time clean; 2 fenced WPTR (fg_ring_doorbell); 4 stall recovery
 + * (fg_abi_unstick_step); 64 coherent-import self-test (skips the per-submit clean/retire invalidate only if it proves the GPU path
 + * coherent); 128 ranged TLBIVAL for a small unmap; 256 map waits for an idle GPU first (the pre-N167 behaviour; default maps while a
-+ * job runs, see fg_abi_map_locked). Parsed once in fg_abi_init. */
++ * job runs, see fg_abi_map_locked); 512 queue a submit behind a running job (see fg_abi_submit_locked). Parsed once in fg_abi_init. */
 +static unsigned fg_abi_coh, fg_abi_coh_tries; /* coh: 0 untested, 1 proven coherent, 2 refused */
 +/* The submit record holds up to NativeAdrenoAbiMaxBuffers IBs; one frame is then one ring prologue and one CP context reset. */
 +_Static_assert(FG_ABI_FRAME_WORDS+8 < 8192, "one frame must fit the idle ring");
@@ -2334,6 +2338,12 @@
 +}
 +static int fg_abi_fault(const char *why)
 +{
++ /* Queue mode: jobs the CP already finished (their fence is in memory; the ring is in order) stay successful, so a fault in a later
++  * job fails only the jobs from it on. */
++ if (fg_abi_queue && fg_client_busy && !fg_access_failed) {
++  uint32_t f=g3_read(G3_FENCE_PA+FG_ABI_FENCE_OFF+4);
++  if (!fg_access_failed && f>fg_abi_completed && f<=fg_abi_seq) fg_abi_completed=f;
++ }
 + fg_abi_hang_dump(why);
 + fg_abi_poisoned = 1;
 + fg_fail(why,0x701);
@@ -2396,9 +2406,18 @@
 +  fg_abi_import_cache(1); /* before fence success, even without a user wait */
 +  if (fg_abi_stage) fg_abi_stall_done();
 +  fg_abi_completed = fg_abi_seq;
-+  fg_client_busy = 0;
++  fg_client_busy = 0; fg_abi_present_wait = 0;
 +  return 0;
 + }
++ /* Queue mode: the ring is in order with a WFI after every frame, so a fence below the newest job's means every job up to it has
++  * finished while the next runs. Retire those (cache handoff included) and give the next job its own 100 ms. */
++ { uint32_t f;
++   if (fg_abi_queue && (f=g3_read(G3_FENCE_PA+FG_ABI_FENCE_OFF+4))>fg_abi_completed && f<fg_abi_seq) {
++    fg_abi_import_cache(1); fg_abi_host_handoff=1; /* the newer job's handoff is still open */
++    if (fg_abi_stage) fg_abi_stall_done();
++    fg_abi_completed=f; fg_client_deadline=rsr("cntpct_el0")+rsr("cntfrq_el0")/10;
++    return 1;
++   } }
 + if (rsr("cntpct_el0") >= fg_client_deadline) {
 +  fg_abi_timed_out=1; (void)fg_abi_fault("client fence deadline (100 ms)");
 +  return fg_abi_drained ? -3 : -4;
@@ -2420,7 +2439,7 @@
 +{
 + unsigned bits=0;
 + (void)PE_parse_boot_argn("fuxigpuncimport",&bits,sizeof(bits));
-+ fg_abi_ncimport=bits&1; fg_wptr_fence=(bits>>1)&1; fg_abi_unstick=(bits>>2)&1; fg_abi_cohtest=(bits>>6)&1; fg_abi_tlbpages=(bits>>7)&1; fg_abi_mapwait=(bits>>8)&1;
++ fg_abi_ncimport=bits&1; fg_wptr_fence=(bits>>1)&1; fg_abi_unstick=(bits>>2)&1; fg_abi_cohtest=(bits>>6)&1; fg_abi_tlbpages=(bits>>7)&1; fg_abi_mapwait=(bits>>8)&1; fg_abi_queue=(bits>>9)&1; fg_abi_present_wait=0; memset(fg_abi_q_stats,0,sizeof(fg_abi_q_stats));
 + fg_abi_coh=fg_abi_coh_tries=0;
 + for (unsigned i=0;i<sizeof(fg_abi_used)/sizeof(fg_abi_used[0]);i++) fg_abi_used[i]=0;
 + /* 772 4K pages: root, two L2s, kernel runtime L3, 768 client L3s.
@@ -2666,15 +2685,33 @@
 +{
 + if (!fg_abi_live || !fuxi_gpu_ready() || fg_abi_poisoned || fg_abi_seq==UINT32_MAX) return -1;
 + if (fg_busy || fg_scanout_reserved) return 1;
-+ int idle=fg_abi_wait_idle();
-+ if (idle) return idle<0 ? -1 : 1;
-+ if (g3_faulted() || g3_gr(0x806)!=g3_wptr || g3_gr(0x807)!=g3_wptr || (g3_gr(0x210)&~1u))
++ /* Why a submit needed an idle GPU: (1) it installs the client root with a full-ASID invalidate, which would pull the page tables from
++  * under a running present job; (2) the ring was assumed empty (RPTR==WPTR) and one fence tracked one job; (3) a frame opens with a
++  * CP context reset, which is safe only after the previous frame's WFI. Behind a running *client* job (1) is moot, (3) is ordered by
++  * the in-order ring, and (2) becomes seq/completed. Queue mode (bit 512) therefore appends the frame and re-rings the doorbell.
++  * It refuses (busy, the caller retries) while a present waits, with FG_ABI_QUEUE_MAX jobs in flight or without ring room. */
++ int queued=0, idle=fg_abi_wait_idle();
++ if (idle<0) return -1;
++ if (idle) {
++  if (!fg_abi_queue) return 1;
++  if (fg_abi_present_wait) { fg_abi_q_stats[2]++; return 1; }
++  uint32_t used=(g3_wptr-g3_gr(0x806))&8191;
++  if (fg_access_failed) return fg_abi_fault("client queue ring read");
++  if (fg_abi_seq-fg_abi_completed>=FG_ABI_QUEUE_MAX || used+FG_ABI_FRAME_WORDS+64>8191) { fg_abi_q_stats[3]++; return 1; }
++  if (g3_faulted()) return fg_abi_fault("client pre-queue fault");
++  queued=1;
++ } else if (g3_faulted() || g3_gr(0x806)!=g3_wptr || g3_gr(0x807)!=g3_wptr || (g3_gr(0x210)&~1u))
 +  return fg_abi_fault("client pre-submit idle/fault");
 + uint32_t *words=fg_abi_words; /* serialized by the GPU lock; too large for the kernel stack at 128 IBs */
 + unsigned n=fg_abi_frame(words,iovas,sizes,count,G3_FENCE_VA+FG_ABI_FENCE_OFF,fg_abi_seq,fg_abi_seq+1,1);
 + if (!n) return -1;
 + fg_abi_ibs[0]++; fg_abi_ibs[1]+=count; if (count>fg_abi_ibs[2]) fg_abi_ibs[2]=count; if (count>16) fg_abi_ibs[3]++;
-+ if (!fg_abi_switch(FG_ABI_PT)) return fg_abi_fault("client install TTBR");
++ if (queued) {
++  /* Same root, nothing to switch. Leaves are only added to never-used VA (fg_abi_map_locked), but if any map happened since the last
++   * submit drop the ASID's translations anyway: fail closed on the no-negative-caching assumption. */
++  uint32_t tlb[128]={0};
++  if (fg_abi_map_seq!=fg_abi_submit_map_seq && (g4_tlb(tlb) || fg_access_failed)) return fg_abi_fault("client queue TLB");
++ } else if (!fg_abi_switch(FG_ABI_PT)) return fg_abi_fault("client install TTBR");
 + /* Ordinary BOs are NC on both sides. Imports preserve CPU attributes and
 +  * need an explicit PoC handoff; IO-coherent XNU helpers may be no-ops here.
 +  * No CPU access is allowed until retirement, per external synchronization.
@@ -2684,12 +2721,17 @@
 + for (unsigned i=0;i<n;i++) g3_emit(words[i]);
 + g3_wptr &= 8191;
 + __asm__ volatile("dsb sy" ::: "memory");
-+ fg_client_deadline=rsr("cntpct_el0")+rsr("cntfrq_el0")/10;
++ if (!queued) { fg_client_deadline=rsr("cntpct_el0")+rsr("cntfrq_el0")/10; fg_abi_stage=0; }
 + fg_client_busy=1;
 + fg_dcvs_kick();
-+ fg_abi_stage=0; fg_abi_submit_map_seq=fg_abi_map_seq;
++ fg_abi_submit_map_seq=fg_abi_map_seq;
 + if (!fg_ring_doorbell() || fg_access_failed) return fg_abi_fault("client doorbell");
 + *fence=++fg_abi_seq;
++ if (queued) {
++  fg_abi_q_stats[0]++;
++  if (fg_abi_seq-fg_abi_completed>fg_abi_q_stats[1]) fg_abi_q_stats[1]=fg_abi_seq-fg_abi_completed;
++  return 0; /* the watchdog already re-arms itself while the chain runs */
++ }
 + uint64_t deadline;
 + clock_interval_to_deadline(2,NSEC_PER_MSEC,&deadline);
 + (void)thread_call_enter_delayed(&fg_client_watchdog,deadline);
@@ -2765,10 +2807,13 @@
 +{
 + FG_GUARD;
 + if (!fg_abi_live || fence>fg_abi_seq) return -1;
++ if (fg_abi_queue && fence && fence<=fg_abi_completed) return 0; /* retired before any later job's fault: stays successful */
 + int err=fg_abi_observe();
 + if (err<0) return err;
 + return fence<=fg_abi_completed ? 0 : 1;
 +}
++int fuxi_gpu_abi_queue_enabled(void) { FG_GUARD; return fg_abi_queue; }
++void fuxi_gpu_abi_queue_stats(uint32_t q[4]) { FG_GUARD; memcpy(q,fg_abi_q_stats,sizeof(fg_abi_q_stats)); }
 +/* Window counters for the SWEET FB stats line (fuxi_gpu_abi_stats_log); a snapshot, not reset. */
 +void fuxi_gpu_abi_sched_stats(uint32_t ibs[4], uint32_t wptr[4], uint32_t stall[8])
 +{
@@ -3150,7 +3195,7 @@
 +#endif
 --- a/bsd/dev/fuxi_gpu_abi.h
 +++ b/bsd/dev/fuxi_gpu_abi.h
-@@ -0,0 +1,34 @@
+@@ -0,0 +1,38 @@
 +/* NativeAdrenoABI platform bridge. All operations serialize with presents. */
 +#ifndef FUXI_GPU_ABI_H
 +#define FUXI_GPU_ABI_H
@@ -3180,6 +3225,10 @@
 +int fuxi_gpu_abi_available(void);
 +/* Snapshot of the backend's IBs-per-submit [4], WPTR fence [4] and stall recovery [8] counters; see fuxi_gpu_abi_backend.inc. */
 +void fuxi_gpu_abi_sched_stats(uint32_t ibs[4], uint32_t wptr[4], uint32_t stall[8]);
++/* fuxigpuncimport bit 512: submits queue behind a running job (in-order ring, one TTBR switch per chain). */
++int fuxi_gpu_abi_queue_enabled(void);
++/* Queued submits, deepest chain, queue refusals for a waiting present, refusals for a full chain/ring. */
++void fuxi_gpu_abi_queue_stats(uint32_t q[4]);
 +void fuxi_gpu_abi_publish(void);
 +#ifdef __cplusplus
 +}
@@ -3517,7 +3566,7 @@
 +#endif
 --- a/iokit/Kernel/arm/fuxi_gpu_abi.h
 +++ b/iokit/Kernel/arm/fuxi_gpu_abi.h
-@@ -0,0 +1,34 @@
+@@ -0,0 +1,38 @@
 +/* NativeAdrenoABI platform bridge. All operations serialize with presents. */
 +#ifndef FUXI_GPU_ABI_H
 +#define FUXI_GPU_ABI_H
@@ -3547,6 +3596,10 @@
 +int fuxi_gpu_abi_available(void);
 +/* Snapshot of the backend's IBs-per-submit [4], WPTR fence [4] and stall recovery [8] counters; see fuxi_gpu_abi_backend.inc. */
 +void fuxi_gpu_abi_sched_stats(uint32_t ibs[4], uint32_t wptr[4], uint32_t stall[8]);
++/* fuxigpuncimport bit 512: submits queue behind a running job (in-order ring, one TTBR switch per chain). */
++int fuxi_gpu_abi_queue_enabled(void);
++/* Queued submits, deepest chain, queue refusals for a waiting present, refusals for a full chain/ring. */
++void fuxi_gpu_abi_queue_stats(uint32_t q[4]);
 +void fuxi_gpu_abi_publish(void);
 +#ifdef __cplusplus
 +}

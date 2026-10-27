@@ -397,7 +397,9 @@ class FuxiAdrenoUserClient : public IOUserClient {
    const auto &r=*static_cast<const NativeAdrenoAbiSubmit *>(in);
    /* A record of the 16-IB layout (416 bytes) from an older Turnip holds only 16 buffers: never read past the bytes the caller gave. */
    if (!r.buffer_count || r.buffer_count>fg_abi_submit_capacity(inBytes_) || r.reserved || r.queue>=8 || !queues_[r.queue]) return kIOReturnBadArgument;
-   if (r.wait_fence) { IOReturn s=waitUnlocked(r.wait_fence,r.wait_timeout_ns); if (s) return s; }
+   /* Queue mode: the ring is in order with a WFI after each frame, so a wait on a fence of this client's own chain adds nothing. */
+   bool chained=r.wait_fence && firstFence_ && r.wait_fence>=firstFence_ && r.wait_fence<=lastFence_ && fuxi_gpu_abi_queue_enabled();
+   if (r.wait_fence && !chained) { IOReturn s=waitUnlocked(r.wait_fence,r.wait_timeout_ns); if (s) return s; }
    uint64_t iova[NativeAdrenoAbiMaxBuffers], bytes[NativeAdrenoAbiMaxBuffers];
    for (unsigned i=0;i<r.buffer_count;i++) {
     const auto &ib=r.buffers[i]; Bo *b=find(ib.handle);
@@ -616,6 +618,8 @@ extern "C" void fuxi_gpu_abi_sched_log(void)
  uint32_t ibs[4], wptr[4], stall[8];
  fuxi_gpu_abi_sched_stats(ibs,wptr,stall);
  if (!ibs[0]) return;
+ uint32_t q[4]; fuxi_gpu_abi_queue_stats(q);
+ if (q[0] || q[2] || q[3]) IOLog("FUXI GPU ABI: queue queued %u deepest %u refused present %u full %u\n",q[0],q[1],q[2],q[3]);
  IOLog("FUXI GPU ABI: submits %u ibs %u max %u over16 %u peak_bos %u wptr writes %u dropped %u repeated %u stuck %u stall kicks %u drains %u acks %u/%u kick_ok %u drain_ok %u snaps %u\n",
      ibs[0],ibs[1],ibs[2],ibs[3],peakBos,wptr[0],wptr[1],wptr[2],wptr[3],stall[0],stall[2],stall[3],stall[4],stall[5],stall[6],stall[7]);
 }

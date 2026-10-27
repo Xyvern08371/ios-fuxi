@@ -166,7 +166,7 @@ static const uint8_t *fg_firmware(unsigned which, unsigned *size)
  *size = h->fw_size[which];
  return (const uint8_t *)fg_pointer_range(FG_FW_BASE + which*FG_FW_SLOT, FG_FW_SLOT);
 }
-static unsigned fg_abi_enabled, fg_client_busy;
+static unsigned fg_abi_enabled, fg_client_busy, fg_abi_present_wait; /* present_wait: a present/reserve was refused for a running client job (stops queueing behind it) */
 static IOLock *fg_ring_lock;
 /* Present callers already hold the surface lock. ABI never takes that lock;
  * neither client waits nor BO allocations hold this short ring/table mutex. */
@@ -753,6 +753,7 @@ int fuxi_gpu_copy(unsigned slot, uint64_t generation, uintptr_t source, uint64_t
 {
  FG_GUARD;
  if (fg_scanout_owned && !fg_scanout_writable) return 0;
+ if (fg_client_busy) fg_abi_present_wait = 1;
  if (!fuxi_gpu_ready() || fg_busy || fg_client_busy || slot >= FG_CACHE_SLOTS || fg_generation[slot] != generation) return 0;
  if (!width || !height || width > 1080 || height > 2400 || dx > 1080-width || dy > 2400-height ||
      (source & 3) || (pitch & 3) || pitch > 131008 || ((uint64_t)sx+width)*4 > pitch ||
