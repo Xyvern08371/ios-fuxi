@@ -80,6 +80,8 @@ enum {THREAD_CALL_PRIORITY_KERNEL=1,THREAD_CALL_OPTIONS_ONCE=1};
 static unsigned probeKicks;
 static void thread_call_setup_with_options(thread_call_data_t *c,void (*fn)(thread_call_param_t,thread_call_param_t),void *arg,unsigned pri,unsigned opt) {(void)arg;(void)pri;(void)opt;c->fn=fn;}
 static int thread_call_enter(thread_call_data_t *c) {(void)c;probeKicks++;return 0;}
+static unsigned spinKicks;static uint64_t spinDeadline;
+static int thread_call_enter_delayed(thread_call_data_t *c,uint64_t d) {(void)c;spinKicks++;spinDeadline=d;return 0;}
 static unsigned fg_access(uint64_t pa,uint64_t *value,unsigned wr,unsigned wide) {
  assert(!wide);
  if(pa==failAddress || (wr && pa==failWriteAddress))return 1;
@@ -165,6 +167,9 @@ static void probe_script(void) {uint64_t t=ticks-base;
  if(t>=1000 && !(intf[0x298/4]>>16))intf[0x298/4]+=1u<<16; // TE edge
  if(t>=1500 && t<8000)intf[0x2b0/4]=300; // active
  if(t>=8000){ctl[0x1c/4]=0;intf[0x2b0/4]=2400;}}
+static unsigned spinBumped,spinAt=250;
+static void spin_script(void) {
+ if(ticks-base>=spinAt){ctl[0x1c/4]=0;intf[0x2b0/4]=2400;if(!spinBumped){spinBumped=1;intf[0x298/4]+=1u<<16;}}}
 static void panel120_tests(uint8_t *panel) {
  // Exact boot-arg admission; no ownership means no DSI read, write, or command.
  reset();panel120_setup();modelPanel120=0;panel120_drain(panel);
@@ -419,6 +424,35 @@ static void triple_tests(uint8_t *panel) {
  }
  assert(fuxi_gpu_scanout_acquire()==1 && fg_scanout_copy==0);assert(fuxi_gpu_scanout_publish()==2);
  ctl[0x1c/4]=0;intf[0x298/4]+=1u<<16;assert(fuxi_gpu_scanout_retry()==1);
+ // fuxigpuncimport 32768: after a START a delayed thread call spins for transfer-done and publishes the waiting back buffer.
+ {
+  unsigned keepStarts=fg_scanout_starts,keepMatch=fg_scanout_current_match,keepMismatch=fg_scanout_current_mismatch;
+  fg_abi_spin=1;fg_scanout_panel120_active=1;fg_scanout_period_us=8333;fg_scanout_spin_busy=0;spinKicks=0;memset(fg_scanout_spin_stat,0,sizeof(fg_scanout_spin_stat));
+  fg_scanout_spin_kick();assert(spinKicks==1 && fg_scanout_spin_busy && spinDeadline==ticks+7749);
+  fg_scanout_spin_kick();assert(spinKicks==1); // one pending call
+  // No back buffer ready: nothing is published.
+  ctl[0x1c/4]=1;intf[0x2b0/4]=100;spinBumped=0;spinAt=250;base=ticks;probeScript=spin_script;
+  unsigned s0=starts;fg_scanout_spin_run(0,0);probeScript=0;
+  assert(starts==s0 && !fg_scanout_spin_busy && fg_scanout_spin_stat[0]==1 && fg_scanout_spin_stat[2]==1 && !fg_scanout_async_published);
+  // A waiting back buffer is STARTed at the first idle sample; the display path then sees one published result.
+  assert(fuxi_gpu_scanout_acquire()==1);ctl[0x1c/4]=1;intf[0x2b0/4]=100;assert(fuxi_gpu_scanout_publish()==2 && fg_scanout_back_ready);
+  fg_scanout_spin_kick();spinBumped=0;base=ticks;probeScript=spin_script;uint64_t t0_=ticks;
+  fg_scanout_spin_run(0,0);probeScript=0;
+  assert(starts==s0+1 && !fg_scanout_back_ready && fg_scanout_async_published && fg_scanout_spin_stat[1]==1 && ticks-t0_<=260);
+  assert(fuxi_gpu_scanout_retry()==1 && !fg_scanout_async_published && fuxi_gpu_scanout_retry()==0);
+  // Another START intervened (display path won the race): the stale wake publishes nothing.
+  assert(fuxi_gpu_scanout_acquire()==1);ctl[0x1c/4]=1;intf[0x2b0/4]=100;assert(fuxi_gpu_scanout_publish()==2);
+  fg_scanout_spin_kick();fg_scanout_starts++;spinBumped=0;base=ticks;probeScript=spin_script;s0=starts;
+  fg_scanout_spin_run(0,0);probeScript=0;assert(starts==s0 && fg_scanout_back_ready && !fg_scanout_async_published && fg_scanout_spin_stat[3]==1);
+  // The transfer never ends: the spin gives up after 600 us.
+  fg_scanout_spin_kick();spinAt=100000;ctl[0x1c/4]=1;intf[0x2b0/4]=100;spinBumped=0;base=ticks;probeScript=spin_script;t0_=ticks;
+  fg_scanout_spin_run(0,0);probeScript=0;assert(ticks-t0_>=600 && ticks-t0_<=640 && starts==s0 && fg_scanout_spin_stat[3]==2 && !fg_scanout_spin_busy);
+  // Off by default and outside panel120.
+  fg_abi_spin=0;spinKicks=0;fg_scanout_spin_kick();assert(!spinKicks);
+  fg_abi_spin=1;fg_scanout_panel120_active=0;fg_scanout_spin_kick();assert(!spinKicks);
+  fg_abi_spin=0;spinAt=250;ctl[0x1c/4]=1;intf[0x2b0/4]=2400;
+  fg_scanout_back_ready=0;fg_scanout_starts=keepStarts;fg_scanout_current_match=keepMatch;fg_scanout_current_mismatch=keepMismatch;fg_scanout_period_us=16667;
+ }
  assert(fg_scanout_buffer_flips[0] && fg_scanout_buffer_flips[1] && fg_scanout_buffer_flips[2] && parseDouble==1 && parseTriple==1);
  unsigned flips=fg_scanout_flips,drops=fg_scanout_ready_drops;
  assert(fuxi_gpu_scanout_acquire()==1);assert(fuxi_gpu_scanout_publish()==2);

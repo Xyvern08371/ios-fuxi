@@ -148,7 +148,18 @@ static int fg_scanout_write(unsigned pa, unsigned value)
  * START-bit-clear ("clear"), the first write-line idle after it was active ("lineend", 0 when never seen active) and "done" = the
  * later of clear and lineend, the same condition acquire uses. The worker only stores results; accounting runs under FG_GUARD at the
  * next publish, so a window is consistent. Read-only MMIO, no behaviour change. Not yet observed on device. */
-static unsigned fg_abi_probe;
+static unsigned fg_abi_probe, fg_abi_spin;
+/* Opt-in (fuxigpuncimport bit 32768), panel120 + double/triple only. The 1080x2400 transfer measures ~8.0 ms from the TE edge in an 8.33 ms
+ * period, so a START can only catch the next TE if it is written in the ~0.3 ms between transfer-done and that TE; the 0.5-1 ms
+ * display poll (plus timer slack) lands there rarely (71% of gaps were two periods). After each START a delayed thread call wakes at
+ * 93% of a period and spins at most 600 us on CTL START / the write line; at the first idle it publishes the waiting back buffer through
+ * the same fg_scanout_publish() the retry path uses (every gate unchanged: ring, TE, transfer status). Nothing is published when no
+ * back buffer is ready or another START intervened; the display path stays the fallback. */
+#define FG_SCAN_SPIN_LEAD_PCT 93u
+#define FG_SCAN_SPIN_US 600u
+static thread_call_data_t fg_scanout_spin_call;
+static unsigned fg_scanout_spin_setup, fg_scanout_spin_busy, fg_scanout_spin_serial, fg_scanout_async_published;
+static unsigned fg_scanout_spin_stat[4]; /* wakes, published, no back buffer, window expired */
 #define FG_PROBE_MAX 128
 static thread_call_data_t fg_scanout_probe_call;
 static unsigned fg_scanout_probe_setup, fg_scanout_probe_busy, fg_scanout_probe_ready, fg_scanout_probe_te0;
@@ -170,12 +181,49 @@ static void fg_scanout_probe_run(thread_call_param_t a, thread_call_param_t b)
   if (!res[1] && !(start & 1)) res[1] = now - t0 + 1;
   if ((line & 65535) != 0 && (line & 65535) < 2400) active = 1;
   else if (active && !res[2]) res[2] = now - t0 + 1;
-  if (res[1] && (res[2] || !active)) { res[3] = res[1] > res[2] ? res[1] : res[2]; break; }
+  /* START clears ~17 us after the write, before the MDP starts writing at the next TE: finishing on "clear and never active" ended
+   * nearly every probe early. Wait for the TE edge, then 0.5 ms for the line to go active (otherwise the START was a no-op). */
+  if (res[1] && res[0] && (res[2] || (!active && now - t0 >= res[0] - 1 + hz/2000))) { res[3] = res[1] > res[2] ? res[1] : res[2]; break; }
   if (now >= limit) break;
   delay(10);
  }
  for (unsigned i = 0; i < 4; i++) fg_scanout_probe_res[i] = res[i];
  __atomic_store_n(&fg_scanout_probe_ready, 1, __ATOMIC_RELEASE);
+}
+static int fg_scanout_publish(void);
+static void fg_scanout_spin_run(thread_call_param_t a, thread_call_param_t b)
+{
+ (void)a; (void)b;
+ uint64_t hz = rsr("cntfrq_el0"), end = rsr("cntpct_el0") + hz*FG_SCAN_SPIN_US/1000000;
+ unsigned serial = fg_scanout_spin_serial, result = 2; /* 2 = window expired */
+ fg_scanout_spin_stat[0]++;
+ for (;;) {
+  unsigned line, start;
+  if (!fg_scanout_read(FG_SCAN_INTF+0x2b0, &line) || !fg_scanout_read(FG_SCAN_CTL+0x1c, &start)) break;
+  if (!(start & 1) && ((line & 65535) == 0 || (line & 65535) >= 2400)) {
+   FG_GUARD;
+   if (fg_scanout_starts != serial || fg_scanout_failed || !fg_scanout_back_ready || fg_busy) { result = fg_scanout_back_ready ? 3 : 1; }
+   else if (fg_scanout_publish() == 1) { fg_scanout_async_published = 1; result = 0; }
+   else result = 3;
+   break;
+  }
+  if (rsr("cntpct_el0") >= end) break;
+  delay(2);
+ }
+ { FG_GUARD; fg_scanout_spin_stat[result == 0 ? 1 : result == 1 ? 2 : 3]++; fg_scanout_spin_busy = 0; }
+}
+/* Called under FG_GUARD right after a START (and its arm). */
+static void fg_scanout_spin_kick(void)
+{
+ if (!fg_abi_spin || fg_scanout_spin_busy || !fg_scanout_panel120_active || !fg_scanout_double_active) return;
+ if (!fg_scanout_spin_setup) {
+  thread_call_setup_with_options(&fg_scanout_spin_call, fg_scanout_spin_run, NULL, THREAD_CALL_PRIORITY_KERNEL, THREAD_CALL_OPTIONS_ONCE);
+  fg_scanout_spin_setup = 1;
+ }
+ uint64_t lead;
+ nanoseconds_to_absolutetime((uint64_t)fg_scanout_period_us*FG_SCAN_SPIN_LEAD_PCT*10, &lead);
+ fg_scanout_spin_busy = 1; fg_scanout_spin_serial = fg_scanout_starts;
+ (void)thread_call_enter_delayed(&fg_scanout_spin_call, mach_absolute_time() + lead);
 }
 static void fg_scanout_probe_kick(unsigned te_frame)
 {
@@ -748,6 +796,11 @@ static int fg_scanout_publish(void)
       fg_scanout_drain_us, fg_scanout_te_mode, te_dhz/10, te_dhz%10,
       fg_scanout_iv[0], fg_scanout_iv[1], fg_scanout_iv[2], fg_scanout_iv[3]);
   fg_scanout_probe_report();
+  if (fg_abi_spin) {
+   printf("FUXI SCANOUT: te_start spin wakes=%u published=%u no_back_buffer=%u expired_or_raced=%u\n",
+       fg_scanout_spin_stat[0], fg_scanout_spin_stat[1], fg_scanout_spin_stat[2], fg_scanout_spin_stat[3]);
+   fg_scanout_spin_stat[0] = fg_scanout_spin_stat[1] = fg_scanout_spin_stat[2] = fg_scanout_spin_stat[3] = 0;
+  }
   {
    uint64_t n = fg_scanout_xfer_n ? fg_scanout_xfer_n : 1, r = fg_scanout_r2s_n ? fg_scanout_r2s_n : 1, cum = 0;
    unsigned p50 = 0;
@@ -784,6 +837,7 @@ static int fg_scanout_publish(void)
  }
  __asm__ volatile("dsb sy" ::: "memory");
  fg_scanout_arm(count);
+ fg_scanout_spin_kick();
  return 1;
 }
 int fuxi_gpu_scanout_publish(void)
@@ -803,6 +857,7 @@ int fuxi_gpu_scanout_retry(void)
 {
  FG_GUARD;
  if (fg_scanout_failed) return -1;
+ if (fg_scanout_async_published) { fg_scanout_async_published = 0; return 1; } /* the spin thread already STARTed the waiting buffer */
  if (!fg_scanout_back_ready || fg_busy) return 0;
  return fg_scanout_publish();
 }
