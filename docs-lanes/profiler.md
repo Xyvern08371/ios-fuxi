@@ -68,3 +68,58 @@ both kernel profiles before building. The host test compiles the actual C with
 mocked tasks/time and ASan/UBSan. Optional `--xnu-buildtree BUILDTREE` adds
 full-file ARM64 syntax checks using an existing saved XNU build tree, without
 running its scripts or accessing a device.
+
+## Registry and work-interval timing
+
+Add the single token `fuxiregtrace=1` (14 bytes). UFS startup parses it once;
+absent/zero/other values leave timing, process-name checks, locks and the worker
+disabled. It filters exactly `backboardd`, across all threads/restarts. A worker
+prints one line every ten seconds, including idle windows:
+
+```text
+REGTRACE backboardd span_us=<window> dropped=<n>/<total_us>/<max_us> wi=<n>/<total_us>/<max_us> [class=<class> key=<key> plane=<plane> options=0x<options> apis=0x<mask> n=<calls> total_us=<total> max_us=<max> bytes=<max-size> lookup_us=<lookup-total> serialize_us=<serialize-total> copy_us=<copy-total>] ...
+```
+
+Up to eight rows rank by total elapsed handler time among 128 tracked
+`(starting-entry-class,key,plane,options)` tuples. Oversized names (128 bytes or
+more) and new tuples after saturation contribute to `dropped`; existing tuples
+keep accumulating. Empty/no plane prints `-`, whole-table key is `*`. Whitespace,
+nonprinting bytes and `[`, `]`, `=` print as `_`; raw names stay distinct internally.
+`apis` ORs 1=raw bytes, 2=XML property, 4=recursive XML property, 8=unsupported XML
+table, 16=binary table, 32=binary property. Binary forwarding MIG calls are counted
+once in their `_bin_buf` implementations. `bytes` is the maximum produced
+serialized/raw length, even on copyout failure; zero also covers missing/denied
+properties and serialization failures.
+
+Times include waits/preemption, exclude final aggregation/printing, and belong
+to completion windows; `span_us` is actual worker spacing. Lookup includes policy,
+compatibility and key creation; serialize includes allocation; copy includes
+copyout/releases. Whole-table binary snapshot/compatibility lookup is in serialize.
+Early returns accrue to the current phase. `wi` covers all `work_interval_ctl`
+operations/error returns via C exit cleanup. Under 80 KiB of fixed static storage
+holds the table, top-eight snapshot and output buffer. Hooks allocate/print
+nothing; the worker selects/resets under a mutex and prints after unlocking.
+
+Inspection found no property overrides, computed values or large registry OSData
+in AppleCLCD/IOMobileFramebuffer or SweetSurface. AppleCLCD's three published
+properties are small startup values; its swap/vsync lock is separate from the
+registry property lock. Optional FuxiBacklight reads do sampled logging (more with
+startup trace); brightness dictionaries are immutable snapshots rebuilt on writes.
+ARM64 enables `CONFIG_THREAD_GROUPS=1`. Work-interval NOTIFY validates the interval
+and creator, obtains urgency, then calls the machine callback; the default
+perfcontrol path returns immediately and our overlays register no replacement.
+No display-value, locking or scheduler change was justified by inspection.
+
+The supplied 60 s/2 ms samples observed about 7% in registry MIG and 2.2% in the
+work-interval syscall. **REGTRACE device results, the per-frame key, the slow stage
+and tracer overhead are not yet observed.** These hooks exclude Mach dispatch/reply
+and user-library time; sampling alone does not establish the expensive property.
+
+`xnu/fuxi-prof/` holds the canonical code and reviewed `regtrace-hooks.diff`.
+`tools/sync-fuxi-regtrace.py` generates `0112-fuxi-registry-trace.patch`;
+`--check --tree TREE` also validates application after 0111. The shared header is
+an XNU-only export for BSD/IOKit builds. Both CI profiles run
+`tools/test-fuxi-regtrace.py`: actual C/C++ with ASan/UBSan tests ordering, bounds,
+filtering, once-only/default-off initialization, concurrency, phases/sizes and exit
+cleanup. Optional `--xnu-buildtree BUILDTREE` checks the complete new BSD source
+and patched syscall/IOUserClient translation units against saved ARM64 flags/headers.
