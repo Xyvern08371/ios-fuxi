@@ -103,10 +103,9 @@ public:
  bool destroy(Texture *t) {if(t){limits.release(t->charged);delete t;}return !poisoned;}
  void destroy(Pipeline *p) {if(p && !--p->references)delete p;}
  bool requiresSampling(const Pipeline *p) const {return p->sampled;}
- void submit(const std::vector<Operation>& ops,const std::function<void()> &scheduled={},std::function<void()> *retirement=nullptr,const std::function<void()> &prepare={},ShadowSnapshot *shadows=nullptr,ShadowPool *shadowPool=nullptr) {
+ void submit(const std::vector<Operation>& ops,const std::function<void()> &scheduled={},std::function<void()> *retirement=nullptr,const std::function<void()> &prepare={}) {
   if(retirement && beforeSubmit)beforeSubmit();
   if(prepare)prepare();
-  if(shadows){auto total=shadows->bytes(),copied=shadows->apply(*shadowPool);if(currentFrame){currentFrame->shadowCopyBytes+=copied;currentFrame->shadowSkippedBytes+=total-copied;}}
   if(retirement){auto copy=ops;submit(copy,scheduled);*retirement=[this]{requireLive();};return;}
   if(getenv("FUXI_TEST_LOST")) {poisoned=true;throw std::runtime_error("modeled device loss");}
   if(getenv("FUXI_TEST_HANG"))for(;;)pause();

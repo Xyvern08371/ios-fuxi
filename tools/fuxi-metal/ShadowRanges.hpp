@@ -5,7 +5,6 @@
 #include <cstdint>
 #include <cstring>
 #include <memory>
-#include <map>
 #include <mutex>
 #include <vector>
 #include <utility>
@@ -87,24 +86,9 @@ public:
   auto &s=cached[cached[0].capacity<cached[1].capacity?0:1];if(storage.capacity>s.capacity)s=std::move(storage);
  }
 };
-inline bool shadowCacheable(uint32_t textureUses,bool bufferUse,bool full){return textureUses==1 && !bufferUse && !full;}
-// Raw no-copy pointers have no mutation seed. Compare immutable chunks at commit.
-class ShadowCache {
- std::mutex mutex;std::map<std::pair<uint64_t,uint64_t>,std::shared_ptr<const std::vector<uint8_t>>> chunks;size_t bytes=0;
-public:
- static constexpr size_t chunkBytes=4096,budget=4u*1024*1024;
- std::shared_ptr<const std::vector<uint8_t>> capture(const void *source,uint64_t offset,size_t size,uint64_t &copied){
-  std::lock_guard<std::mutex> lock(mutex);auto key=std::make_pair(offset,uint64_t(size));auto it=chunks.find(key);
-  if(it!=chunks.end() && !memcmp(it->second->data(),(const uint8_t *)source+offset,size))return it->second;
-  auto next=std::make_shared<const std::vector<uint8_t>>((const uint8_t *)source+offset,(const uint8_t *)source+offset+size);copied+=size;
-  if(it==chunks.end()){if(size>budget-bytes){chunks.clear();bytes=0;}bytes+=size;}chunks[key]=next;return next;
- }
-};
-struct CachedShadowSegment {void *destination;uint64_t offset;std::shared_ptr<const std::vector<uint8_t>> data;};
 struct ShadowSegment {void *destination;const void *source;uint64_t offset,size,packed;};
 class ShadowSnapshot {
  ShadowStorage storage;std::vector<ShadowSegment> segments;size_t size=0,captured=0;
- std::vector<CachedShadowSegment> cached;uint64_t cachedBytes=0,cachedCopied=0;
  template<class F> void pieces(void *destination,uint64_t offset,uint64_t bytes,F &&f) const {
   uint64_t end=offset+bytes;while(offset<end){const ShadowSegment *hit=nullptr;uint64_t next=end;
    for(const auto &r:segments)if(r.destination==destination){if(r.offset<=offset && offset-r.offset<r.size){hit=&r;break;}if(r.offset>offset)next=std::min(next,r.offset);}
@@ -115,16 +99,7 @@ public:
  void add(void *destination,const void *source,const ShadowRanges &ranges){
   std::vector<ShadowSegment> added;ranges.each([&](auto r){pieces(destination,r.offset,r.size,[&](uint64_t offset,uint64_t bytes,const ShadowSegment *hit){if(!hit){added.push_back({destination,source,offset,bytes,size});size+=bytes;}});});segments.insert(segments.end(),added.begin(),added.end());
  }
- void addCached(void *destination,const void *source,const ShadowRanges &ranges,ShadowCache &cache){
-  ranges.each([&](auto r){for(uint64_t at=r.offset;at<r.offset+r.size;){auto n=std::min<uint64_t>(ShadowCache::chunkBytes-at%ShadowCache::chunkBytes,r.offset+r.size-at);
-   cached.push_back({destination,at,cache.capture(source,at,n,cachedCopied)});cachedBytes+=n;at+=n;}});
- }
- size_t bytes() const{return size+cachedBytes;}
- uint64_t copiedBytes() const{return size+cachedCopied;}
- uint64_t reusedBytes() const{return cachedBytes-cachedCopied;}
- template<class F> void eachRange(F &&f) const {for(auto r:segments)f((uint8_t *)r.destination+r.offset,r.size);for(auto &r:cached)f((uint8_t *)r.destination+r.offset,r.data->size());}
- // Call only while no GPU writer can touch these ranges.
- template<class F> void eachDirty(F &&f) const {for(auto r:segments)f((uint8_t *)r.destination+r.offset,r.size);for(auto &r:cached)if(memcmp((uint8_t *)r.destination+r.offset,r.data->data(),r.data->size()))f((uint8_t *)r.destination+r.offset,r.data->size());}
+ size_t bytes() const{return size;}
  void capture(ShadowPool &pool){
   if(size==captured)return;if(!storage.data || storage.capacity<size){auto next=pool.take(size);if(captured)memcpy(next.data.get(),storage.data.get(),captured);pool.put(std::move(storage));storage=std::move(next);}
   for(auto r:segments)if(r.packed>=captured)memcpy(storage.data.get()+r.packed,(const uint8_t *)r.source+r.offset,r.size);captured=size;
@@ -135,11 +110,7 @@ public:
  uint64_t refresh(void *destination,const void *source,const ShadowRanges &ranges) const {
   uint64_t copied=0;ranges.each([&](auto r){pieces(destination,r.offset,r.size,[&](uint64_t offset,uint64_t bytes,const ShadowSegment *hit){const void *from=hit?storage.data.get()+hit->packed+offset-hit->offset:(const uint8_t *)source+offset;memcpy((uint8_t *)destination+offset,from,bytes);copied+=bytes;});});return copied;
  }
- size_t apply(ShadowPool &pool){
-  for(auto r:segments)memcpy((uint8_t *)r.destination+r.offset,storage.data.get()+r.packed,r.size);size_t copied=size;
-  for(auto &r:cached)if(memcmp((uint8_t *)r.destination+r.offset,r.data->data(),r.data->size())){memcpy((uint8_t *)r.destination+r.offset,r.data->data(),r.data->size());copied+=r.data->size();}
-  release(pool);return copied;
- }
- void release(ShadowPool &pool){pool.put(std::move(storage));segments.clear();cached.clear();size=captured=0;cachedBytes=cachedCopied=0;}
+ size_t apply(ShadowPool &pool){for(auto r:segments)memcpy((uint8_t *)r.destination+r.offset,storage.data.get()+r.packed,r.size);size_t copied=size;release(pool);return copied;}
+ void release(ShadowPool &pool){pool.put(std::move(storage));segments.clear();size=captured=0;}
 };
 }

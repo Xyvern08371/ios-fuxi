@@ -2429,6 +2429,10 @@ changes, device access, deployment, firmware download, push or workflow run.
 
 ## Index admission and unchanged sampled shadows
 
+The shadow-reuse portion below is historical and has been reverted after device
+measurement; see [Restore simple texture shadows](#restore-simple-texture-shadows).
+The read-only-index admission remains in effect.
+
 2026-10-27. **Device results for this revision: not yet observed.** The supplied
 227-frame backboardd trace on iOS 16.7 / FuxiMetal `78aaa3a` reports
 `wait_reasons=drain:180,conflict:0,slots:0`, slot-wait p50/p90 **6.312/8.160 ms**,
@@ -2580,3 +2584,98 @@ bytes change through an environment variable outside `DrawInput` (production
 planning has no such input). All **12** `tools/sync-fuxi-*.py --check` pass;
 no generated patches changed. No device access, deployment, external project
 changes, vendoring, Apple/GPL code or binaries, push or workflow run occurred.
+
+## Restore simple texture shadows
+
+2026-10-27. The supplied **observed** backboardd trace for `53ddcd8` (149 frames),
+compared with `78aaa3a` (227 frames), validates read-only-index admission:
+`wait_reasons=drain:0` versus `drain:180`, with `index_submits=readonly:149`.
+It rejects byte-compared texture-shadow chunk reuse. Shadow-copy p50/p90 rose
+from **0.634/1.350 ms** to **12.220/118.277 ms**; commit snapshot rose from
+**1.262/1.969 ms** to **3.007/4.341 ms**, with commit-call about **3 ms**.
+Retire-lock rose from **0.001/0.001 ms** to **1.356/104.638 ms**; slot-wait was
+**0.229/53.838 ms**, submit-queue **0.040/102.120 ms**, and backend-submit
+**14.9/122.5 ms** versus **3.6/5.8 ms**. Wall p50 rose from **24 ms** to **75 ms**,
+effective fps fell from **49** to **30**, and one-tick 60 Hz cadence fell from
+**84%** to **44%**. Reusing **3.2 MB/frame** of snapshot bytes and skipping
+**6.9 MB/frame** of backing copies (only **230 bytes/frame** copied, with
+**3.7 MB/frame** of new snapshot bytes) cost more than copying the logical
+**6.9 MB/frame** of texture shadows. These are supplied device observations,
+not a new run or a timing claim for this restoration.
+
+Code attribution in **`53ddcd8`**, with line numbers at that revision:
+
+- `Frontend.mm:1393–1397` calls `ShadowSnapshot::addCached` directly on the
+  caller's commit thread. `ShadowRanges.hpp:93–101` (`ShadowCache::capture`)
+  locks the per-buffer cache mutex for each chunk, does a `std::map` lookup and
+  full-byte `memcmp`, and allocates a vector/shared ownership for changed
+  chunks. `addCached` at lines 118–121 also appends a reference for every chunk,
+  even on unchanged frames. This work precedes commit return; it does not hold
+  the backend mutex.
+- `Backend.hpp:893` acquires `Backend::mutex` before admission; lines 895–899
+  also collect/deduplicate all resource uses under it. `shadowHazard`
+  at lines 908–912 scans each snapshot segment/chunk against live-slot writer
+  and use lists. After excluding writers, it calls `eachDirty`
+  (`ShadowRanges.hpp:127`) to compare mapped backing bytes, then checks dirty
+  ranges against overlapping GPU readers. The condition-variable predicate at
+  `Backend.hpp:918–923` repeats this work on wakes while holding that mutex.
+  The actual condition-variable sleep releases the mutex; the comparisons and
+  nested range scans do not. `slot_wait` includes predicate CPU work.
+- `Backend.hpp:934` applies snapshots under the same backend mutex.
+  `ShadowSnapshot::apply` (`ShadowRanges.hpp:138–142`) compares cached backing
+  bytes again before copying and releases chunk references, potentially freeing
+  older queued versions there. `shadow_copy` includes that work, even with
+  almost no copied payload. The retirement callback waits for the fence outside
+  the mutex, then takes it at `Backend.hpp:1572–1573` before invalidation,
+  resource release and slot wakeup. Thus admission/application can delay
+  retirement despite a completed fence. The submit queue is serial
+  (`Frontend.mm:1750–1751` in that revision), so a slow submit also delays later
+  commands. The trace fits this contention mechanism; it does not isolate the
+  cost of each individual compare, allocation or scan.
+
+Restore the `78aaa3a` shadow implementation: one command-owned packed snapshot
+of recorded ranges before commit returns, then unconditional `memcpy` of those
+ranges into shared backing. The existing two-entry `ShadowPool` still reuses
+retired packed storage. Remove `ShadowCache`, immutable chunk maps/references,
+backing comparisons, explicit shadow-destination admission and its all-use
+metadata. Overlap mode again installs the original opaque `prepare` callback,
+which fully drains before writing shared backing under the backend mutex;
+event-split commands apply it once. The synchronous refresh and bounded/full
+range rules are restored too. Raw caller pointers have no reliable generation
+or mutation seed, so identity alone cannot safely skip their copies.
+
+Keep the `53ddcd8` index-writer tracking, coherent/import/attachment alias checks,
+final-plan storage-writer proof, upload provenance, read-only-index admission,
+noncoherent exclusion, poison handling and all index/drain counters unchanged.
+Only the reader-use metadata needed by removed shadow admission is dropped;
+GPU-writer metadata remains through fence wait and invalidation. A shadow copy
+can once again increment `prepare`/drain counters; an otherwise read-only index
+does not cause a drain. Keep every frame-trace field and its aggregation/reset:
+`snapshot_reused_bytes`, `shadow_skipped_bytes` and `shadow_waits` now read zero;
+`snapshot_bytes` and `shadow_copy_bytes` again count all recorded payload.
+
+Portable controls now assert full copies for unchanged inputs, frozen queued
+A/B/A versions, overwriting intervening GPU writes, bounded/full/fallback pixels,
+and prepare exclusion even for unrelated flights. The real-Vulkan admission
+controls retain the upload/read-only and GPU-written index checks. Native
+`ShadowFrontendTests.mm` keeps view writes and paused queued snapshots, expecting
+all 142 bytes captured/applied on every commit and zero reuse/skip counters.
+Its submit calls and the modeled backend match the restored four-argument API;
+native `.mm` compilation/execution remains unavailable on Linux and was checked
+by inspection.
+
+Validation: invoked all **34** `tools/test-fuxi-metal*.py` entrypoints. All
+**17 runnable suites passed**: backend, frontend, frametrace, shadows (including
+real-Vulkan admission and synchronous/overlap pixels), overlap, merge/barriers,
+memory, mipfeedback, M6, M9m/n/o, metal, metal2, metal2g/h, and stage with
+`--policy-storage-only`. Existing local shader tools enabled the Vulkan controls;
+no dependencies were downloaded. The other **17** require unavailable external
+translator/checkouts, Apple SDK/metallib/cache or boot/artifact inputs:
+artifacts, ca-offline, cache/cache-hits, defaults, draw-plans, M6b, M7,
+M9a/b/g/h/i/k/l, pipeline and translation. Their argument/precondition failures
+are not passes. M9o's optional external shader/line controls and stage's real
+artifact verification remain unavailable. All **12**
+`tools/sync-fuxi-*.py --check` pass; `git diff --check` passes and generated
+patches are unchanged. Frame-trace definitions/tests are unchanged from
+`53ddcd8`. No device access or new device measurement, external project changes,
+vendoring, Apple/GPL code or binaries, push or workflow run occurred.

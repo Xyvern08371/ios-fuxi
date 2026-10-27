@@ -308,7 +308,7 @@ static FuxiOwner *owner(id obj) {return (FuxiOwner *)objc_getAssociatedObject(ob
   if(state!=MTLPurgeableStateKeepCurrent)_purgeable=state;return before;}
 }
 @end
-@interface FuxiBuffer : FuxiResource { @public fuxi::Buffer *_buffer;fuxi::ShadowCache _shadowCache;void *_wrapped;NSUInteger _wrappedLength;void (^_deallocator)(void *,NSUInteger);BOOL _shadow;MTLStorageMode _storage;MTLCPUCacheMode _cacheMode; }
+@interface FuxiBuffer : FuxiResource { @public fuxi::Buffer *_buffer;void *_wrapped;NSUInteger _wrappedLength;void (^_deallocator)(void *,NSUInteger);BOOL _shadow;MTLStorageMode _storage;MTLCPUCacheMode _cacheMode; }
 @end
 @implementation FuxiBuffer
 - (void)dealloc {auto *backend=owner(_device)->backend;backend->destroy(_buffer);
@@ -913,7 +913,7 @@ static thread_local FuxiCommandBuffer *completionCommand;
  dispatch_group_t _scheduledGroup,_commitReady;BOOL _overlap,_finished,_earlySubmit;
  fuxi::FrameSample _flightTrace;fuxi::FrameClock::time_point _commitStart,_commitReturn;uint64_t _gpuBefore;bool _surfaceFrame;
  std::function<void()> _retirement;std::shared_ptr<fuxi::SurfaceLease> _lease,_pendingLease;
- struct ShadowUse {FuxiBuffer *buffer;fuxi::ShadowRanges ranges;uint32_t textureUses=0;bool bufferUse=false;ShadowUse(FuxiBuffer *b):buffer(b),ranges(b->_wrappedLength){}};
+ struct ShadowUse {FuxiBuffer *buffer;fuxi::ShadowRanges ranges;uint32_t textureUses=0;ShadowUse(FuxiBuffer *b):buffer(b),ranges(b->_wrappedLength){}};
  std::unordered_map<fuxi::Buffer *,ShadowUse> _shadowUses;fuxi::ShadowSnapshot _shadows;
  std::unordered_set<void *> _resourceSet;fuxi::CommandResourceCache _resourceCache;
  fuxi::FrontendTimes _frontendTimes;
@@ -933,7 +933,7 @@ static thread_local FuxiCommandBuffer *completionCommand;
 static void retainCommandResource(FuxiCommandBuffer *command,id resource,bool bounded=false,fuxi::ShadowFullReason reason=fuxi::ShadowFullReason::other){
  if(command->_resourceCache.seen((void *)resource,bounded,reason))return;
  FuxiBuffer *buffer=nil;if([resource isKindOfClass:[FuxiBuffer class]])buffer=resource;else if([resource isKindOfClass:[FuxiTexture class]])buffer=[(FuxiTexture *)resource buffer];
- if(buffer && buffer->_shadow){auto &use=command->_shadowUses.try_emplace(buffer->_buffer,buffer).first->second;if([resource isKindOfClass:[FuxiBuffer class]])use.bufferUse=true;if(!bounded)use.ranges.full(reason);if(!bounded && [resource isKindOfClass:[FuxiTexture class]])use.textureUses|=4;}
+ if(buffer && buffer->_shadow){auto &use=command->_shadowUses.try_emplace(buffer->_buffer,buffer).first->second;if(!bounded)use.ranges.full(reason);if(!bounded && [resource isKindOfClass:[FuxiTexture class]])use.textureUses|=4;}
  if(resource && command->_resourceSet.insert((void *)resource).second)[command->_resources addObject:resource];
 }
 static void retainCommandTexture(FuxiCommandBuffer *command,FuxiTexture *texture,bool sampled){
@@ -1383,18 +1383,15 @@ static NSString *renderPassText(MTLRenderPassDescriptor *d){
  dispatch_group_enter(_completionGroup);dispatch_group_enter(_scheduledGroup);
  // Reserve queue order before snapshotting; explicit enqueue reserves it earlier.
  if(!_enqueued)[self reserveOverlap];
- // Freeze caller-owned bytes before returning; backend admission excludes only
- // flights that can race index inspection or changed shadow destinations.
+ // Snapshot caller-owned no-copy bytes before commit returns. The worker drains
+ // prior submissions before refreshing a shared shadow allocation.
  auto snapshotStart=_frameTrace?fuxi::FrameClock::now():fuxi::FrameClock::time_point{};
  try{if(_earlySubmit){auto *backend=owner(_queue->_device)->backend;backend->requireLive();
    _pendingLease=std::make_shared<fuxi::SurfaceLease>(true,lockScanoutPendingSurface,unlockScanoutSurface,&backend->poisoned);
    for(id r in _resources)if([r isKindOfClass:[FuxiTexture class]])_pendingLease->add((uintptr_t)[(FuxiTexture *)r iosurface]);
   }
-  prepareCommandShadows(self,_frameTrace?&_flightTrace:nullptr);for(auto &entry:_shadowUses){auto &use=entry.second;
-   if(fuxi::shadowCacheable(use.textureUses,use.bufferUse,use.ranges.isFull()))_shadows.addCached(use.buffer->_buffer->contents,use.buffer->_wrapped,use.ranges,use.buffer->_shadowCache);
-   else _shadows.add(use.buffer->_buffer->contents,use.buffer->_wrapped,use.ranges);
-  }
-  _shadows.capture(_queue->_shadowPool);if(_frameTrace){_flightTrace.snapshotBytes+=_shadows.copiedBytes();_flightTrace.snapshotReusedBytes+=_shadows.reusedBytes();}
+  prepareCommandShadows(self,_frameTrace?&_flightTrace:nullptr);for(auto &entry:_shadowUses){auto &use=entry.second;_shadows.add(use.buffer->_buffer->contents,use.buffer->_wrapped,use.ranges);}
+  _shadows.capture(_queue->_shadowPool);if(_frameTrace)_flightTrace.snapshotBytes+=_shadows.bytes();
  }catch(const std::exception &e){[self submissionError:e.what()];}
  _commitReturn=fuxi::FrameClock::now();
  if(_frameTrace){_flightTrace.snapshot=fuxi::frameNanos(snapshotStart);_flightTrace.commitCall=fuxi::frameNanos(_commitStart);_queue->_traceReturn=uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(_commitReturn.time_since_epoch()).count());}
@@ -1426,17 +1423,20 @@ static NSString *renderPassText(MTLRenderPassDescriptor *d){
   if(gpuScanout)for(id r in _resources)if([r isKindOfClass:[FuxiTexture class]])surfaces.push_back((uintptr_t)[(FuxiTexture *)r iosurface]);
   std::sort(surfaces.begin(),surfaces.end());for(auto surface:surfaces)_lease->add(surface);
   if(_frameTrace)_flightTrace.leaseLock+=fuxi::frameNanos(leaseStart);
-  fuxi::ShadowSnapshot *shadows=_overlap && _shadows.bytes()?&_shadows:nullptr;
-  if(!_overlap){auto start=fuxi::FrameClock::now();uint64_t bytes=refreshCommandShadows(self);auto ns=fuxi::frameNanos(start);fuxi::Backend::shadowCopyNanos+=ns;if(_frameTrace){_flightTrace.shadowCopyBytes+=bytes;_flightTrace.shadowCopy+=ns;}}
+  auto refresh=[&]{auto start=fuxi::FrameClock::now();
+   uint64_t bytes=_overlap?_shadows.apply(_queue->_shadowPool):refreshCommandShadows(self);if(_frameTrace)_flightTrace.shadowCopyBytes+=bytes;
+   auto ns=fuxi::frameNanos(start);fuxi::Backend::shadowCopyNanos+=ns;if(_frameTrace)_flightTrace.shadowCopy+=ns;
+  };
+  std::function<void()> prepare;if(_overlap){if(_shadows.bytes())prepare=refresh;}else refresh();
   size_t begin=0;
   auto scheduled=[&]{@synchronized(self){_scheduled=YES;if(_status<MTLCommandBufferStatusScheduled)_status=MTLCommandBufferStatusScheduled;}};
   for(const auto &point:_events){
-   if(point.operation>begin){backend->submit(std::vector<fuxi::Operation>(_ops.begin()+begin,_ops.begin()+point.operation),scheduled,nullptr,{},shadows,&_queue->_shadowPool);shadows=nullptr;begin=point.operation;}
+   if(point.operation>begin){backend->submit(std::vector<fuxi::Operation>(_ops.begin()+begin,_ops.begin()+point.operation),scheduled,nullptr,prepare);prepare={};begin=point.operation;}
    if(point.signal)[point.event setSignaledValue:point.value];else if(![point.event waitUntilSignaledValue:point.value timeoutMS:2000])throw std::runtime_error("process-local event wait timed out");
   }
-  if(_events.empty())backend->submit(_ops,scheduled,_overlap?&_retirement:nullptr,{},shadows,&_queue->_shadowPool);
-  else if(begin<_ops.size())backend->submit(std::vector<fuxi::Operation>(_ops.begin()+begin,_ops.end()),scheduled,_overlap?&_retirement:nullptr,{},shadows,&_queue->_shadowPool);
-  else {if(shadows)backend->submit({},scheduled,nullptr,{},shadows,&_queue->_shadowPool);else scheduled();}
+  if(_events.empty())backend->submit(_ops,scheduled,_overlap?&_retirement:nullptr,prepare);
+  else if(begin<_ops.size())backend->submit(std::vector<fuxi::Operation>(_ops.begin()+begin,_ops.end()),scheduled,_overlap?&_retirement:nullptr,prepare);
+  else {if(prepare)backend->submit({},scheduled,nullptr,prepare);else scheduled();}
   if(backboard){std::lock_guard<std::mutex> lock(backend->mutex);
    for(id r in _resources){if(![r isKindOfClass:[FuxiTexture class]] || ![(FuxiTexture *)r iosurface])continue;auto *texture=((FuxiTexture *)r)->_texture;if(!texture)continue;
     for(const auto &op:_ops)if(op.pipeline || op.clearOnly)for(unsigned i=0;i<op.colorCount;++i){auto c=op.color(i);if(c.texture==texture && c.store && texture->isDefined(c.level))_surfaceFrame=true;}}

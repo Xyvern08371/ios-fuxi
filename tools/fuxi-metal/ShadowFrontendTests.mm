@@ -84,10 +84,10 @@ int main(){@autoreleasepool{
  dispatch_suspend(queue->_submitQueue);
  for(unsigned i=0;i<3;++i){if(i==2){dispatch_resume(queue->_submitQueue);[versions[0] waitUntilCompleted];[versions[1] waitUntilCompleted];dispatch_suspend(queue->_submitQueue);}if(i==1)cpu[288]=39;auto *c=versions[i]=[(FuxiCommandBuffer *)[queue commandBuffer] retain];c->_frameTrace=YES;
   FuxiRender *e=(FuxiRender *)[c renderCommandEncoderWithDescriptor:pass];[e setRenderPipelineState:(id)pipeline];[e setFragmentTexture:(id)view atIndex:0];[e setFragmentSamplerState:(id)sampler atIndex:0];[e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];[e endEncoding];[c commit];
-  assert(c->_flightTrace.snapshotBytes==(i==1?142:0) && c->_flightTrace.snapshotReusedBytes==(i==1?0:142));
+  assert(c->_flightTrace.snapshotBytes==142 && !c->_flightTrace.snapshotReusedBytes);
  }
  memset(cpu,77,sizeof(cpu));dispatch_resume(queue->_submitQueue);
- for(unsigned i=0;i<3;++i){auto *c=versions[i];[c waitUntilCompleted];assert(c.status==MTLCommandBufferStatusCompleted && c->_flightTrace.shadowCopyBytes==(i==2?0:142) && c->_flightTrace.shadowSkippedBytes==(i==2?142:0));[c release];}assert(versionDraws==3);
+ for(unsigned i=0;i<3;++i){auto *c=versions[i];[c waitUntilCompleted];assert(c.status==MTLCommandBufferStatusCompleted && c->_flightTrace.shadowCopyBytes==142 && !c->_flightTrace.shadowSkippedBytes);[c release];}assert(versionDraws==3);
  [sampler release];[view release];[texture release];
  fuxi::Backend::modelDraw={};[pipeline release];[target release];[buffer release];[queue release];[device release];
  puts("PASS: shadow bindings/offsets, frozen indexed u16 quads, strips/restarts, bounds and mutable-index fallback, aliased indices, scan cache and reason/byte trace");
