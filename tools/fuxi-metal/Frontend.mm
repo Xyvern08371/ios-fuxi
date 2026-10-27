@@ -1180,20 +1180,20 @@ static uint64_t refreshCommandShadows(FuxiCommandBuffer *command){
 
 
 @end
-// Only the attached targets are captured at encoder creation; text is formatted lazily for failure logs.
-struct PassSnap {
- NSUInteger width=0,height=0;
- struct Color {id texture=nil;NSUInteger level=0,slice=0,load=0,store=0;double clear[4]{};} colors[8];
- PassSnap()=default;PassSnap(const PassSnap &)=delete;PassSnap &operator=(const PassSnap &)=delete;
- ~PassSnap(){for(auto &c:colors)[c.texture release];}
-};
-static std::string passSnapText(const PassSnap &s) {
- NSMutableString *text=[NSMutableString stringWithFormat:@"renderPass area=%lux%lu colors=[",(unsigned long)s.width,(unsigned long)s.height];
- for(unsigned i=0;i<8;++i){auto &c=s.colors[i];if(!c.texture)continue;NSString *texture;
-  if([c.texture isKindOfClass:[FuxiTexture class]]){auto ft=(FuxiTexture *)c.texture;texture=[NSString stringWithFormat:@"{%@ viewBase=%u viewLevels=%lu}",ft->_descriptorText?:@"model",ft->_baseLevel,(unsigned long)[ft mipmapLevelCount]];}
-  else texture=[NSString stringWithFormat:@"class=%s",object_getClassName(c.texture)];
-  [text appendFormat:@"%u:texture=%@ level=%lu slice=%lu load=%lu store=%lu clear=%.17g,%.17g,%.17g,%.17g;",i,texture,(unsigned long)c.level,(unsigned long)c.slice,(unsigned long)c.load,(unsigned long)c.store,c.clear[0],c.clear[1],c.clear[2],c.clear[3]];}
- [text appendString:@"]"];return text.UTF8String;
+// The descriptor is copied at encoder creation; its text is formatted lazily for failure logs.
+static NSString *passAttachmentText(MTLRenderPassAttachmentDescriptor *a){
+ id t=a.texture;NSString *texture=@"nil";
+ if([t isKindOfClass:[FuxiTexture class]]){auto ft=(FuxiTexture *)t;texture=[NSString stringWithFormat:@"{%@ viewBase=%u viewLevels=%lu}",ft->_descriptorText?:@"model",ft->_baseLevel,(unsigned long)[ft mipmapLevelCount]];}
+ else if(t)texture=[NSString stringWithFormat:@"class=%s",object_getClassName(t)];
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+ return [NSString stringWithFormat:@"texture=%@ level=%lu slice=%lu plane=%lu load=%lu store=%lu options=%lu resolve=%s/%lu/%lu/%lu",texture,(unsigned long)a.level,(unsigned long)a.slice,(unsigned long)a.depthPlane,(unsigned long)a.loadAction,(unsigned long)a.storeAction,(unsigned long)a.storeActionOptions,a.resolveTexture?object_getClassName(a.resolveTexture):"nil",(unsigned long)a.resolveLevel,(unsigned long)a.resolveSlice,(unsigned long)a.resolveDepthPlane];
+#pragma clang diagnostic pop
+}
+static NSString *renderPassText(MTLRenderPassDescriptor *d){
+ NSMutableString *text=[NSMutableString stringWithFormat:@"renderPass area=%lux%lu array=%lu samples=%lu visibility=%u tile=%lux%lu imageblock=%lu threadgroup=%lu rateMap=%u colors=[",(unsigned long)d.renderTargetWidth,(unsigned long)d.renderTargetHeight,(unsigned long)d.renderTargetArrayLength,(unsigned long)d.defaultRasterSampleCount,d.visibilityResultBuffer!=nil,(unsigned long)d.tileWidth,(unsigned long)d.tileHeight,(unsigned long)d.imageblockSampleLength,(unsigned long)d.threadgroupMemoryLength,d.rasterizationRateMap!=nil];
+ for(unsigned i=0;i<8;++i){auto a=d.colorAttachments[i];auto c=a.clearColor;[text appendFormat:@"%u:%@ clear=%.17g,%.17g,%.17g,%.17g;",i,passAttachmentText(a),c.red,c.green,c.blue,c.alpha];}
+ [text appendFormat:@"] depth={%@ clear=%.17g} stencil={%@ clear=%u}",passAttachmentText(d.depthAttachment),d.depthAttachment.clearDepth,passAttachmentText(d.stencilAttachment),d.stencilAttachment.clearStencil];return text;
 }
 @implementation FuxiQueue
 - (void)dealloc {_uploadStorage.clear([](FuxiBuffer *b){[b release];});for(auto q:{_completionQueue,_submitQueue,_retireQueue,_finishQueue,_deliveryQueue})if(q)dispatch_release(q);if(_inflight)dispatch_release(_inflight);[_device release];[super dealloc];}
@@ -1240,10 +1240,8 @@ static std::string passSnapText(const PassSnap &s) {
 - (id)renderCommandEncoderWithDescriptor:(MTLRenderPassDescriptor *)d {FRONTEND_TIME(self);FUXI_PHASE(encBegin);@try {CENSUS();
  if(clientMode==fuxi::ClientMode::census)return nil;if(_rejected)return [self refusedRender];
  auto checksPhase=std::make_unique<fuxi::PhaseTimer>(fuxi::EncPhase::encChecks);
- auto snap=std::make_shared<PassSnap>();fuxi::LazyText passText([snap]{return passSnapText(*snap);});DescriptorContext context(passText);
- snap->width=d.renderTargetWidth;snap->height=d.renderTargetHeight;
- for(unsigned i=0;i<8;++i){auto ca=d.colorAttachments[i];id texture=ca.texture;if(!texture)continue;auto &c=snap->colors[i];auto clear=ca.clearColor;
-  c.texture=[texture retain];c.level=ca.level;c.slice=ca.slice;c.load=ca.loadAction;c.store=ca.storeAction;c.clear[0]=clear.red;c.clear[1]=clear.green;c.clear[2]=clear.blue;c.clear[3]=clear.alpha;}
+ std::shared_ptr<void> passCopy((void *)[d copy],[](void *p){[(id)p release];});
+ fuxi::LazyText passText([passCopy]{return std::string(renderPassText((MTLRenderPassDescriptor *)passCopy.get()).UTF8String);});DescriptorContext context(passText);
  if(!stage4Value("renderEncoder","commandStatus",_status,_status==MTLCommandBufferStatusNotEnqueued) ||
     !stage4Value("renderEncoder","encoding",_encoding,!_encoding))return [self refusedRender];
 #define CHECK(field,value,accepted) do {__typeof__(value) actual=(value);stage4Require("renderPass",field,(uint64_t)actual,(accepted));}while(0)
