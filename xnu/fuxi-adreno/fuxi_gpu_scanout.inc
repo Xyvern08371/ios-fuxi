@@ -407,14 +407,20 @@ static void fg_scanout_spin_kick(int fresh)
 #define FG_SCAN_MID_LO 160u
 #define FG_SCAN_MID_HI 2420u
 #define FG_SCAN_MID_TRIALS 4u
-#define FG_SCAN_MID_NVAR 4u
+#define FG_SCAN_MID_NVAR 5u
 /* Variants of the way to open the hardware start gate, tried in order within one boot (device B181: low16 of SYNC_THRESH alone did not open it):
  * 0 high16 of SYNC_THRESH = 2420 (low16 kept); 1 both halves = 2420; 2 START_POS (+0x2a0) set just past the current read line before each
  * in-window START and restored after it; 3 TEAR_CHECK_EN (+0x284) cleared for each in-window START and restored after it (only tried if the
  * read counter keeps running with the enable cleared, checked once with interrupts masked). A variant ends after 4 trials that began writing at
- * once (confirmed) or 4 that waited for the TE (failed: registers restored, next variant). Not yet observed on device. */
-static const char *const fg_scanout_mid_name[FG_SCAN_MID_NVAR] = {"thresh_hi16", "thresh_both", "start_pos", "tear_en"};
-static unsigned fg_scanout_mid_state, fg_scanout_mid_var, fg_scanout_mid_old, fg_scanout_mid_new, fg_scanout_mid_pos, fg_scanout_mid_en, fg_scanout_mid_dirty;
+ * once (confirmed) or 4 that waited for the TE (failed: registers restored, next variant). Device D183: variants 0-3 all held (the gate is not in
+ * the INTF tear check); 4 is tried first: DSI TRIG_CTRL (+0x084) bit 31 (TE, public register naming: DMA_TRIGGER [2:0], MDP_TRIGGER [6:4],
+ * STREAM [8], BLOCK_DMA_WITHIN_FRAME [12], TE [31]) is cleared for each in-window START and restored after the 200 us check. The DMA (DCS)
+ * trigger select is the low 3 bits and the panel120 DMA sequences finish (and restore TRIG_CTRL) before this mode is set up, so they are not
+ * touched. Not yet observed on device. */
+static const char *const fg_scanout_mid_name[FG_SCAN_MID_NVAR] = {"thresh_hi16", "thresh_both", "start_pos", "tear_en", "dsi_te"};
+static const unsigned char fg_scanout_mid_order[FG_SCAN_MID_NVAR] = {4, 0, 1, 2, 3};
+static unsigned fg_scanout_mid_state, fg_scanout_mid_var, fg_scanout_mid_seq, fg_scanout_mid_old, fg_scanout_mid_new, fg_scanout_mid_pos, fg_scanout_mid_en, fg_scanout_mid_dirty;
+static unsigned fg_scanout_mid_trig, fg_scanout_mid_wval, fg_scanout_mid_rval;
 static unsigned fg_scanout_mid_vimm[FG_SCAN_MID_NVAR], fg_scanout_mid_vheld[FG_SCAN_MID_NVAR];
 static unsigned fg_scanout_mid_wait, fg_scanout_mid_forced, fg_scanout_mid_hist[7], fg_scanout_mid_g1[7]; /* state: 0 off, 1 verify, 2 confirmed, 3 disabled */
 static uint64_t fg_scanout_mid_block_t;
@@ -428,6 +434,7 @@ static void fg_scanout_mid_undirty(void)
  if (!fg_scanout_mid_dirty) return;
  if (fg_scanout_mid_var == 2) (void)fg_scanout_write(FG_SCAN_INTF+0x2a0, fg_scanout_mid_pos);
  if (fg_scanout_mid_var == 3) (void)fg_scanout_write(FG_SCAN_INTF+0x284, fg_scanout_mid_en);
+ if (fg_scanout_mid_var == 4) (void)fg_scanout_write(FG_SCAN_DSI+0x084, fg_scanout_mid_trig);
  fg_scanout_mid_dirty = 0;
 }
 static int fg_scanout_mid_apply(unsigned v)
@@ -442,6 +449,13 @@ static int fg_scanout_mid_apply(unsigned v)
   }
  } else if (v == 2) {
   if (!fg_scanout_read(FG_SCAN_INTF+0x2a0, &fg_scanout_mid_pos)) return 0;
+ } else if (v == 4) {
+  unsigned trig;
+  if (!fg_scanout_read(FG_SCAN_DSI+0x084, &trig) || !(trig & 0x80000000u)) {
+   printf("FUXI SCANOUT: mid_start variant %u (%s) skipped: DSI TRIG_CTRL=%#x has no TE bit\n", v, fg_scanout_mid_name[v], trig);
+   return 0;
+  }
+  fg_scanout_mid_trig = trig;
  } else {
   unsigned c1 = 0, c2 = 0, ok;
   boolean_t interrupts = ml_set_interrupts_enabled(FALSE);
@@ -460,9 +474,11 @@ static int fg_scanout_mid_apply(unsigned v)
      v, fg_scanout_mid_name[v], fg_scanout_mid_old, want, fg_scanout_mid_pos, fg_scanout_mid_en, FG_SCAN_MID_LO, FG_SCAN_MID_HI);
  return 1;
 }
-static void fg_scanout_mid_from(unsigned v)
+static void fg_scanout_mid_from(unsigned seq)
 {
- for (; v < FG_SCAN_MID_NVAR; v++) if (fg_scanout_mid_apply(v)) { fg_scanout_mid_var = v; fg_scanout_mid_state = 1; return; }
+ for (; seq < FG_SCAN_MID_NVAR; seq++) if (fg_scanout_mid_apply(fg_scanout_mid_order[seq])) {
+  fg_scanout_mid_var = fg_scanout_mid_order[seq]; fg_scanout_mid_seq = seq; fg_scanout_mid_state = 1; return;
+ }
  fg_scanout_mid_state = 3;
  printf("FUXI SCANOUT: mid_start no variant opens the gate; off, threshold %#x\n", fg_scanout_mid_old);
 }
@@ -483,9 +499,15 @@ static int fg_scanout_mid_allow(void)
  since = fg_scanout_mid_since(count);
  if (since <= 4 || since >= 4000 || (since >= FG_SCAN_MID_LO && since <= FG_SCAN_MID_HI)) {
   fg_scanout_mid_block_t = 0;
-  if (since >= FG_SCAN_MID_LO && since <= FG_SCAN_MID_HI && !fg_scanout_mid_dirty && (fg_scanout_mid_var == 2 || fg_scanout_mid_var == 3) &&
-      fg_scanout_write(fg_scanout_mid_var == 2 ? FG_SCAN_INTF+0x2a0 : FG_SCAN_INTF+0x284, fg_scanout_mid_var == 2 ? (count + 8) & 0xffffu : 0))
-   fg_scanout_mid_dirty = 1;
+  if (since >= FG_SCAN_MID_LO && since <= FG_SCAN_MID_HI && !fg_scanout_mid_dirty && fg_scanout_mid_var >= 2) {
+   unsigned reg = fg_scanout_mid_var == 2 ? FG_SCAN_INTF+0x2a0 : fg_scanout_mid_var == 3 ? FG_SCAN_INTF+0x284 : FG_SCAN_DSI+0x084, val = 0;
+   if (fg_scanout_mid_var == 2) val = (count + 8) & 0xffffu;
+   if (fg_scanout_mid_var == 4) { if (!fg_scanout_read(reg, &val)) return 1; fg_scanout_mid_trig = val; val &= ~0x80000000u; }
+   if (fg_scanout_write(reg, val)) {
+    fg_scanout_mid_dirty = 1; fg_scanout_mid_wval = val;
+    if (!fg_scanout_read(reg, &fg_scanout_mid_rval)) fg_scanout_mid_rval = 0xdead0000u;
+   }
+  }
   return 1;
  }
  uint64_t now = rsr("cntpct_el0");
@@ -511,6 +533,9 @@ static void fg_scanout_mid_account(unsigned count, unsigned gap1)
   if (rsr("cntpct_el0") >= limit) break;
   delay(5);
  }
+ if (fg_scanout_mid_dirty && !fg_scanout_mid_vimm[v] && !fg_scanout_mid_vheld[v])
+  printf("FUXI SCANOUT: mid_start variant %u (%s) first trial: wrote %#x read back %#x, read line since TE %u, write line %s\n",
+      v, fg_scanout_mid_name[v], fg_scanout_mid_wval, fg_scanout_mid_rval, since, immediate ? "active" : "idle");
  fg_scanout_mid_undirty();
  if (immediate) fg_scanout_mid_vimm[v]++; else fg_scanout_mid_vheld[v]++;
  if (fg_scanout_mid_state != 1) return;
@@ -518,7 +543,7 @@ static void fg_scanout_mid_account(unsigned count, unsigned gap1)
   printf("FUXI SCANOUT: mid_start variant %u (%s) failed: hardware still waits for the TE (immediate=%u held=%u); registers restored\n",
       v, fg_scanout_mid_name[v], fg_scanout_mid_vimm[v], fg_scanout_mid_vheld[v]);
   (void)fg_scanout_write(FG_SCAN_INTF+0x29c, fg_scanout_mid_old);
-  fg_scanout_mid_from(v + 1);
+  fg_scanout_mid_from(fg_scanout_mid_seq + 1);
  } else if (fg_scanout_mid_vimm[v] >= FG_SCAN_MID_TRIALS) {
   fg_scanout_mid_state = 2;
   printf("FUXI SCANOUT: mid_start variant %u (%s) confirmed: in-window STARTs begin writing at once (immediate=%u held=%u)\n",
@@ -1105,10 +1130,10 @@ static int fg_scanout_publish(void)
   if (fg_abi_mid) {
    unsigned *h = fg_scanout_mid_hist, *g = fg_scanout_mid_g1;
    unsigned *vi = fg_scanout_mid_vimm, *vh = fg_scanout_mid_vheld;
-   printf("FUXI SCANOUT: mid_start state=%u var=%u(%s) thresh=%#x->%#x imm=%u/%u/%u/%u held=%u/%u/%u/%u blocked_polls=%u forced=%u"
+   printf("FUXI SCANOUT: mid_start state=%u var=%u(%s) thresh=%#x->%#x imm=%u/%u/%u/%u/%u held=%u/%u/%u/%u/%u blocked_polls=%u forced=%u"
        " read_line_since_te<=4/<160/<600/<1200/<1800/<=2420/more starts=%u/%u/%u/%u/%u/%u/%u gap1=%u/%u/%u/%u/%u/%u/%u\n",
        fg_scanout_mid_state, fg_scanout_mid_var, fg_scanout_mid_name[fg_scanout_mid_var], fg_scanout_mid_old, fg_scanout_mid_new,
-       vi[0], vi[1], vi[2], vi[3], vh[0], vh[1], vh[2], vh[3], fg_scanout_mid_wait, fg_scanout_mid_forced,
+       vi[0], vi[1], vi[2], vi[3], vi[4], vh[0], vh[1], vh[2], vh[3], vh[4], fg_scanout_mid_wait, fg_scanout_mid_forced,
        h[0], h[1], h[2], h[3], h[4], h[5], h[6], g[0], g[1], g[2], g[3], g[4], g[5], g[6]);
    for (unsigned i = 0; i < 7; i++) h[i] = g[i] = 0;
    fg_scanout_mid_wait = fg_scanout_mid_forced = 0;

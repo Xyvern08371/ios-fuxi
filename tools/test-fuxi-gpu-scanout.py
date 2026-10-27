@@ -73,6 +73,7 @@ static int fg_abi_observe(void) {observations++;if(!abiResult)fg_client_busy=0;r
 static uint64_t model_counter(const char *r) {return !strcmp(r,"cntfrq_el0")?1000000:ticks;}
 #define rsr(r) model_counter(r)
 static void (*probeScript)(void);
+static int dsiTrigAnytime;
 static void delay(unsigned us) {if(!frozenClock)ticks+=us;if(probeScript)probeScript();}
 typedef void *thread_call_param_t;
 typedef struct {void (*fn)(thread_call_param_t,thread_call_param_t);} thread_call_data_t;
@@ -92,7 +93,7 @@ static unsigned fg_access(uint64_t pa,uint64_t *value,unsigned wr,unsigned wide)
  else {assert(pa>=0xae36000 && pa<0xae37000);reg=&intf[(pa-0xae36000)/4];}
  if(wr){
   writes++;assert(traceCount<8192);trace[traceCount].pa=pa;trace[traceCount++].value=*value;
-  if(pa>=0xae94000 && pa<0xae95000) {
+  if(pa>=0xae94000 && pa<0xae95000 && !(dsiTrigAnytime && pa==0xae94084)) {
    assert(interruptsOn);
    assert(fg_scanout_owned_for_model());
    assert(!(intf[0x2b4/4]&0x80000000u) && !ctl[0x1c/4] && !fg_busy && !starts);
@@ -704,11 +705,11 @@ static void mid_tests(uint8_t *panel) {
  // fuxigpuncimport 65536: START anywhere in the tear-safe part of the period; the hardware start threshold is widened and the low part blocked in software.
  {
   unsigned keepP=fg_scanout_panel120_active,keepInit=fg_scanout_te_init,keepStarts=fg_scanout_starts,keepMatch=fg_scanout_current_match,keepMismatch=fg_scanout_current_mismatch,keepTe=fg_scanout_te_frames,keepCount=intf[0x298/4];
-  fg_abi_mid=1;fg_scanout_panel120_active=1;fg_scanout_period_us=8333;fg_scanout_te_init=0x960;fg_scanout_mid_state=0;memset(fg_scanout_mid_vimm,0,sizeof(fg_scanout_mid_vimm));memset(fg_scanout_mid_vheld,0,sizeof(fg_scanout_mid_vheld));fg_scanout_mid_wait=fg_scanout_mid_forced=0;intf[0x284/4]=1;intf[0x2a0/4]=0x960;
+  fg_abi_mid=1;fg_scanout_panel120_active=1;fg_scanout_period_us=8333;fg_scanout_te_init=0x960;fg_scanout_mid_state=0;memset(fg_scanout_mid_vimm,0,sizeof(fg_scanout_mid_vimm));memset(fg_scanout_mid_vheld,0,sizeof(fg_scanout_mid_vheld));fg_scanout_mid_wait=fg_scanout_mid_forced=0;intf[0x284/4]=1;intf[0x2a0/4]=0x960;dsi[0x084/4]=0x80000004u;dsiTrigAnytime=1;
   memset(fg_scanout_mid_hist,0,sizeof(fg_scanout_mid_hist));memset(fg_scanout_mid_g1,0,sizeof(fg_scanout_mid_g1));fg_scanout_mid_block_t=0;
   intf[0x29c/4]=0x40004;intf[0x298/4]=(7u<<16)|0x960;
   fg_scanout_mid_setup();
-  assert(fg_scanout_mid_state==1 && fg_scanout_mid_var==0 && fg_scanout_mid_old==0x40004 && intf[0x29c/4]==(2420u<<16|4));
+  assert(fg_scanout_mid_state==1 && fg_scanout_mid_var==4 && fg_scanout_mid_old==0x40004 && intf[0x29c/4]==0x40004);
   #define SINCE(n) (intf[0x298/4]=(7u<<16)|(0x960u+(n)))
   SINCE(3);assert(fg_scanout_mid_allow()==1);SINCE(0);assert(fg_scanout_mid_allow()==1);
   SINCE(160);assert(fg_scanout_mid_allow()==1);SINCE(2420);assert(fg_scanout_mid_allow()==1);SINCE(4500);assert(fg_scanout_mid_allow()==1);
@@ -721,8 +722,13 @@ static void mid_tests(uint8_t *panel) {
   START_AT(100);assert(fuxi_gpu_scanout_publish()==2 && fg_scanout_mid_wait>=3);
   START_AT(1000);base=ticks;probeScript=mid_script;
   assert(fuxi_gpu_scanout_publish()==1);probeScript=0;
-  assert(fg_scanout_mid_vimm[0]==1 && fg_scanout_mid_vheld[0]==0 && fg_scanout_mid_hist[3]==1 && fg_scanout_mid_state==1);
+  assert(fg_scanout_mid_vimm[4]==1 && fg_scanout_mid_vheld[4]==0 && dsi[0x084/4]==0x80000004u && fg_scanout_mid_hist[3]==1 && fg_scanout_mid_state==1);
+  // dsi_te variant: TRIG_CTRL bit 31 is cleared for the START and restored afterwards.
+  START_AT(1000);assert(fg_scanout_mid_allow()==1 && dsi[0x084/4]==4 && fg_scanout_mid_dirty);
+  assert(fuxi_gpu_scanout_publish()==1 && dsi[0x084/4]==0x80000004u && !fg_scanout_mid_dirty);
   // The hardware keeps waiting for the TE (line does not go active): four such results restore the threshold and move to the next variant.
+  for(unsigned i=0;i<3;i++){START_AT(1000);assert(fuxi_gpu_scanout_publish()==1);}
+  assert(fg_scanout_mid_vheld[4]==4 && fg_scanout_mid_var==0 && fg_scanout_mid_state==1 && intf[0x29c/4]==(2420u<<16|4));
   for(unsigned i=0;i<4;i++){START_AT(1000);assert(fuxi_gpu_scanout_publish()==1);}
   assert(fg_scanout_mid_vheld[0]==4 && fg_scanout_mid_var==1 && fg_scanout_mid_state==1 && intf[0x29c/4]==(2420u<<16|2420));
   for(unsigned i=0;i<4;i++){START_AT(1000);assert(fuxi_gpu_scanout_publish()==1);}
@@ -737,13 +743,13 @@ static void mid_tests(uint8_t *panel) {
   assert(fuxi_gpu_scanout_publish()==1 && intf[0x284/4]==1 && !fg_scanout_mid_dirty);
   for(unsigned i=0;i<3;i++){START_AT(1000);assert(fuxi_gpu_scanout_publish()==1);}
   probeScript=0;
-  assert(fg_scanout_mid_vheld[3]==4 && fg_scanout_mid_state==3 && intf[0x29c/4]==0x40004 && intf[0x284/4]==1 && intf[0x2a0/4]==0x960 && fg_scanout_mid_hist[3]==17);
+  assert(fg_scanout_mid_vheld[3]==4 && fg_scanout_mid_state==3 && intf[0x29c/4]==0x40004 && intf[0x284/4]==1 && intf[0x2a0/4]==0x960 && fg_scanout_mid_hist[3]==21);
   // A variant whose enable-cleared counter stands still is skipped without leaving the enable cleared.
   intf[0x284/4]=1;fg_scanout_mid_old=0x40004;assert(!fg_scanout_mid_apply(3) && intf[0x284/4]==1);
   #undef START_AT
   SINCE(100);assert(fg_scanout_mid_allow()==1); // off: no software block
   #undef SINCE
-  fg_abi_mid=0;fg_scanout_mid_state=0;fg_scanout_period_us=16667;fg_scanout_panel120_active=keepP;fg_scanout_te_init=keepInit;fg_scanout_back_ready=0;
+  dsiTrigAnytime=0;fg_abi_mid=0;fg_scanout_mid_state=0;fg_scanout_period_us=16667;fg_scanout_panel120_active=keepP;fg_scanout_te_init=keepInit;fg_scanout_back_ready=0;
   fg_scanout_starts=keepStarts;fg_scanout_current_match=keepMatch;fg_scanout_current_mismatch=keepMismatch;fg_scanout_te_frames=keepTe;intf[0x298/4]=keepCount;ctl[0x1c/4]=1;intf[0x2b0/4]=2400;
  }
 }
