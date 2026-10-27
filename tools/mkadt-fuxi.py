@@ -156,6 +156,22 @@ def add_product_children(root, haptics=False, camera=False, d22ap=mkadt.D22AP_AD
     return root
 
 
+def set_display_gamut(root, gamut):
+    """/product artwork-display-gamut. The D22AP value P3 makes MobileGestalt report
+    deep colour (MTSupportsDeepColor), so MaterialKit snapshots idle materials into
+    two-plane 10-bit b3a8 IOSurfaces that the Fuxi GPU path cannot render (black
+    App Library). The Fuxi scanout is 8-bit BGRA, so sRGB is the honest answer."""
+    product = next((n for n in root.children if n.name == 'product'), None)
+    if product is None:
+        raise ValueError('--display-gamut needs a /product node')
+    value = mkadt.cstr(gamut)
+    if product.prop('artwork-display-gamut') is None:
+        product.props.append(('artwork-display-gamut', 0, value))
+    else:
+        setprop(product, 'artwork-display-gamut', value)
+    return root
+
+
 def ensure_mac_addresses(root):
     """Add mkadt's synthetic /chosen Wi-Fi and Bluetooth MACs if missing, so
     older --template ADTs get them too (MobileGestalt UniqueDeviceID inputs)."""
@@ -192,6 +208,7 @@ def main():
     ap.add_argument('--ram-layout', choices=('full', '1g'), default='full', help='full = 5088 MiB; 1g = original 1 GiB XNU window')
     ap.add_argument('--product-haptics', action='store_true', help='add /product/haptics copied from the D22AP tree')
     ap.add_argument('--product-camera', action='store_true', help='add an empty /product/camera node (no flash)')
+    ap.add_argument('--display-gamut', choices=('P3', 'sRGB'), help='set /product artwork-display-gamut (sRGB: no deep colour surfaces)')
     ap.add_argument('--d22ap-adt', type=Path, default=Path(mkadt.D22AP_ADT), help='real D22AP device tree (not in git)')
     args = ap.parse_args()
     mem_size = MEM_SIZE if args.ram_layout == 'full' else LEGACY_SIZE
@@ -209,6 +226,8 @@ def main():
         else:
             root = build(args.ufs_readonly, root_props, args.smp, args.gpu_reserve, mem_size)
         root = add_product_children(root, args.product_haptics, args.product_camera, args.d22ap_adt)
+        if args.display_gamut:
+            root = set_display_gamut(root, args.display_gamut)
         has_ufs = any(n.name == 'fuxi-ufs' for n in root.children)
         validate_live(args.live_fdt, has_ufs)
         blob = adt.serialize(root)
