@@ -149,17 +149,29 @@ static int fg_scanout_write(unsigned pa, unsigned value)
  * later of clear and lineend, the same condition acquire uses. The worker only stores results; accounting runs under FG_GUARD at the
  * next publish, so a window is consistent. Read-only MMIO, no behaviour change. Not yet observed on device. */
 static unsigned fg_abi_probe, fg_abi_spin;
-/* Opt-in (fuxigpuncimport bit 32768), panel120 + double/triple only. The 1080x2400 transfer measures ~8.0 ms from the TE edge in an 8.33 ms
- * period, so a START can only catch the next TE if it is written in the ~0.3 ms between transfer-done and that TE; the 0.5-1 ms
- * display poll (plus timer slack) lands there rarely (71% of gaps were two periods). After each START a delayed thread call wakes at
- * 93% of a period and spins at most 600 us on CTL START / the write line; at the first idle it publishes the waiting back buffer through
- * the same fg_scanout_publish() the retry path uses (every gate unchanged: ring, TE, transfer status). Nothing is published when no
- * back buffer is ready or another START intervened; the display path stays the fallback. */
-#define FG_SCAN_SPIN_LEAD_PCT 93u
-#define FG_SCAN_SPIN_US 600u
+/* Opt-in (fuxigpuncimport bit 32768), panel120 + double/triple only. The 1080x2400 transfer runs ~8.0 ms from the TE edge in an 8.3 ms
+ * period, so a START catches the next TE only if written in the ~0.3 ms between transfer-done and that TE. The first version woke a
+ * fixed 93% of a period after the START write, but the transfer begins at the next TE after the START, up to a period later, so it woke
+ * at a random phase (about 10 of 570 hits). Now the wake is referenced to the TE edge: a phase model (last observed edge tick and
+ * count, period refined from edge-count deltas) predicts the edge E that starts the transfer, the thread call wakes at E + done_est -
+ * 400 us and spins on the write line. It publishes at the first idle sample only after an edge was seen and the line was seen active
+ * (a missed START latch cannot look like done), then spins up to 600 us for the next edge, which resyncs the model, measures E to idle
+ * (done_est) and the prediction error, and re-kicks itself for the new START so the chain continues without the display path. No model
+ * (first use, or stale after 64 periods): one sync wake catches an edge from the START's count. Every gate in fg_scanout_publish() is
+ * unchanged; with no back buffer or after a raced START nothing is published and the display path stays the fallback. */
+#define FG_SCAN_SPIN_LEAD_US 400u
+#define FG_SCAN_SPIN_DONE_US 7950u
+#define FG_SCAN_SPIN_TAIL_PCT 6u
+#define FG_SCAN_SPIN_CATCH_US 600u
+enum {FG_SPIN_WAKES, FG_SPIN_PUBLISHED, FG_SPIN_NO_BACK, FG_SPIN_RACED, FG_SPIN_EXPIRED, FG_SPIN_HIT, FG_SPIN_LATE, FG_SPIN_NO_ACTIVE,
+      FG_SPIN_SYNCS, FG_SPIN_SYNC_FAIL, FG_SPIN_CATCH_FAIL, FG_SPIN_N};
 static thread_call_data_t fg_scanout_spin_call;
-static unsigned fg_scanout_spin_setup, fg_scanout_spin_busy, fg_scanout_spin_serial, fg_scanout_async_published;
-static unsigned fg_scanout_spin_stat[4]; /* wakes, published, no back buffer, window expired */
+static unsigned fg_scanout_spin_setup, fg_scanout_spin_busy, fg_scanout_spin_serial, fg_scanout_async_published, fg_scanout_spin_sync, fg_scanout_spin_c0;
+static unsigned fg_scanout_last_count, fg_scanout_ph_ok, fg_scanout_ph_c, fg_scanout_ph_done_us;
+static uint64_t fg_scanout_ph_t, fg_scanout_ph_p, fg_scanout_ph_e, fg_scanout_ph_wake;
+static unsigned fg_scanout_spin_stat[FG_SPIN_N]; /* FG_SPIN_* */
+static uint64_t fg_scanout_spin_err_sum, fg_scanout_spin_err_max, fg_scanout_spin_late_sum, fg_scanout_spin_late_max;
+static unsigned fg_scanout_spin_err_n, fg_scanout_spin_late_n;
 #define FG_PROBE_MAX 128
 static thread_call_data_t fg_scanout_probe_call;
 static unsigned fg_scanout_probe_setup, fg_scanout_probe_busy, fg_scanout_probe_ready, fg_scanout_probe_te0;
@@ -191,26 +203,118 @@ static void fg_scanout_probe_run(thread_call_param_t a, thread_call_param_t b)
  __atomic_store_n(&fg_scanout_probe_ready, 1, __ATOMIC_RELEASE);
 }
 static int fg_scanout_publish(void);
+static int fg_scanout_te_count(unsigned *count)
+{
+ unsigned v;
+ if (!fg_scanout_read(FG_SCAN_INTF+0x298, &v)) return 0;
+ *count = v >> 16;
+ return 1;
+}
+/* First sample (cntpct) at which the TE count differs from c0, 0 on timeout or read failure. */
+static uint64_t fg_scanout_te_catch(unsigned c0, uint64_t limit, unsigned *count)
+{
+ for (;;) {
+  uint64_t now = rsr("cntpct_el0");
+  unsigned v;
+  if (!fg_scanout_te_count(&v)) return 0;
+  if (v != c0) { *count = v; return now; }
+  if (now >= limit) return 0;
+  delay(2);
+ }
+}
+static uint64_t fg_scanout_us_to_ticks(uint64_t us) { return us*rsr("cntfrq_el0")/1000000; }
+static void fg_scanout_phase_set(uint64_t t, unsigned c)
+{
+ unsigned n = (c - fg_scanout_ph_c) & 0xffffu;
+ if (fg_scanout_ph_ok && n >= 1 && n <= 200 && t > fg_scanout_ph_t) {
+  uint64_t p = (t - fg_scanout_ph_t)/n, q = fg_scanout_ph_p;
+  if (p > q - q/20 && p < q + q/20) fg_scanout_ph_p = q - q/8 + p/8;
+ }
+ fg_scanout_ph_t = t; fg_scanout_ph_c = c; fg_scanout_ph_ok = 1;
+}
+/* First modelled edge at or after "after" (an edge within the START latch time is still counted; the active check resolves it). */
+static uint64_t fg_scanout_phase_next(uint64_t after)
+{
+ uint64_t t = fg_scanout_ph_t, p = fg_scanout_ph_p;
+ return after <= t ? t : t + ((after - t)/p + 1)*p;
+}
+static void fg_scanout_spin_schedule(uint64_t wake)
+{
+ uint64_t now = rsr("cntpct_el0"), d;
+ if (wake < now) wake = now;
+ nanoseconds_to_absolutetime((wake - now)*1000000000ull/rsr("cntfrq_el0"), &d);
+ fg_scanout_ph_wake = wake; fg_scanout_spin_busy = 1;
+ (void)thread_call_enter_delayed(&fg_scanout_spin_call, mach_absolute_time() + d);
+}
+/* Wake shortly before the predicted transfer-done of the transfer that starts at edge e. */
+static void fg_scanout_spin_plan(uint64_t e)
+{
+ fg_scanout_spin_sync = 0; fg_scanout_ph_e = e;
+ fg_scanout_spin_schedule(e + fg_scanout_us_to_ticks(fg_scanout_ph_done_us - FG_SCAN_SPIN_LEAD_US));
+}
+static void fg_scanout_spin_kick(void);
 static void fg_scanout_spin_run(thread_call_param_t a, thread_call_param_t b)
 {
  (void)a; (void)b;
- uint64_t hz = rsr("cntfrq_el0"), end = rsr("cntpct_el0") + hz*FG_SCAN_SPIN_US/1000000;
- unsigned serial = fg_scanout_spin_serial, result = 2; /* 2 = window expired */
- fg_scanout_spin_stat[0]++;
- for (;;) {
-  unsigned line, start;
-  if (!fg_scanout_read(FG_SCAN_INTF+0x2b0, &line) || !fg_scanout_read(FG_SCAN_CTL+0x1c, &start)) break;
-  if (!(start & 1) && ((line & 65535) == 0 || (line & 65535) >= 2400)) {
-   FG_GUARD;
-   if (fg_scanout_starts != serial || fg_scanout_failed || !fg_scanout_back_ready || fg_busy) { result = fg_scanout_back_ready ? 3 : 1; }
-   else if (fg_scanout_publish() == 1) { fg_scanout_async_published = 1; result = 0; }
-   else result = 3;
-   break;
-  }
-  if (rsr("cntpct_el0") >= end) break;
-  delay(2);
+ uint64_t t0 = rsr("cntpct_el0"), p = fg_scanout_ph_p, e = fg_scanout_ph_e, late = t0 > fg_scanout_ph_wake ? t0 - fg_scanout_ph_wake : 0;
+ unsigned serial = fg_scanout_spin_serial, c0 = fg_scanout_spin_c0, result = FG_SPIN_EXPIRED, active = 0, nedge = 0, c = c0, published = 0;
+ uint64_t idle_t = 0, edge_t = 0;
+ fg_scanout_spin_stat[FG_SPIN_WAKES]++;
+ if (fg_scanout_spin_sync) {
+  /* No usable phase: catch the edge that starts this START's transfer (c0 was read right after the START write). */
+  edge_t = fg_scanout_te_catch(c0, t0 + p + p/4, &c);
+  if (edge_t) fg_scanout_phase_set(edge_t, c);
+  FG_GUARD;
+  fg_scanout_spin_stat[edge_t ? FG_SPIN_SYNCS : FG_SPIN_SYNC_FAIL]++; fg_scanout_spin_busy = 0;
+  if (fg_scanout_starts != serial) fg_scanout_spin_kick();
+  else if (edge_t && ((c - c0) & 0xffffu) == 1 && !fg_scanout_failed) fg_scanout_spin_plan(edge_t);
+  return;
  }
- { FG_GUARD; fg_scanout_spin_stat[result == 0 ? 1 : result == 1 ? 2 : 3]++; fg_scanout_spin_busy = 0; }
+ {
+  uint64_t end = e + p + p*FG_SCAN_SPIN_TAIL_PCT/100;
+  for (;;) {
+   unsigned line, start, cnt;
+   uint64_t now = rsr("cntpct_el0");
+   if (!fg_scanout_te_count(&cnt) || !fg_scanout_read(FG_SCAN_INTF+0x2b0, &line) || !fg_scanout_read(FG_SCAN_CTL+0x1c, &start)) break;
+   nedge = (cnt - c0) & 0xffffu; c = cnt; line &= 65535;
+   if (nedge && line != 0 && line < 2400) active = 1;
+   if (nedge && active && !(start & 1) && (line == 0 || line >= 2400)) {
+    idle_t = now;
+    FG_GUARD;
+    if (fg_scanout_starts != serial || fg_scanout_failed || !fg_scanout_back_ready || fg_busy) result = fg_scanout_back_ready ? FG_SPIN_RACED : FG_SPIN_NO_BACK;
+    else if (fg_scanout_publish() == 1) { fg_scanout_async_published = 1; published = 1; result = FG_SPIN_PUBLISHED; }
+    else result = FG_SPIN_RACED;
+    break;
+   }
+   if (now >= end) { result = active ? FG_SPIN_EXPIRED : FG_SPIN_NO_ACTIVE; break; }
+   delay(2);
+  }
+ }
+ /* The next edge arrives within ~0.3 ms of an on-time idle: catch it to resync the model, measure E-to-idle and the prediction error. */
+ if (idle_t) {
+  unsigned c2 = 0;
+  edge_t = fg_scanout_te_catch(c, idle_t + fg_scanout_us_to_ticks(FG_SCAN_SPIN_CATCH_US), &c2);
+  if (edge_t) {
+   if (nedge == 1) {
+    uint64_t pred = e + p, err = edge_t > pred ? edge_t - pred : pred - edge_t, done = idle_t + p - edge_t;
+    fg_scanout_spin_err_sum += err; fg_scanout_spin_err_n++; if (err > fg_scanout_spin_err_max) fg_scanout_spin_err_max = err;
+    if (idle_t + p > edge_t && done > fg_scanout_us_to_ticks(5000) && done < p) {
+     unsigned us = (unsigned)(done*1000000/rsr("cntfrq_el0"));
+     fg_scanout_ph_done_us = fg_scanout_ph_done_us - fg_scanout_ph_done_us/4 + us/4;
+    }
+    fg_scanout_phase_set(edge_t, c2);
+   } else if (((c2 - fg_scanout_ph_c) & 0xffffu) < 200) fg_scanout_phase_set(edge_t, c2);
+  } else fg_scanout_spin_stat[FG_SPIN_CATCH_FAIL]++;
+ }
+ {
+  FG_GUARD;
+  fg_scanout_spin_stat[result]++;
+  if (published) fg_scanout_spin_stat[nedge == 1 ? FG_SPIN_HIT : FG_SPIN_LATE]++;
+  fg_scanout_spin_late_sum += late; fg_scanout_spin_late_n++; if (late > fg_scanout_spin_late_max) fg_scanout_spin_late_max = late;
+  fg_scanout_spin_busy = 0;
+  /* A newer START (ours, or the display path's while this call was busy) has no pending wake: arm it now. */
+  if (fg_scanout_starts != serial) fg_scanout_spin_kick();
+ }
 }
 /* Called under FG_GUARD right after a START (and its arm). */
 static void fg_scanout_spin_kick(void)
@@ -220,10 +324,12 @@ static void fg_scanout_spin_kick(void)
   thread_call_setup_with_options(&fg_scanout_spin_call, fg_scanout_spin_run, NULL, THREAD_CALL_PRIORITY_KERNEL, THREAD_CALL_OPTIONS_ONCE);
   fg_scanout_spin_setup = 1;
  }
- uint64_t lead;
- nanoseconds_to_absolutetime((uint64_t)fg_scanout_period_us*FG_SCAN_SPIN_LEAD_PCT*10, &lead);
- fg_scanout_spin_busy = 1; fg_scanout_spin_serial = fg_scanout_starts;
- (void)thread_call_enter_delayed(&fg_scanout_spin_call, mach_absolute_time() + lead);
+ uint64_t now = rsr("cntpct_el0");
+ if (!fg_scanout_ph_p) fg_scanout_ph_p = fg_scanout_us_to_ticks(fg_scanout_period_us);
+ if (!fg_scanout_ph_done_us) fg_scanout_ph_done_us = FG_SCAN_SPIN_DONE_US;
+ fg_scanout_spin_serial = fg_scanout_starts; fg_scanout_spin_c0 = fg_scanout_last_count;
+ if (!fg_scanout_ph_ok || now - fg_scanout_ph_t > 64*fg_scanout_ph_p) { fg_scanout_spin_sync = 1; fg_scanout_spin_schedule(now); }
+ else fg_scanout_spin_plan(fg_scanout_phase_next(fg_scanout_last_start));
 }
 static void fg_scanout_probe_kick(unsigned te_frame)
 {
@@ -784,7 +890,7 @@ static int fg_scanout_publish(void)
  fg_scanout_last_start = now;
  if (fg_scanout_ready_at) { fg_scanout_r2s += now - fg_scanout_ready_at; fg_scanout_r2s_n++; }
  fg_scanout_ready_at = fg_scanout_charged_at = 0;
- fg_scanout_te_frames = count >> 16;
+ fg_scanout_te_frames = fg_scanout_last_count = count >> 16;
  if (++fg_scanout_starts % 600 == 0) {
   uint64_t span = now - fg_scanout_window_start;
   unsigned frames = (fg_scanout_te_frames - fg_scanout_te_window) & 0xffffu;
@@ -797,9 +903,20 @@ static int fg_scanout_publish(void)
       fg_scanout_iv[0], fg_scanout_iv[1], fg_scanout_iv[2], fg_scanout_iv[3]);
   fg_scanout_probe_report();
   if (fg_abi_spin) {
+   unsigned *st = fg_scanout_spin_stat, pus = (unsigned)(fg_scanout_ph_p*1000000/hz);
    printf("FUXI SCANOUT: te_start spin wakes=%u published=%u no_back_buffer=%u expired_or_raced=%u\n",
-       fg_scanout_spin_stat[0], fg_scanout_spin_stat[1], fg_scanout_spin_stat[2], fg_scanout_spin_stat[3]);
-   fg_scanout_spin_stat[0] = fg_scanout_spin_stat[1] = fg_scanout_spin_stat[2] = fg_scanout_spin_stat[3] = 0;
+       st[FG_SPIN_WAKES], st[FG_SPIN_PUBLISHED], st[FG_SPIN_NO_BACK], st[FG_SPIN_RACED] + st[FG_SPIN_EXPIRED] + st[FG_SPIN_NO_ACTIVE]);
+   printf("FUXI SCANOUT: te_phase hit=%u late=%u raced=%u expired=%u no_active=%u syncs=%u sync_fail=%u catch_fail=%u period_us=%u done_us=%u"
+       " phase_err_us avg=%llu max=%llu wake_late_us avg=%llu max=%llu\n",
+       st[FG_SPIN_HIT], st[FG_SPIN_LATE], st[FG_SPIN_RACED], st[FG_SPIN_EXPIRED], st[FG_SPIN_NO_ACTIVE], st[FG_SPIN_SYNCS],
+       st[FG_SPIN_SYNC_FAIL], st[FG_SPIN_CATCH_FAIL], pus, fg_scanout_ph_done_us,
+       (unsigned long long)(fg_scanout_spin_err_n ? fg_scanout_spin_err_sum*1000000/hz/fg_scanout_spin_err_n : 0),
+       (unsigned long long)(fg_scanout_spin_err_max*1000000/hz),
+       (unsigned long long)(fg_scanout_spin_late_n ? fg_scanout_spin_late_sum*1000000/hz/fg_scanout_spin_late_n : 0),
+       (unsigned long long)(fg_scanout_spin_late_max*1000000/hz));
+   for (unsigned i = 0; i < FG_SPIN_N; i++) st[i] = 0;
+   fg_scanout_spin_err_sum = fg_scanout_spin_err_max = fg_scanout_spin_late_sum = fg_scanout_spin_late_max = 0;
+   fg_scanout_spin_err_n = fg_scanout_spin_late_n = 0;
   }
   {
    uint64_t n = fg_scanout_xfer_n ? fg_scanout_xfer_n : 1, r = fg_scanout_r2s_n ? fg_scanout_r2s_n : 1, cum = 0;
