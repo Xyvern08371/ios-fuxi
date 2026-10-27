@@ -178,12 +178,21 @@ static uint32_t g3_read(uint64_t pa) {return *(uint32_t *)G_PTR(pa);}
 static void g_wr(uint64_t pa,unsigned off,uint32_t value) {*(uint32_t *)G_PTR(pa+off)=value;}
 static int g3_faulted(void) {return fault;}
 static int g4_tlb(uint32_t *d) {(void)d;tlbs++;return failTlb;}
+#define GPU_SMMU_BASE 0
+static unsigned tlbiWrites,failTlbi,cohMode,delays;static uint64_t tlbiVals[1024];
+static unsigned fg_access(uint64_t pa,uint64_t *v,unsigned wr,unsigned wide) {
+ assert(wr && wide && !(pa&7) && pa==g_cb(g3_bank)+0x620 && tlbiWrites<1024);
+ if(failTlbi) return fg_access_failed=1;
+ tlbiVals[tlbiWrites++]=*v;return 0;
+}
+static void gpu_model(void);
+static void delay(unsigned n) {(void)n;delays++;if(fg_client_busy && cohMode) gpu_model();}
 static int fg_isolate(void) {assert(hangLines==16);drains++;if(fg_suspends!=UINT64_MAX)fg_suspends++;return drainGood;}
 static void fg_fail(const char *why,unsigned code) {(void)why;(void)code;if(state==1 && fg_faults!=UINT64_MAX)fg_faults++;state=2;}
 static int fuxi_gpu_ready(void) {return state==1;}
 static void g3_emit(uint32_t v) {ring[g3_wptr++&8191]=v;}
 static unsigned pmapWalks;
-static ppnum_t pmap_find_phys(unsigned map,uintptr_t va) {(void)map; pmapWalks++; return (unsigned)(0x200000+(va>>14)*3);}
+static ppnum_t pmap_find_phys(unsigned map,uintptr_t va) {(void)map; pmapWalks++; return (unsigned)(0x200000+((va>>14)&0xfff)*3);}
 static void clock_interval_to_deadline(unsigned n,unsigned scale,uint64_t *d) {*d=ticks+(uint64_t)n*scale/1000;}
 static void thread_call_setup_with_options(thread_call_data_t *c,void (*fn)(void *,void *),void *arg,unsigned pri,unsigned opt) {(void)arg;(void)pri;(void)opt;c->fn=fn;}
 static int thread_call_enter_delayed(thread_call_data_t *c,uint64_t d) {(void)c;(void)d;enqueued++;return 0;}
@@ -197,8 +206,8 @@ static void seed(void) {
  fg_scanout_owned=scanoutStops=0;
  fg_abi_live=fg_abi_seq=fg_abi_completed=fg_abi_poisoned=fg_abi_timed_out=0;fg_abi_hang_dumped=0;
  fg_faults=fg_suspends=highReads=rollover=0;
- ticks=tlbs=failTlb=doorbells=enqueued=drains=fault=cacheClean=cacheInvalidate=0;
- memset(fg_abi_imports,0,sizeof(fg_abi_imports));fg_abi_host_handoff=fg_abi_ncimport=ncimportArg=0;
+ ticks=tlbs=failTlb=doorbells=enqueued=drains=fault=cacheClean=cacheInvalidate=0;tlbiWrites=failTlbi=cohMode=delays=0;
+ memset(fg_abi_imports,0,sizeof(fg_abi_imports));fg_abi_host_handoff=fg_abi_ncimport=ncimportArg=0;fg_abi_coh=fg_abi_coh_tries=0;memset(fg_abi_coh_page,0,sizeof(fg_abi_coh_page));
  fg_abi_cleaned=fg_abi_skipped=fg_abi_invalidated=0;
  readFault=sreadFault=writeFail=writeCount=logLines=hangLines=0;
 }
@@ -209,6 +218,29 @@ static void reset(void) {
 static void complete(void) {
  g_wr(G3_FENCE_PA,FG_ABI_FENCE_OFF+4,fg_abi_seq);
  regs[0x806]=regs[0x807]=g3_wptr;regs[0x210]=0;
+}
+/* Models the CP executing the self-test IB. cohMode 1: coherent (GPU sees the CPU's cached values and the CPU sees GPU writes);
+ * 2: non-coherent (GPU reads stale DRAM, its writes never reach the CPU's cached lines); 3: GPU never retires; 4: fault. */
+static void gpu_model(void) {
+ if(cohMode==3) {ticks+=60000;return;}
+ if(cohMode==4) {fault=1;regs[0x928]=1;return;}
+ const uint64_t base=FG_ABI_VA_START+FG_ABI_VA_SIZE-0x10000;
+ uint32_t *ib=(uint32_t *)(scratch+(FG_ABI_COH_IB-G_MEM));
+ uint32_t *res=(uint32_t *)(scratch+(FG_ABI_COH_RES-G_MEM));
+ uint32_t *page=(uint32_t *)fg_abi_coh_page;
+ unsigned at=0,m2m=0,wr=0;
+ while(ib[at]) {
+  unsigned op=(ib[at]>>16)&0x7f,n=ib[at]&0x3fff;
+  if(op==0x73) {assert(n==5 && !ib[at+1]);uint64_t dst=ib[at+2],src=ib[at+4];
+   assert(dst>=base+0x1000 && dst<base+0x1040 && src>=base+0x4000 && src<base+0x4200 && !(src&3));
+   uint32_t v=cohMode==1 || (cohMode==5 && dst!=base+0x1000+12) ? page[(src-base-0x4000)/4] : 0; res[(dst-base-0x1000)/4]=v;m2m++;}
+  else if(op==0x3d) {assert(n==3);uint64_t dst=ib[at+1];assert(dst>=base+0x4200 && dst<base+0x4400 && !ib[at+2]);
+   if(cohMode==1 || cohMode==5) page[(dst-base-0x4000)/4]=ib[at+3];wr++;}
+  else assert(op==0x12 || op==0x26);
+  at+=1+n;
+ }
+ assert(m2m==8 && wr==8);
+ complete();
 }
 int main(void) {
  assert(!fg_abi_live_for_scanout());
@@ -425,9 +457,9 @@ int main(void) {
  puts("PASS: imported BO cache handoff covers indirect resources, watchdog retirement, drained fault and undrained quarantine");
  // Optional writable-import lifetime handoff. NC SMMU attributes stay equal;
  // only initial map clean replaces per-submit clean. Completion still IVACs writable imports (not the read-only one).
- for(unsigned arg=0;arg<3;arg++) {
+ for(unsigned arg=0;arg<2;arg++) {
   seed();ncimportArg=arg;assert(fg_abi_init());
-  assert(fg_abi_ncimport==(arg==1));
+  assert(fg_abi_ncimport==(arg==1) && !fg_abi_cohtest && !fg_abi_tlbpages);
   assert(!fuxi_gpu_abi_map_import(va,source,32768,3));
   assert(!(*fg_abi_leaf(va)&(1u<<2)) && ((*fg_abi_leaf(va)>>8)&3)==2);
   assert(!fuxi_gpu_abi_map_import(va+0x10000,source+65536,16384,1));
@@ -458,7 +490,85 @@ int main(void) {
   assert(cacheClean==256 && cacheInvalidate==good*256 && fg_abi_skipped==16384);
   assert(fuxi_gpu_abi_unmap(va,16384)==(good?0:-2));
  }
- puts("PASS: opt-in NC-import map handoff, indirect RW/RO policy, repeated submits, byte counters, map failure/busy and fault quarantine");
+  puts("PASS: opt-in NC-import map handoff, indirect RW/RO policy, repeated submits, byte counters, map failure/busy and fault quarantine");
+ /* fuxigpuncimport is a bitmask: 1 NC import, 64 coherent self-test, 128 ranged TLBI. Value 1 keeps its meaning;
+  * the low bits 2..32 stay free for other lanes and are ignored here. */
+ for(unsigned arg=0;arg<256;arg++) {
+  seed();ncimportArg=arg;assert(fg_abi_init());
+  assert(fg_abi_ncimport==(arg&1) && fg_abi_cohtest==((arg>>6)&1) && fg_abi_tlbpages==((arg>>7)&1) && !fg_abi_coh && !delays);
+ }
+ /* Cached overlap mirror replaces the NC leaf read: exact 4K overlap refusal, nothing published on refusal, unmap/init clear. */
+ reset();assert(!fuxi_gpu_abi_map(va,source,32768,3,0,2));
+ assert(fuxi_gpu_abi_map(va+0x7000,source,8192,3,0,2)==-1 && fuxi_gpu_abi_map(va-4096,source,8192,3,0,2)==-1);
+ assert(!*fg_abi_leaf(va-4096) && !*fg_abi_leaf(va+0x8000));
+ assert(!fuxi_gpu_abi_map(va+0x8000,source,4096,3,0,2) && !fuxi_gpu_abi_map(va-4096,source,4096,3,0,2));
+ assert(!fuxi_gpu_abi_unmap(va,32768) && !fg_abi_used_get(fg_abi_pg(va)) && fg_abi_used_get(fg_abi_pg(va+0x8000)));
+ assert(!fuxi_gpu_abi_map(va,source,32768,3,0,2) && fuxi_gpu_abi_map(va,source,4096,3,0,2)==-1);
+ assert(!fuxi_gpu_abi_unmap(va,32768) && !fuxi_gpu_abi_unmap(va+0x8000,4096) && !fuxi_gpu_abi_unmap(va-4096,4096));
+ for(unsigned i=0;i<sizeof(fg_abi_used)/sizeof(fg_abi_used[0]);i++) assert(!fg_abi_used[i]);
+ puts("PASS: cached overlap mirror (exact 4K overlap refusal, no partial publish, unmap clears, init clears)");
+ /* Ranged invalidate: default keeps the whole-ASID TLBI; value 128 does one TLBIVAL per 4K page plus sync, up to 512 pages. */
+ reset();assert(!fuxi_gpu_abi_map(va,source,32768,3,0,2));tlbs=0;
+ assert(!fuxi_gpu_abi_unmap(va,32768) && tlbs==1 && !tlbiWrites);
+ seed();ncimportArg=128;assert(fg_abi_init());assert(!fuxi_gpu_abi_map(va,source,32768,3,0,2));tlbs=0;
+ assert(!fuxi_gpu_abi_unmap(va,32768) && !tlbs && tlbiWrites==8);
+ for(unsigned i=0;i<8;i++) assert(tlbiVals[i]==(((va>>12)+i)|((uint64_t)g3_asid<<48)));
+ assert(sregs[(g_cb(g3_bank)+0x7f0)/4]==0 && !*fg_abi_leaf(va));
+ assert(!fuxi_gpu_abi_map(va,source,512*4096,3,0,2));tlbiWrites=0;
+ assert(!fuxi_gpu_abi_unmap(va,512*4096) && !tlbs && tlbiWrites==512);
+ assert(!fuxi_gpu_abi_map(va,source,513*4096,3,0,2));tlbiWrites=0;
+ assert(!fuxi_gpu_abi_unmap(va,513*4096) && tlbs==1 && !tlbiWrites); /* above the page limit: whole ASID */
+ /* A failed ranged invalidate or sync is a fault, never a silent skip. */
+ assert(!fuxi_gpu_abi_map(va,source,16384,3,0,2));failTlbi=1;
+ assert(fuxi_gpu_abi_unmap(va,16384)==-1 && fg_abi_poisoned && state==2);
+ seed();ncimportArg=128;assert(fg_abi_init());assert(!fuxi_gpu_abi_map(va,source,16384,3,0,2));
+ sregs[(g_cb(g3_bank)+0x7f4)/4]=1;delays=0;
+ assert(fuxi_gpu_abi_unmap(va,16384)==-1 && fg_abi_poisoned && delays==1000); /* TLBSYNC never completes */
+ puts("PASS: ranged TLBIVAL on small unmap (VA|ASID format, sync, 512-page limit, ASID fallback) and fail-closed on write/sync failure");
+ /* Coherent-import self-test (value 64): only a fully matching run skips import cache maintenance. */
+ for(unsigned mode=1;mode<=5;mode++) {
+  seed();ncimportArg=64;assert(fg_abi_init());assert(fg_abi_cohtest && !fg_abi_ncimport && !fg_abi_coh);
+  assert(!fuxi_gpu_abi_map(va-0x100000,source,4096,3,0,2) && !fuxi_gpu_abi_unmap(va-0x100000,4096)); /* no probe before an import */
+  assert(!fg_abi_coh && !delays && !doorbells);
+  cohMode=mode;
+  int s=fuxi_gpu_abi_map_import(va,source,16384,3);
+  assert(s==((mode==3||mode==4)?-1:0));
+  assert(fg_abi_coh==(mode==1?1u:2u) && doorbells==1);
+  assert(!strstr(lastLog,"retry") && strstr(lastLog,"coherent-import self-test"));
+  assert(cacheClean==256 && cacheInvalidate==0); /* only the probe page's own cleanup */
+  assert(fg_abi_cleaned==0); /* not accounted as import traffic */
+  if(mode<3) assert(strstr(lastLog,mode==1?"pass cpu_to_gpu 8/8 gpu_to_cpu 8/8":"stale cpu_to_gpu 0/8 gpu_to_cpu 0/8"));
+  if(mode==5) assert(strstr(lastLog,"stale cpu_to_gpu 7/8 gpu_to_cpu 8/8"));
+  if(mode==3||mode==4) {assert(state==2 && fg_abi_poisoned && strstr(lastLog,"self-test fault"));continue;}
+  for(unsigned i=0;i<4;i++) assert(!*fg_abi_leaf(FG_ABI_COH_IOVA+4096*i) && !fg_abi_used_get(fg_abi_pg(FG_ABI_COH_IOVA+4096*i)));
+  assert(!*fg_abi_leaf(FG_ABI_COH_IOVA+0x4000) && fg_abi_imports[0].iova==va && fg_abi_imports[0].source==source);
+  cacheClean=0;cohMode=0;
+  assert(!fuxi_gpu_abi_submit(addresses,sizes,1,&fence));
+  complete();assert(!fuxi_gpu_abi_poll(fence));
+  if(mode==1) assert(!cacheClean && !cacheInvalidate && fg_abi_skipped==16384 && !fg_abi_cleaned && !fg_abi_invalidated);
+  else assert(cacheClean==256 && cacheInvalidate==256 && fg_abi_skipped==0);
+  unsigned before=doorbells;
+  assert(!fuxi_gpu_abi_map_import(va+0x10000,source+65536,16384,1) && doorbells==before); /* verdict is final, no re-probe */
+  assert(!fuxi_gpu_abi_unmap(va,16384) && !fuxi_gpu_abi_unmap(va+0x10000,16384));
+ }
+ /* Inconclusive (GPU busy) runs retry, at most three times, then stay on the safe path. */
+ seed();ncimportArg=64;assert(fg_abi_init());fg_busy=1;
+ for(unsigned i=0;i<3;i++) {
+  assert(!fuxi_gpu_abi_map_import(va+0x10000*i,source,16384,3));
+  assert(fg_abi_coh==(i==2?2u:0u) && !doorbells && strstr(lastLog,"busy") && !!strstr(lastLog,"retry")==(i<2));
+ }
+ assert(!fuxi_gpu_abi_map_import(va+0x30000,source,16384,3) && fg_abi_coh==2);
+ /* An occupied probe window (client mapped it) is inconclusive and leaves the client's mapping intact. */
+ seed();ncimportArg=64;assert(fg_abi_init());
+ assert(!fuxi_gpu_abi_map(FG_ABI_COH_IOVA+0x1000,source,4096,3,0,2));
+ assert(!fuxi_gpu_abi_map_import(va,source,16384,3) && !fg_abi_coh && fg_abi_used_get(fg_abi_pg(FG_ABI_COH_IOVA+0x1000)) && !fg_abi_used_get(fg_abi_pg(FG_ABI_COH_IOVA)));
+ /* With value 1 as well: a proven mapping needs no map-time clean either; an unproven one still gets it. */
+ for(unsigned mode=1;mode<=2;mode++) {
+  seed();ncimportArg=65;assert(fg_abi_init());cohMode=mode;
+  assert(!fuxi_gpu_abi_map_import(va,source,16384,3) && cacheClean==(mode==1?256u:512u));cohMode=0;
+ }
+ puts("PASS: coherent self-test (pass skips maintenance; stale/partial/hang/fault/busy/occupied stay on the clean+invalidate path; probe window left unmapped)");
+
 
  puts("PASS: actual backend root isolation, 16K/4K scattered leaves, VA reuse/TLBI, present exclusion, late retirement, independent watchdog/fault/drain/quarantine");
 }

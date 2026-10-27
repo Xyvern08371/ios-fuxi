@@ -48,7 +48,8 @@ static void abiTrace(const char *,int,int){}
 static bool pmap_valid_page(ppnum_t p) {return p!=0x12345;}
 constexpr unsigned VM_WIMG_MASK=255,VM_WIMG_DEFAULT=2,VM_WIMG_WCOMB=6;
 static unsigned hostCache=VM_WIMG_DEFAULT;
-static unsigned pmap_cache_attributes(ppnum_t) {return fail==12?7:hostCache;}
+static unsigned pmap_cache_attributes(ppnum_t p) {return fail==12 || (fail==16 && p==(0x10000000>>14)+1)?7:hostCache;}
+static unsigned segLookups;
 struct IOMemoryMap;
 struct IOMemoryDescriptor {
  unsigned refs=1,wired=0;uint64_t length=0;
@@ -67,7 +68,7 @@ struct IOMemoryDescriptor {
  uint64_t getLength() {return fail==3?length-1:length;}
  uint64_t getPhysicalSegment(uint64_t off,IOByteCount *n,unsigned flags) {
   assert(wired && flags==kIOMemoryMapperNone && !(off&16383));
-  *n=fail==4?4096:16384;
+  segLookups++;*n=fail==4?4096:(fail==15||fail==16)?length-off:16384;
   if(fail==5 && off==16384)return 0; // unwind a partially walked scatter list
   if(fail==6)return UINT64_C(1)<<36;
   if(fail==7)return 0x12345ULL<<14; // foreign/device page
@@ -131,6 +132,14 @@ int main() {
   assert(c.importHost(request,out)!=0 && !out.handle && !c.wired_ && !c.bos_[0].handle);
   empty();assert(completes==before+(fail>=3));
  }
+ // One physical segment lookup per contiguous run, but the cache-class predicate still applies to every 16K page of the run.
+ fail=15;segLookups=0;
+ assert(!c.importHost(request,out) && segLookups==1 && c.wired_==32768);fail=0;assert(!c.drop(c.bos_[0]));empty();
+ request.bytes=65536;fail=15;segLookups=0;
+ assert(!c.importHost(request,out) && segLookups==1);fail=0;assert(!c.drop(c.bos_[0]));empty();
+ request.bytes=32768;fail=16;segLookups=0;unsigned before_=completes;
+ assert(c.importHost(request,out)!=0 && segLookups==1 && !c.wired_ && !c.bos_[0].handle);empty();assert(completes==before_+1);
+ fail=0;
  fail=0;caller=8;assert(c.importHost(request,out)==kIOReturnBadArgument);empty();caller=7;
  c.task_=kernel_task;assert(c.importHost(request,out)==kIOReturnBadArgument);c.task_=7;
  c.wired_=FG_ABI_MAX_WIRED_BYTES-16384;assert(c.importHost(request,out)==kIOReturnNoResources);c.wired_=0;

@@ -274,12 +274,16 @@ class FuxiAdrenoUserClient : public IOUserClient {
   if (memory->prepare()!=kIOReturnSuccess) { memory->release(); return refuse(5,kIOReturnBadArgument,0); }
   bool valid=memory->getLength()==r.bytes;
   uint64_t why=valid ? 0 : (6ULL<<56);
-  for (uint64_t off=0;valid && off<r.bytes;off+=NativeAdrenoAbiHostPageBytes) {
+  /* One segment lookup per physical run (UniXNU Adreno740 pattern); the cache-class predicate stays per 16K page. */
+  for (uint64_t off=0,step=0;valid && off<r.bytes;off+=step) {
    IOByteCount length=0;
    uint64_t pa=memory->getPhysicalSegment(off,&length,kIOMemoryMapperNone);
-   valid=pa && !(pa&(NativeAdrenoAbiHostPageBytes-1)) && length>=NativeAdrenoAbiHostPageBytes &&
-       pa<(UINT64_C(1)<<FG_ABI_PA_BITS) && fuxi_adreno_host_page_ok(pa);
-   if (!valid) why=(7ULL<<56)|off;
+   step=(length>r.bytes-off ? r.bytes-off : length)&~(NativeAdrenoAbiHostPageBytes-1);
+   valid=pa && !(pa&(NativeAdrenoAbiHostPageBytes-1)) && step>=NativeAdrenoAbiHostPageBytes &&
+       pa<(UINT64_C(1)<<FG_ABI_PA_BITS) && step<=(UINT64_C(1)<<FG_ABI_PA_BITS)-pa;
+   if (!valid) { why=(7ULL<<56)|off; break; }
+   for (uint64_t k=0;k<step;k+=NativeAdrenoAbiHostPageBytes)
+    if (!fuxi_adreno_host_page_ok(pa+k)) { valid=false; why=(7ULL<<56)|(off+k); break; }
   }
   // DefaultCache inherits the memory entry's actual policy (WB or Normal NC).
   IOMemoryMap *mapping=valid ? memory->createMappingInTask(kernel_task,0,kIOMapAnywhere|kIOMapDefaultCache) : nullptr;

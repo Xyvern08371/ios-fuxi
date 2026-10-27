@@ -320,6 +320,7 @@ integer value **1**, default off. No deployment or hardware test was performed.
 | Project / repository | Commit and license | Result |
 | --- | --- | --- |
 | [UniXNU NativeAdreno](https://github.com/UniXNU/NativeAdreno) | `b686b9054f57d393c80195b82568a09f8ca106a2`, MIT | Adapt writable-import cache handoff, retaining completion invalidation; `fuxigpuncimport=1`. Existing `LICENSE.NativeAdreno` retained. |
+| [UniXNU ArmSmmu4K / Adreno740](https://github.com/UniXNU) (`research/unixnu-new`; commit ids not readable, files compared) | MIT | Adapt: cached overlap mirror for caller-owned maps, one segment lookup per run in BoImport, ranged TLBIVAL for small unmaps (`fuxigpuncimport=128`), coherency-proven skipping of import cache maintenance (`=64`). See metal.md "GPU map/unmap cost". |
 | Same | `26220f1ab79fec643517336fbd81574bd1e0d05a`, MIT | Already present: `fuxi_abi_wire.h` programs IFPC off (`P1(0x65,0x101)`); no power sequencing change. |
 | [UniXNU NativeMetal](https://github.com/UniXNU/NativeMetal) | `c6d29caad6d880cc8204ebe3bc34d77479a3255d`, MIT | Adapt screen-delivery priority to the kernel timer callback; `fuxifbprio=1`. Existing `LICENSE.NativeMetal` retained. No NativeMetal source tree modified or vendored. |
 | Same | `dce1bdc468716bfa9e8f58ac05bfacdec6b6128a`, `eed65758722bd4a1219de5161a8ed9ef0bc547da`, MIT | Already at the final setting: `ClientSetup.hpp` supplies `TU_DEBUG=sysmem,nocb` without overwriting an explicit environment value. Do not restore the superseded `nobin,nocb`. |

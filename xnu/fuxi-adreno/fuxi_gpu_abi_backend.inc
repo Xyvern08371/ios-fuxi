@@ -20,7 +20,10 @@ static thread_call_data_t fg_client_watchdog;
  * list. Serialize cache handoff with the same GPU lock as submit/retirement.
  * The user client owns these prepared kernel mappings until successful unmap. */
 static struct { uint64_t iova, bytes; uintptr_t source; unsigned permissions; } fg_abi_imports[FG_ABI_MAX_IMPORTS];
-static unsigned fg_abi_host_handoff, fg_abi_ncimport;
+static unsigned fg_abi_host_handoff, fg_abi_ncimport, fg_abi_cohtest, fg_abi_tlbpages;
+/* fuxigpuncimport is a bitmask: 1 NC-import map-time clean, 64 coherent-import self-test (skips the per-submit
+ * clean/retire invalidate only if it proves the GPU path coherent), 128 ranged TLBIVAL for a small unmap. Default 0. */
+static unsigned fg_abi_coh, fg_abi_coh_tries; /* coh: 0 untested, 1 proven coherent, 2 refused */
 static uint64_t fg_abi_cleaned, fg_abi_skipped, fg_abi_invalidated;
 static void fg_abi_cache_region(uintptr_t source, uint64_t bytes, int complete)
 {
@@ -36,6 +39,11 @@ static void fg_abi_import_cache(int complete)
 {
  if (complete && !fg_abi_host_handoff) return;
  __asm__ volatile("dsb sy" ::: "memory");
+ if (fg_abi_coh==1) { /* self-test proved CPU/GPU coherence for import-class mappings: no cache maintenance */
+  for (unsigned i=0;i<FG_ABI_MAX_IMPORTS;i++) if (fg_abi_imports[i].iova) fg_abi_skipped+=fg_abi_imports[i].bytes;
+  fg_abi_host_handoff=0;
+  return;
+ }
  /* A read-only PTE cannot be written by the GPU, so retirement has no stale
   * lines to drop for it; the submit-side clean still covers every import. */
  for (unsigned i=0;i<FG_ABI_MAX_IMPORTS;i++) if (fg_abi_imports[i].iova && (!complete || (fg_abi_imports[i].permissions&2))) {
@@ -71,6 +79,32 @@ static volatile uint64_t *fg_abi_leaf(uint64_t iova)
 {
  unsigned chunk = (unsigned)((iova-FG_ABI_VA_START)>>21);
  return (volatile uint64_t *)G_PTR_RANGE(FG_ABI_PT+(4u+chunk)*4096,4096)+((iova>>12)&511);
+}
+/* Cached mirror of which client 4K leaves are live. Only map/unmap/init write client leaves, so the overlap test reads this
+ * instead of NC page-table memory (UniXNU ArmSmmu4K: no existing-range pass for caller-owned pages). */
+static uint64_t fg_abi_used[(FG_ABI_VA_SIZE>>12)/64];
+static inline unsigned fg_abi_pg(uint64_t iova) { return (unsigned)((iova-FG_ABI_VA_START)>>12); }
+static inline int fg_abi_used_get(unsigned pg) { return (fg_abi_used[pg>>6]>>(pg&63))&1; }
+static inline void fg_abi_used_put(unsigned pg, int on)
+{ if (on) fg_abi_used[pg>>6]|=UINT64_C(1)<<(pg&63); else fg_abi_used[pg>>6]&=~(UINT64_C(1)<<(pg&63)); }
+/* Ranged invalidate of a small unmap (opt-in value 128): TLBIVAL (+0x620, AArch64 format VA[55:12]|ASID<<48) per removed
+ * 4K leaf, then TLBSYNC. Leaf-only: the L1/L2 tables are fixed for the life of the root. Same status codes as g4_tlb. */
+#define FG_ABI_TLB_PAGE_LIMIT 512u
+static int g3_sw64(unsigned off, uint64_t v) { return !fg_access_failed && !fg_access(GPU_SMMU_BASE+off,&v,1,1); }
+static int fg_abi_tlb_pages(uint64_t iova, uint64_t bytes)
+{
+ unsigned cb=g_cb(g3_bank);
+ __asm__ volatile("dsb sy" ::: "memory");
+ for (uint64_t off=0;off<bytes;off+=4096)
+  if (!g3_sw64(cb+0x620,(((iova+off)>>12)&((UINT64_C(1)<<44)-1))|((uint64_t)g3_asid<<48))) return 0xe01;
+ if (!g3_sw(cb+0x7f0,0)) return 0xe01;
+ for (unsigned i=0;i<1000;i++) {
+  uint32_t st=g3_sr(cb+0x7f4);
+  if (fg_access_failed) return 0xe01;
+  if (!(st&1)) return 0;
+  delay(1);
+ }
+ return 0xe03;
 }
 static int fg_abi_switch(uint64_t root)
 {
@@ -156,8 +190,11 @@ static void fg_abi_watch(thread_call_param_t arg, thread_call_param_t unused)
 }
 static int fg_abi_init(void)
 {
- (void)PE_parse_boot_argn("fuxigpuncimport",&fg_abi_ncimport,sizeof(fg_abi_ncimport));
- fg_abi_ncimport=fg_abi_ncimport==1;
+ unsigned bits=0;
+ (void)PE_parse_boot_argn("fuxigpuncimport",&bits,sizeof(bits));
+ fg_abi_ncimport=bits&1; fg_abi_cohtest=(bits>>6)&1; fg_abi_tlbpages=(bits>>7)&1;
+ fg_abi_coh=fg_abi_coh_tries=0;
+ for (unsigned i=0;i<sizeof(fg_abi_used)/sizeof(fg_abi_used[0]);i++) fg_abi_used[i]=0;
  /* 772 4K pages: root, two L2s, kernel runtime L3, 768 client L3s.
   * Allocate all table storage from unused reserved NC scratch, never VM.
   * No existing GMU or present PTE is reused as mutable client storage. */
@@ -308,19 +345,18 @@ static int fg_abi_map_locked(uint64_t iova, uintptr_t source, uint64_t bytes,
  uintptr_t base=source>>PAGE_SHIFT;
  volatile uint64_t *leaf=NULL;
  for (uint64_t off=0;off<bytes;off+=4096) {
-  if (!leaf || !((iova+off)&0x1fffff)) leaf=fg_abi_leaf(iova+off); else leaf++;
   if (!off || !((source+off)&PAGE_MASK)) {
    ppnum_t ppn=pmap_find_phys(kernel_pmap,source+off);
    if (!ppn || ((uint64_t)ppn<<PAGE_SHIFT)>=(1ULL<<FG_ABI_PA_BITS)) return -1;
    fg_abi_ppns[((source+off)>>PAGE_SHIFT)-base]=ppn;
   }
-  if (*leaf) return -1;
+  if (fg_abi_used_get(fg_abi_pg(iova+off))) return -1;
  }
- leaf=NULL;
  for (uint64_t off=0;off<bytes;off+=4096) {
   if (!leaf || !((iova+off)&0x1fffff)) leaf=fg_abi_leaf(iova+off); else leaf++;
   uint64_t pa=((uint64_t)fg_abi_ppns[((source+off)>>PAGE_SHIFT)-base]<<PAGE_SHIFT)|((source+off)&PAGE_MASK);
   *leaf=pa|3|(permissions==3 ? 1u<<6 : 3u<<6)|(wb ? 1u<<2 : 0)|sh<<8|1u<<10;
+  fg_abi_used_put(fg_abi_pg(iova+off),1);
  }
  __asm__ volatile("dsb sy" ::: "memory");
  /* Root is inactive; TLBI is mandatory before its next doorbell. */
@@ -332,17 +368,19 @@ int fuxi_gpu_abi_map(uint64_t iova, uintptr_t source, uint64_t bytes,
  FG_GUARD;
  return fg_abi_map_locked(iova,source,bytes,permissions,wb,sh);
 }
+static void fg_abi_coh_probe(void);
 int fuxi_gpu_abi_map_import(uint64_t iova, uintptr_t source, uint64_t bytes, unsigned permissions)
 {
  FG_GUARD;
  if (!source || !bytes || ((source|bytes)&(NativeAdrenoAbiHostPageBytes-1)) ||
      bytes>FG_ABI_MAX_BYTES || source+bytes<source) return -1;
+ if (fg_abi_cohtest && !fg_abi_coh) fg_abi_coh_probe(); /* first import = first use; runs before this range is mapped */
  unsigned slot;
  for (slot=0;slot<FG_ABI_MAX_IMPORTS && fg_abi_imports[slot].iova;slot++) {}
  if (slot==FG_ABI_MAX_IMPORTS) return -1;
  int s=fg_abi_map_locked(iova,source,bytes,permissions,0,2);
  if (!s) {
-  if (fg_abi_ncimport && (permissions&2)) {
+  if (fg_abi_ncimport && fg_abi_coh!=1 && (permissions&2)) {
    /* Before the first GPU use: publish preexisting CPU pixels/dirty lines.
     * The GPU lock prevents any submission until this handoff has finished. */
    __asm__ volatile("dsb sy" ::: "memory");
@@ -359,9 +397,8 @@ static void fg_abi_import_remove(uint64_t iova, uint64_t bytes)
  for (unsigned i=0;i<FG_ABI_MAX_IMPORTS;i++)
   if (fg_abi_imports[i].iova==iova && fg_abi_imports[i].bytes==bytes) fg_abi_imports[i].iova=0;
 }
-int fuxi_gpu_abi_unmap(uint64_t iova, uint64_t bytes)
+static int fg_abi_unmap_locked(uint64_t iova, uint64_t bytes)
 {
- FG_GUARD;
  if (fg_abi_live && !fg_abi_poisoned && fg_abi_range(iova,bytes)) (void)fg_abi_wait_idle();
  if (fg_abi_poisoned) {
   if (!fg_abi_drained) return -2;
@@ -373,19 +410,20 @@ int fuxi_gpu_abi_unmap(uint64_t iova, uint64_t bytes)
  for (uint64_t off=0;off<bytes;off+=4096) {
   if (!leaf || !((iova+off)&0x1fffff)) leaf=fg_abi_leaf(iova+off); else leaf++;
   *leaf=0;
+  fg_abi_used_put(fg_abi_pg(iova+off),0);
  }
  __asm__ volatile("dsb sy" ::: "memory");
- /* Remove stale ASID translations before backing pages can be released.
-  * Safe with an in-flight present: only the inactive root was changed. */
+ /* Remove stale ASID translations before backing pages can be released; never skipped. Opt-in value 128 drops a small
+  * unmap page by page instead of the whole ASID. Safe with an in-flight present: only the inactive root was changed. */
  uint32_t tlb[128]={0};
- if (g4_tlb(tlb) || fg_access_failed) return fg_abi_fault("client unmap TLB sync");
+ int terr=fg_abi_tlbpages && bytes/4096<=FG_ABI_TLB_PAGE_LIMIT ? fg_abi_tlb_pages(iova,bytes) : g4_tlb(tlb);
+ if (terr || fg_access_failed) return fg_abi_fault("client unmap TLB sync");
  fg_abi_import_remove(iova,bytes);
  return 0;
 }
-int fuxi_gpu_abi_submit(const uint64_t *iovas, const uint64_t *sizes,
+static int fg_abi_submit_locked(const uint64_t *iovas, const uint64_t *sizes,
     unsigned count, uint64_t *fence)
 {
- FG_GUARD;
  if (!fg_abi_live || !fuxi_gpu_ready() || fg_abi_poisoned || fg_abi_seq==UINT32_MAX) return -1;
  if (fg_busy || fg_scanout_reserved) return 1;
  int idle=fg_abi_wait_idle();
@@ -413,6 +451,72 @@ int fuxi_gpu_abi_submit(const uint64_t *iovas, const uint64_t *sizes,
  clock_interval_to_deadline(2,NSEC_PER_MSEC,&deadline);
  (void)thread_call_enter_delayed(&fg_client_watchdog,deadline);
  return 0;
+}
+int fuxi_gpu_abi_unmap(uint64_t iova, uint64_t bytes)
+{
+ FG_GUARD;
+ return fg_abi_unmap_locked(iova,bytes);
+}
+int fuxi_gpu_abi_submit(const uint64_t *iovas, const uint64_t *sizes,
+    unsigned count, uint64_t *fence)
+{
+ FG_GUARD;
+ return fg_abi_submit_locked(iovas,sizes,count,fence);
+}
+/* Opt-in (fuxigpuncimport value 64) fail-closed CPU/GPU coherency self-test, run once under the GPU lock at the first import map.
+ * It maps a cacheable kernel page with the exact import leaf attributes (Normal NC, outer-shareable) and runs one tiny IB:
+ * up: the CPU leaves 8 lines dirty in its cache and the GPU must copy those values (no clean); down: the CPU caches 8 old
+ * lines and the GPU must overwrite them and the CPU must read the new values (no invalidate). All 16 must match, otherwise
+ * (stale, timeout, fault, anything unexpected) the normal per-submit clean and retire invalidate stay. Not yet observed on device. */
+#define FG_ABI_COH_IOVA (FG_ABI_VA_START+FG_ABI_VA_SIZE-0x10000)
+#define FG_ABI_COH_IB (FG_ABI_PT+0x3f0000)
+#define FG_ABI_COH_RES (FG_ABI_PT+0x3f1000)
+_Static_assert(FG_ABI_COH_IB >= FG_ABI_PT+(4u+768u)*4096 && FG_ABI_COH_RES+4096 <= FG_ABI_PT+FG_ABI_PT_BYTES, "coherency test pages overlap tables");
+static uint8_t fg_abi_coh_page[16384] __attribute__((aligned(16384)));
+static void fg_abi_coh_probe(void)
+{
+ if (!fg_abi_live || !fuxi_gpu_ready() || fg_abi_poisoned) return;
+ const uint64_t ib=FG_ABI_COH_IOVA, res=ib+0x1000, data=ib+0x4000;
+ const char *why="inconclusive";
+ unsigned up=0, down=0, mapped=0, definitive=0;
+ volatile uint32_t *page=(volatile uint32_t *)fg_abi_coh_page;
+ volatile uint32_t *rp=(volatile uint32_t *)G_PTR_RANGE(FG_ABI_COH_RES,4096);
+ uint32_t *ibw=(uint32_t *)G_PTR_RANGE(FG_ABI_COH_IB,4096);
+ uint64_t fence=0, ibytes=0, cleaned=fg_abi_cleaned;
+ unsigned n=0;
+ if (fg_abi_map_locked(ib,(uintptr_t)ibw,4096,3,0,2)) { why="map ib"; goto out; }
+ mapped|=1;
+ if (fg_abi_map_locked(res,(uintptr_t)rp,4096,3,0,2)) { why="map result"; goto out; }
+ mapped|=2;
+ if (fg_abi_map_locked(data,(uintptr_t)fg_abi_coh_page,sizeof(fg_abi_coh_page),3,0,2)) { why="map data"; goto out; }
+ mapped|=4;
+ for (unsigned k=0;k<16;k++) rp[k]=0;
+ for (unsigned k=0;k<8;k++) { page[k*16]=0xC0DE0000u|k; page[(8+k)*16]=0x51A1E000u|k; (void)page[(8+k)*16]; }
+ for (unsigned k=0;k<8;k++) {
+  ibw[n++]=fg_abi_pkt7(0x73,5); ibw[n++]=0; ibw[n++]=(uint32_t)(res+4*k); ibw[n++]=0; ibw[n++]=(uint32_t)(data+64*k); ibw[n++]=0;
+ }
+ for (unsigned k=0;k<8;k++) {
+  ibw[n++]=fg_abi_pkt7(0x3d,3); ibw[n++]=(uint32_t)(data+(8+k)*64); ibw[n++]=0; ibw[n++]=0x6E57A000u|k;
+ }
+ ibw[n++]=fg_abi_pkt7(0x12,0); ibw[n++]=fg_abi_pkt7(0x26,0);
+ ibytes=4u*n;
+ __asm__ volatile("dsb sy" ::: "memory");
+ { int s=fg_abi_submit_locked(&ib,&ibytes,1,&fence); if (s) { why=s>0 ? "busy" : "submit"; goto out; } }
+ { int o; while ((o=fg_abi_observe())==1) delay(20);
+   if (o) { why="fault"; definitive=1; goto out; } }
+ for (unsigned k=0;k<8;k++) { up+=rp[k]==(0xC0DE0000u|k); down+=page[(8+k)*16]==(0x6E57A000u|k); }
+ definitive=1;
+ why=up==8 && down==8 ? "pass" : "stale";
+out:
+ if (mapped&4) fg_abi_cache_region((uintptr_t)fg_abi_coh_page,sizeof(fg_abi_coh_page),0);
+ fg_abi_cleaned=cleaned;
+ if (mapped&4) (void)fg_abi_unmap_locked(data,sizeof(fg_abi_coh_page));
+ if (mapped&2) (void)fg_abi_unmap_locked(res,4096);
+ if (mapped&1) (void)fg_abi_unmap_locked(ib,4096);
+ if (up==8 && down==8 && definitive && !fg_abi_poisoned) fg_abi_coh=1;
+ else if (definitive || ++fg_abi_coh_tries>=3) fg_abi_coh=2;
+ printf("FUXI GPU ABI: coherent-import self-test %s cpu_to_gpu %u/8 gpu_to_cpu %u/8 -> %s\n",why,up,down,
+     fg_abi_coh==1 ? "skip import clean/invalidate" : fg_abi_coh==2 ? "keep import cache maintenance (final)" : "keep import cache maintenance (retry)");
 }
 int fuxi_gpu_abi_poll(uint64_t fence)
 {

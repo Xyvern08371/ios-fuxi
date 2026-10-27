@@ -2767,3 +2767,41 @@ Source: AdrenoMetal (MIT), `NativeBridgeMetalFrontend.mm` (`surfaceBuffer`, `enc
 - Not ported, 0009..0015: all metal2vulkan runtime/bind/canon changes with no FuxiMetal equivalent.
 - Not ported, frame/wait trace: FrameTrace already records `waitUntilCompleted`/`waitUntilScheduled` durations per frame; their
   addition is the caller return address, judged too little to add.
+## GPU map/unmap cost, ranged TLBI and IO-coherent imports (not yet observed on device)
+
+Ported from UniXNU `ArmSmmu4K` and `Adreno740` (MIT; newest work compared by reading the source files, git history of the
+sources was not readable). Sources reviewed: `ArmSmmu4KLive.c` (`ArmSmmu4KSyncContextTlbPages`, `ArmSmmu4KTlbPageLimit=512`,
+the `aliases=0`/exclusive map path), `ArmSmmu4KProgram.c` (TLBIVAL +0x620, AArch64 format VA[55:12] | ASID<<48, TLBSYNC +0x7f0),
+UniXNU docs `drivers/arm-smmu4k.md` and `drivers/adreno740.md` ("Memory and TLB" table). Our client root is a flat 4K table with
+no per-range alias classes, so the port is the same idea in our shape:
+
+- **Overlap test without the NC read-back** (`fuxi_gpu_abi_backend.inc`): map pass 1 used to read every target leaf from NC
+  table memory. `fg_abi_used[]` is a cached 48 KiB bit-per-4K mirror written only by map, unmap and init; pass 1 reads that.
+  Refusal is still exact to 4K and publishes nothing. Pass 1 also no longer resolves the leaf table pointer per 2 MiB.
+- **Segment lookup per run in BoImport** (`FuxiAdrenoUserClient.cpp` `importHost`): one `getPhysicalSegment` per physical run;
+  the pmap cache-class predicate (`fuxi_adreno_host_page_ok`) still runs for every 16K page. Refusal stage 7 now reports the
+  offset of the failing page.
+- **Ranged TLBI on unmap, boot-arg `fuxigpuncimport` value 128, default off**: up to 512 4K pages are invalidated with one
+  64-bit TLBIVAL each plus TLBSYNC and the same status poll as `g4_tlb`; larger unmaps, and every unmap without the bit, keep
+  the whole-ASID invalidate. A failed write or sync is a fault (`client unmap TLB sync`), never a skip. It needs a 64-bit store
+  to the SMMU context bank (`g3_sw64`, via the existing wide `fg_access`), unverified on this SMMU: hence opt-in. Note
+  `fg_abi_switch` still does a full ASID invalidate on every root switch (submit and retire); UniXNU does none at submit. That
+  needs a separate ASID for the client root and is not done here.
+- **IO-coherent imports, value 64, default off**: at the first `BoMap` of an import the kernel runs a fail-closed self-test.
+  A cacheable kernel page is mapped with the import leaf attributes (Normal NC, outer-shareable), the CPU leaves 8 lines
+  dirty and caches 8 others, and one IB makes the GPU copy the 8 dirty lines to an NC result page (`CP_MEM_TO_MEM`) and
+  overwrite the 8 cached lines (`CP_MEM_WRITE`). Only 16/16 matches set the verdict "coherent"; then submit stops cleaning
+  imports, retirement stops invalidating them and the map-time clean (value 1) is skipped, the avoided bytes count in `skipped`.
+  Stale lines, partial matches, a map failure inside the probe window, a fault or a 100 ms hang leave the existing
+  clean/invalidate path (a hang or fault also poisons the GPU like any client fault). Busy results retry, three times at most.
+  The probe uses 4 KiB of NC scratch after the ABI page tables, the last 64 KiB of the client aperture and a 16 KiB kernel BSS
+  page; it unmaps them and cleans the page afterwards. Scope of the proof: the kernel page and the import pages share the CPU
+  attribute class and the leaf bits; a PASS on a few lines at boot cannot prove every later line, which is why it is opt-in.
+  Expected device evidence: `FUXI GPU ABI: coherent-import self-test pass cpu_to_gpu 8/8 gpu_to_cpu 8/8 -> skip ...` or
+  `stale ...` (the expected result on a non-snooping path), then `cleaned`/`skipped` deltas in the presents line.
+- `fuxigpuncimport` is a bitmask now: 1 NC-import (unchanged), 64 coherency self-test, 128 ranged TLBI. Values 2..32 are
+  deliberately unused so concurrent lanes can claim them; other values of those bits were not meaningful before.
+- Tests: `tools/test-fuxi-metal.py` (overlap mirror, TLBIVAL values/limit/fallback/fault, self-test pass/stale/partial/hang/
+  fault/busy/occupied, bitmask parse), `tools/test-fuxi-hostimport.py` (segment lookups, per-page predicate in a long run).
+- New log field: the self-test line above. Owned BO maps still need one pmap lookup per 16K page (scattered BOs); a contiguous
+  BO could skip it but the backend does not know contiguity, not changed.
