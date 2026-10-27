@@ -43,7 +43,7 @@
      __unused int32_t *retval)
  {
 +#if defined(FUXI)
-+	uint64_t frt_start __attribute__((cleanup(fuxi_regtrace_work_end)))=fuxi_regtrace_begin();
++	uint64_t frt_start __unused __attribute__((cleanup(fuxi_regtrace_work_end)))=fuxi_regtrace_begin();
 +#endif
  	uint32_t        operation = uap->operation;
  	int             error = 0;

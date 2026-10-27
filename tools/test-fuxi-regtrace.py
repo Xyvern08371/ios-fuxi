@@ -114,7 +114,7 @@ extern "C" void fuxi_regtrace_end(struct frt_token *t,const char *c,const char *
 extern "C" void fuxi_regtrace_work_end(uint64_t *t){if(*t)work_finished++;}
 #include "fuxi_regtrace_iokit.h"
 static int call(unsigned path){IORegistryEntry entry;FRT_SCOPE(&entry,"key","IOService",0,32);if(path==0)return -1;FRT_PHASE(1);if(path==1)return -2;FRT_SIZE(8);return 0;}
-static int work(unsigned path){uint64_t start __attribute__((cleanup(fuxi_regtrace_work_end)))=fuxi_regtrace_begin();if(path==0)return -1;return 0;}
+static int work(unsigned path){uint64_t start __attribute__((unused,cleanup(fuxi_regtrace_work_end)))=fuxi_regtrace_begin();if(path==0)return -1;return 0;}
 int main(){for(enabled=0;enabled<2;enabled++)for(unsigned i=0;i<3;i++){call(i);work(i);}assert(finished==3 && phases==2 && work_finished==3);}
 '''
 
