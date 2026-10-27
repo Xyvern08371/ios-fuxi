@@ -1359,7 +1359,7 @@
 +#endif
 --- a/bsd/dev/fuxi_gpu_scanout.inc
 +++ b/bsd/dev/fuxi_gpu_scanout.inc
-@@ -0,0 +1,1095 @@
+@@ -0,0 +1,1135 @@
 +/* SPDX-License-Identifier: MIT
 + * Copyright (c) 2026 NativeMetal contributors
 + * Ported from UniXNU drivers/NativeMetal/GpuScanoutClient.h (MIT).
@@ -1534,7 +1534,7 @@
 +#define FG_SCAN_SPIN_CATCH_US 600u
 +enum {FG_SPIN_WAKES, FG_SPIN_PUBLISHED, FG_SPIN_NO_BACK, FG_SPIN_RACED, FG_SPIN_EXPIRED, FG_SPIN_HIT, FG_SPIN_LATE, FG_SPIN_NO_ACTIVE,
 +      FG_SPIN_SYNCS, FG_SPIN_SYNC_FAIL, FG_SPIN_CATCH_FAIL, FG_SPIN_SKIPPED, FG_SPIN_NEAR_EDGE, FG_SPIN_ARRIVAL, FG_SPIN_MISSED, FG_SPIN_PHASE_REJECT, FG_SPIN_DIRECT, FG_SPIN_OFFERED,
-+      FG_SPIN_ARR_BUSY, FG_SPIN_ARR_STALE, FG_SPIN_ARR_PAST, FG_SPIN_N};
++      FG_SPIN_ARR_BUSY, FG_SPIN_ARR_STALE, FG_SPIN_ARR_PAST, FG_SPIN_COPY_OPEN, FG_SPIN_UNSTOLEN, FG_SPIN_STALL, FG_SPIN_REFUSED, FG_SPIN_N};
 +static thread_call_data_t fg_scanout_spin_call;
 +static unsigned fg_scanout_spin_setup, fg_scanout_spin_busy, fg_scanout_spin_serial, fg_scanout_async_published, fg_scanout_spin_sync, fg_scanout_spin_c0;
 +static unsigned fg_scanout_last_count, fg_scanout_ph_ok, fg_scanout_ph_c, fg_scanout_ph_done_us, fg_scanout_ph_late_us;
@@ -1542,6 +1542,10 @@
 +static unsigned fg_scanout_spin_stat[FG_SPIN_N]; /* FG_SPIN_* */
 +static uint64_t fg_scanout_spin_err_sum, fg_scanout_spin_err_max, fg_scanout_spin_late_sum, fg_scanout_spin_late_max;
 +static unsigned fg_scanout_spin_err_n, fg_scanout_spin_late_n, fg_scanout_spin_replanned, fg_scanout_spin_rejects, fg_scanout_spin_mw[4], fg_scanout_spin_mm[4];
++/* The display path owns the writable token from its acquire() until the copy is offered through fuxi_gpu_scanout_publish() (or the next
++ * retry): a START by the spin thread in that window consumed the token, the offer then returned -1 and the framebuffer held scanout
++ * for good (Y178: START count froze near 600). copy_open marks the window; stolen lets a stolen token be restored. */
++static unsigned fg_scanout_copy_open, fg_scanout_spin_stolen, fg_scanout_stall_prints;
 +static uint64_t fg_scanout_spin_m; /* START-write to predicted-edge margin of the armed wake (ticks) */
 +#define FG_PROBE_MAX 128
 +static thread_call_data_t fg_scanout_probe_call;
@@ -1675,7 +1679,8 @@
 +    idle_t = now;
 +    FG_GUARD;
 +    if (fg_scanout_starts != serial || fg_scanout_failed || !fg_scanout_back_ready || fg_busy) result = fg_scanout_back_ready ? FG_SPIN_RACED : FG_SPIN_NO_BACK;
-+    else if (fg_scanout_publish() == 1) { fg_scanout_async_published = 1; published = 1; result = FG_SPIN_PUBLISHED; }
++    else if (fg_scanout_copy_open) result = FG_SPIN_COPY_OPEN;
++    else if (fg_scanout_publish() == 1) { fg_scanout_async_published = 1; fg_scanout_spin_stolen = 1; published = 1; result = FG_SPIN_PUBLISHED; }
 +    else result = FG_SPIN_RACED;
 +    break;
 +   }
@@ -2227,7 +2232,9 @@
 +  fg_scanout_double_active = 1; fg_scanout_front = fg_scanout_back_ready = 0;
 +  if (++fg_scanout_reentries <= 4) printf("FUXI SCANOUT: double re-entered after CPU frame (%u)\n", fg_scanout_reentries);
 + }
-+ return fg_scanout_acquire(0);
++ int writable = fg_scanout_acquire(0);
++ if (writable == 1 && fg_scanout_double_active) fg_scanout_copy_open = 1;
++ return writable;
 +}
 +int fuxi_gpu_scanout_double(void)
 +{
@@ -2333,8 +2340,9 @@
 +       (unsigned long long)(fg_scanout_spin_late_n ? fg_scanout_spin_late_sum*1000000/hz/fg_scanout_spin_late_n : 0),
 +       (unsigned long long)(fg_scanout_spin_late_max*1000000/hz),
 +       st[FG_SPIN_SKIPPED], st[FG_SPIN_NEAR_EDGE], st[FG_SPIN_ARRIVAL], fg_scanout_spin_lead_us());
-+   printf("FUXI SCANOUT: te_arm offered=%u direct=%u armed_on_arrival=%u arr_busy=%u arr_stale=%u arr_past=%u near_edge=%u skipped=%u missed=%u phase_reject=%u"
++   printf("FUXI SCANOUT: te_arm copy_open=%u unstolen=%u stalls=%u refused=%u offered=%u direct=%u armed_on_arrival=%u arr_busy=%u arr_stale=%u arr_past=%u near_edge=%u skipped=%u missed=%u phase_reject=%u"
 +       " margin_us<500/1000/2000/more wakes=%u/%u/%u/%u missed=%u/%u/%u/%u\n",
++       st[FG_SPIN_COPY_OPEN], st[FG_SPIN_UNSTOLEN], st[FG_SPIN_STALL], st[FG_SPIN_REFUSED],
 +       st[FG_SPIN_OFFERED], st[FG_SPIN_DIRECT], st[FG_SPIN_ARRIVAL], st[FG_SPIN_ARR_BUSY], st[FG_SPIN_ARR_STALE], st[FG_SPIN_ARR_PAST],
 +       st[FG_SPIN_NEAR_EDGE], st[FG_SPIN_SKIPPED], st[FG_SPIN_MISSED], st[FG_SPIN_PHASE_REJECT],
 +       fg_scanout_spin_mw[0], fg_scanout_spin_mw[1], fg_scanout_spin_mw[2], fg_scanout_spin_mw[3],
@@ -2383,11 +2391,30 @@
 + fg_scanout_spin_kick(1);
 + return 1;
 +}
++/* A token the spin thread consumed while no copy was open is restored for the caller that still holds a finished copy. */
++static void fg_scanout_unsteal(void)
++{
++ if (!fg_scanout_writable && fg_scanout_spin_stolen && !fg_scanout_failed && !fg_busy) {
++  fg_scanout_writable = 1; fg_scanout_spin_stat[FG_SPIN_UNSTOLEN]++;
++ }
++ fg_scanout_spin_stolen = 0;
++}
++static void fg_scanout_refused(const char *where)
++{
++ fg_scanout_spin_stat[FG_SPIN_REFUSED]++;
++ if (fg_scanout_stall_prints < 8) {
++  fg_scanout_stall_prints++;
++  printf("FUXI SCANOUT: %s refused failed=%u busy=%u writable=%u copy_open=%u stolen=%u spin_busy=%u back_ready=%u starts=%u\n", where,
++      fg_scanout_failed, fg_busy, fg_scanout_writable, fg_scanout_copy_open, fg_scanout_spin_stolen, fg_scanout_spin_busy, fg_scanout_back_ready, fg_scanout_starts);
++ }
++}
 +int fuxi_gpu_scanout_publish(void)
 +{
 + if (!fuxi_gpu_scanout_owned()) return 0;
 + FG_GUARD;
-+ if (fg_scanout_failed || fg_busy || !fg_scanout_writable) return -1;
++ fg_scanout_copy_open = 0;
++ fg_scanout_unsteal();
++ if (fg_scanout_failed || fg_busy || !fg_scanout_writable) { fg_scanout_refused("publish"); return -1; }
 + if (fg_scanout_double_active) {
 +  if (fg_scanout_back_ready && fg_scanout_triple_requested) fg_scanout_ready_drops++;
 +  fg_scanout_ready = fg_scanout_triple_requested ? fg_scanout_copy : fg_scanout_front ^ 1u;
@@ -2404,9 +2431,22 @@
 +{
 + FG_GUARD;
 + if (fg_scanout_failed) return -1;
++ fg_scanout_copy_open = 0; /* retry runs only with no copy in flight */
 + if (fg_scanout_async_published) { fg_scanout_async_published = 0; return 1; } /* the spin thread already STARTed the waiting buffer */
 + if (!fg_scanout_back_ready || fg_busy) return 0;
-+ return fg_scanout_publish();
++ /* Watchdog: a frame waiting more than 4 periods is visible in the log (first 8, then every 256th). */
++ uint64_t now = rsr("cntpct_el0"), hz = rsr("cntfrq_el0");
++ if (fg_scanout_ready_at && now - fg_scanout_ready_at > 4*hz*fg_scanout_period_us/1000000) {
++  unsigned n = ++fg_scanout_spin_stat[FG_SPIN_STALL];
++  if (n <= 8 || !(n & 255))
++   printf("FUXI SCANOUT: stall frame waiting %llu us writable=%u spin_busy=%u stolen=%u copy_open=%u starts=%u start_age_us=%llu\n",
++       (unsigned long long)((now - fg_scanout_ready_at)*1000000/hz), fg_scanout_writable, fg_scanout_spin_busy, fg_scanout_spin_stolen,
++       fg_scanout_copy_open, fg_scanout_starts, (unsigned long long)((now - fg_scanout_last_start)*1000000/hz));
++ }
++ fg_scanout_unsteal();
++ int r = fg_scanout_publish();
++ if (r < 0) fg_scanout_refused("retry");
++ return r;
 +}
 +/* Reserve the idle ring across the surface-cache transaction. Client submit
 + * returns busy until release; map/TLBI/copy cannot race a client TTBR switch.

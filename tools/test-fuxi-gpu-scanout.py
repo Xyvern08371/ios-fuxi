@@ -502,6 +502,25 @@ static void triple_tests(uint8_t *panel) {
    if(i<3)assert(st[FG_SPIN_PHASE_REJECT]==i+1 && fg_scanout_ph_t==before && fg_scanout_spin_rejects==i+1);
    else assert(st[FG_SPIN_PHASE_REJECT]==3 && fg_scanout_ph_t!=before && !fg_scanout_spin_rejects);
   }
+  // Y178 stall: the spin thread must not START while the display path holds the writable token for a copy (acquire ... offer); a stolen token is restored.
+  fg_scanout_spin_busy=0;spinKicks=0;fg_scanout_back_ready=0;ctl[0x1c/4]=0;intf[0x2b0/4]=2400;ticks+=20000;
+  assert(fuxi_gpu_scanout_acquire()==1);ctl[0x1c/4]=1;intf[0x2b0/4]=100;assert(fuxi_gpu_scanout_publish()==2 && fg_scanout_back_ready && !fg_scanout_copy_open);
+  ctl[0x1c/4]=0;intf[0x2b0/4]=2400;ticks+=20000;assert(fuxi_gpu_scanout_acquire()==1 && fg_scanout_copy_open);
+  fg_scanout_spin_busy=0;spinKicks=0;E=ticks+1000;s0=starts;st[FG_SPIN_COPY_OPEN]=0;
+  phase_run(E,40,0,7550);
+  assert(starts==s0 && fg_scanout_back_ready && st[FG_SPIN_COPY_OPEN]==1 && !fg_scanout_async_published && fg_scanout_writable);
+  {
+   unsigned r0=st[FG_SPIN_REFUSED],u0=st[FG_SPIN_UNSTOLEN];
+   // The token was consumed anyway (stolen): the offer restores it instead of returning -1 (which would hold scanout for good).
+   fg_scanout_writable=0;fg_scanout_spin_stolen=1;ctl[0x1c/4]=1;intf[0x2b0/4]=100;
+   assert(fuxi_gpu_scanout_publish()==2 && st[FG_SPIN_UNSTOLEN]==u0+1 && st[FG_SPIN_REFUSED]==r0 && fg_scanout_writable && !fg_scanout_spin_stolen && !fg_scanout_copy_open);
+   // A token lost for any other reason is still refused, and the refusal is logged.
+   fg_scanout_writable=0;assert(fuxi_gpu_scanout_publish()==-1 && st[FG_SPIN_REFUSED]==r0+1);
+   fg_scanout_writable=1;
+  }
+  // Watchdog: a frame waiting more than 4 periods is counted and logged by the display retry; retry still tries to START it.
+  fg_scanout_back_ready=1;fg_scanout_ready_at=ticks-100000;st[FG_SPIN_STALL]=0;fg_scanout_async_published=0;ctl[0x1c/4]=1;intf[0x2b0/4]=100;
+  assert(fuxi_gpu_scanout_retry()==2 && st[FG_SPIN_STALL]==1);
   // Arrival arming: a good model arms only when a frame is waiting; a START too close to the edge is not trusted; a finished transfer is not armed.
   fg_scanout_spin_busy=0;spinKicks=0;st[FG_SPIN_SKIPPED]=st[FG_SPIN_ARRIVAL]=st[FG_SPIN_NEAR_EDGE]=0;
   fg_scanout_ph_ok=1;fg_scanout_ph_p=8333;fg_scanout_ph_t=ticks-1000;fg_scanout_last_start=ticks-500;fg_scanout_back_ready=0;
