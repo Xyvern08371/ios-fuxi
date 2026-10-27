@@ -110,6 +110,7 @@ public:
  uint64_t refresh(void *destination,const void *source,const ShadowRanges &ranges) const {
   uint64_t copied=0;ranges.each([&](auto r){pieces(destination,r.offset,r.size,[&](uint64_t offset,uint64_t bytes,const ShadowSegment *hit){const void *from=hit?storage.data.get()+hit->packed+offset-hit->offset:(const uint8_t *)source+offset;memcpy((uint8_t *)destination+offset,from,bytes);copied+=bytes;});});return copied;
  }
+ template<class F> void eachWrite(F &&f) const {for(auto &r:segments)f(r.destination,r.offset,r.size);}
  size_t apply(ShadowPool &pool){for(auto r:segments)memcpy((uint8_t *)r.destination+r.offset,storage.data.get()+r.packed,r.size);size_t copied=size;release(pool);return copied;}
  void release(ShadowPool &pool){pool.put(std::move(storage));segments.clear();size=captured=0;}
 };

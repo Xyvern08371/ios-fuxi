@@ -78,6 +78,8 @@ inline void importCheck(VkResult r,int line=__builtin_LINE()) {
  X(CreatePipelineCache) X(DestroyPipelineCache) X(GetPipelineCacheData) \
  X(CmdBindVertexBuffers) X(CmdBindIndexBuffer) X(CmdDrawIndexed) X(CmdSetViewport) X(CmdSetScissor) X(CmdPushConstants) X(CmdBeginRenderPass) X(CmdEndRenderPass) X(CmdBindPipeline) X(CmdDraw) X(CmdCopyImageToBuffer) X(CmdPipelineBarrier) X(CreateFence) X(DestroyFence) X(QueueSubmit) X(WaitForFences)
 struct Buffer { VkBuffer buffer{}; VkDeviceMemory memory{}; void *contents{}; size_t length{}, allocated{},charged{},memoryBytes{},references=1;uint32_t memoryType{};bool imported=false,upload=false; };
+// Host ranges a submit's prepare callback will write; absent means unknown (full drain).
+struct PrepareWrite {Buffer *buffer;uint64_t offset,bytes;};
 struct Texture : TextureLevels {VkImage image{};VkDeviceMemory memory{};VkImageView view{};size_t allocated{},charged{},memoryBytes{},references=1;
  uint32_t memoryType{};VkImageUsageFlags usage{};uint32_t format=80;VkFormat vkFormat=VK_FORMAT_B8G8R8A8_UNORM;
  // layout is level zero; levelLayouts[1..levels) track the remaining mips.
@@ -184,7 +186,7 @@ class Backend {
  struct SubmitSlot {
   VkCommandPool commandPool{};VkCommandBuffer command{};VkFence submitFence{};VkQueryPool queryPool{};
   Buffer *aliasScratch=nullptr;VkDescriptorPool descriptorPool{};uint32_t descriptorSets{};
-  std::vector<VkDescriptorPoolSize> descriptorCapacity;std::vector<HostUse> hostUses,writes;bool busy=false;
+  std::vector<VkDescriptorPoolSize> descriptorCapacity;std::vector<HostUse> hostUses,writes,uses;bool busy=false;
  } slots[2];
  std::condition_variable submitWake;
  static constexpr size_t aliasScratchLimit=1024*1024;
@@ -888,32 +890,36 @@ public:
  }
  // The caller must invoke retirement exactly once, before Backend destruction.
  // Slots pin every referenced object, including resources released by the client.
- void submit(std::vector<Operation> ops,const std::function<void()> &scheduled={},std::function<void()> *retirement=nullptr,const std::function<void()> &prepare={}) {
+ void submit(std::vector<Operation> ops,const std::function<void()> &scheduled={},std::function<void()> *retirement=nullptr,const std::function<void()> &prepare={},const std::vector<PrepareWrite> *prepareWrites=nullptr) {
   auto submitStart=std::chrono::steady_clock::now();auto submitQueued=submitStart;
   auto since=[](std::chrono::steady_clock::time_point t){return (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-t).count();};
   auto *timing=systemTranslationPolicy().frameTrace?currentFrame:nullptr;
   std::unique_lock<std::mutex> guard(mutex);
   if(currentFrame)currentFrame->backendLock+=since(submitStart);
-  requireLive();std::vector<HostUse> hostUses,writes;
+  requireLive();std::vector<HostUse> hostUses,writes,uses;
   auto addUse=[](std::vector<HostUse> &list,VkDeviceMemory memory,const void *address,size_t bytes){if(std::none_of(list.begin(),list.end(),[&](auto old){return old.memory==memory && old.address==address && old.bytes==bytes;}))list.push_back({memory,address,bytes});};
   auto bufferUse=[&](std::vector<HostUse> &list,Buffer *b){if(b)addUse(list,b->memory,b->contents,b->length);};
   auto textureUse=[&](std::vector<HostUse> &list,Texture *t){if(t){addUse(list,t->memory,t->mapped,t->allocated);bufferUse(list,t->backingBuffer);}};
-  if(retirement || systemTranslationPolicy().overlap){
-   auto buffer=[&](Buffer *b){if(b && !coherent(b->memoryType))bufferUse(hostUses,b);};
-   auto texture=[&](Texture *t){if(t){if(t->mapped && !coherent(t->memoryType))addUse(hostUses,t->memory,t->mapped,t->allocated);buffer(t->backingBuffer);}};
+  if(retirement || prepare || systemTranslationPolicy().overlap){ // uses: every host-mapped allocation, coherent too, for prepare conflicts
+   auto buffer=[&](Buffer *b){if(b){bufferUse(uses,b);if(!coherent(b->memoryType))bufferUse(hostUses,b);}};
+   auto texture=[&](Texture *t){if(t){if(t->mapped){addUse(uses,t->memory,t->mapped,t->allocated);if(!coherent(t->memoryType))addUse(hostUses,t->memory,t->mapped,t->allocated);}buffer(t->backingBuffer);}};
    for(const auto &op:ops){buffer(op.src);buffer(op.dst);buffer(op.indices);texture(op.texture);texture(op.sourceTexture);for(auto *t:op.samples)texture(t);for(unsigned i=0;i<std::min(op.colorCount,8u);++i)texture(op.color(i).texture);for(auto &stage:op.buffers)for(auto binding:stage)buffer(binding.buffer);if(op.pipeline)for(auto *blob:op.pipeline->constantBlobs)buffer(blob);}
   }
   auto aliases=[](HostUse a,HostUse b){return (a.memory && a.memory==b.memory) || hostRangesOverlap(a.address,a.bytes,b.address,b.bytes);};
   auto conflicts=[&]{for(auto &pending:slots)if(pending.busy)for(auto old:pending.hostUses)for(auto use:hostUses)if(aliases(old,use))return true;return false;};
+  // A declared prepare waits only for flights using the memory it writes; undeclared drains.
+  std::vector<HostUse> prepared;const bool declared=prepare && prepareWrites;
+  if(declared)for(auto w:*prepareWrites)if(w.buffer && w.bytes)prepared.push_back({w.buffer->memory,(const uint8_t *)w.buffer->contents+w.offset,w.bytes});
+  auto prepareConflicts=[&]{for(auto &pending:slots)if(pending.busy)for(auto old:pending.uses)for(auto write:prepared)if(aliases(old,write))return true;return false;};
   auto indexHazard=[&](bool uploadOnly=false){for(auto &op:ops)if(op.indices && (!uploadOnly || op.indices->upload))for(auto &pending:slots)if(pending.busy)for(auto old:pending.writes)if(aliases(old,{op.indices->memory,op.indices->contents,op.indices->length}))return true;return false;};
   // Coherent index reads need only exclude real GPU writers. Noncoherent cache
-  // maintenance still excludes every shared allocation; opaque prepare drains.
-  bool sawDrain=false,sawIndex=false,sawUpload=false,sawPrepare=false,sawDrainWait=false,sawConflict=false,sawSlots=false,otherIndices=false;
+  // maintenance still excludes every shared allocation; undeclared prepare drains.
+  bool sawDrain=false,sawIndex=false,sawUpload=false,sawPrepare=false,sawUnknown=false,sawPrepConflict=false,sawDrainWait=false,sawConflict=false,sawSlots=false,otherIndices=false;
   if(currentFrame){bool upload=false;for(auto &op:ops)if(op.indices)(op.indices->upload?upload:otherIndices)=true;currentFrame->indexUploadSubmits+=upload;}
   auto slotStart=FrameClock::now();
-  submitWake.wait(guard,[&]{if(poisoned)return true;bool index=indexHazard(),drain=bool(prepare) || index,busy=slots[0].busy || slots[1].busy,conflict=conflicts(),full=slots[0].busy && (!retirement || slots[1].busy);
+  submitWake.wait(guard,[&]{if(poisoned)return true;bool index=indexHazard(),unknown=prepare && !declared,prepConflict=declared && prepareConflicts(),drain=unknown || index,busy=slots[0].busy || slots[1].busy,conflict=conflicts() || prepConflict,full=slots[0].busy && (!retirement || slots[1].busy);
    if(currentFrame){auto once=[](bool value,bool &seen,uint64_t &count){if(value && !seen){++count;seen=true;}};
-    once(drain,sawDrain,currentFrame->drainSubmits);once(index,sawIndex,currentFrame->indexGPUWritableDrains);once(indexHazard(true),sawUpload,currentFrame->indexUploadDrains);once(bool(prepare),sawPrepare,currentFrame->prepareDrains);
+    once(drain,sawDrain,currentFrame->drainSubmits);once(index,sawIndex,currentFrame->indexGPUWritableDrains);once(indexHazard(true),sawUpload,currentFrame->indexUploadDrains);once(bool(prepare),sawPrepare,currentFrame->prepareDrains);once(unknown,sawUnknown,currentFrame->prepareUnknownDrains);once(prepConflict,sawPrepConflict,currentFrame->prepareConflictWaits);
     once(drain && busy,sawDrainWait,currentFrame->drainWaits);once(conflict,sawConflict,currentFrame->conflictWaits);once(full,sawSlots,currentFrame->slotWaits);}
    return !full && (!drain || !busy) && !conflict;
   });
@@ -1566,7 +1572,7 @@ public:
     if(currentFrame)currentFrame->gpuWait+=frameNanos(waitStart);
     auto lockStart=FrameClock::now();std::lock_guard<std::mutex> lock(mutex);
     if(currentFrame)currentFrame->retireLock+=frameNanos(lockStart);
-    auto releaseSlot=[&]{slot.hostUses.clear();slot.writes.clear();slot.busy=false;submitWake.notify_all();};
+    auto releaseSlot=[&]{slot.hostUses.clear();slot.writes.clear();slot.uses.clear();slot.busy=false;submitWake.notify_all();};
     try {
      if(result!=VK_SUCCESS){poisoned=true;check(result);}
      // Another in-flight failure also prohibits host invalidation and teardown.
@@ -1591,7 +1597,7 @@ public:
     }catch(...){poisoned=true;releaseSlot();throw;} // Quarantine all pinned GPU objects on uncertain ownership.
    };
    for(auto *b:pinnedBuffers)++b->references;for(auto *t:pinnedTextures)++t->references;for(auto *p:pinnedPipelines)++p->references;for(auto *s:pinnedSamplers)++s->references;
-   slot.hostUses=std::move(hostUses);slot.writes=std::move(writes);slot.busy=true;
+   slot.hostUses=std::move(hostUses);slot.uses=std::move(uses);slot.writes=std::move(writes);slot.busy=true;
    submitToQueue();if(scheduled)scheduled();
    submitted=false;completed=true;
    *retirement=std::move(finish);

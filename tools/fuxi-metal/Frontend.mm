@@ -1435,16 +1435,19 @@ static NSString *renderPassText(MTLRenderPassDescriptor *d){
    uint64_t bytes=_overlap?_shadows.apply(_queue->_shadowPool):refreshCommandShadows(self);if(_frameTrace)_flightTrace.shadowCopyBytes+=bytes;
    auto ns=fuxi::frameNanos(start);fuxi::Backend::shadowCopyNanos+=ns;if(_frameTrace)_flightTrace.shadowCopy+=ns;
   };
-  std::function<void()> prepare;if(_overlap){if(_shadows.bytes())prepare=refresh;}else refresh();
+  std::function<void()> prepare;std::vector<fuxi::PrepareWrite> prepareWrites;const std::vector<fuxi::PrepareWrite> *declared=nullptr;
+  if(_overlap){if(_shadows.bytes()){prepare=refresh;bool known=true; // the apply() destinations, resolved to backend buffers; unresolved means undeclared (full drain)
+   _shadows.eachWrite([&](void *destination,uint64_t offset,uint64_t bytes){fuxi::Buffer *target=nullptr;for(auto &entry:_shadowUses)if(entry.first->contents==destination){target=entry.first;break;}if(target)prepareWrites.push_back({target,offset,bytes});else known=false;});
+   if(known)declared=&prepareWrites;}}else refresh();
   size_t begin=0;
   auto scheduled=[&]{@synchronized(self){_scheduled=YES;if(_status<MTLCommandBufferStatusScheduled)_status=MTLCommandBufferStatusScheduled;}};
   for(const auto &point:_events){
-   if(point.operation>begin){backend->submit(std::vector<fuxi::Operation>(_ops.begin()+begin,_ops.begin()+point.operation),scheduled,nullptr,prepare);prepare={};begin=point.operation;}
+   if(point.operation>begin){backend->submit(std::vector<fuxi::Operation>(_ops.begin()+begin,_ops.begin()+point.operation),scheduled,nullptr,prepare,declared);prepare={};declared=nullptr;begin=point.operation;}
    if(point.signal)[point.event setSignaledValue:point.value];else if(![point.event waitUntilSignaledValue:point.value timeoutMS:2000])throw std::runtime_error("process-local event wait timed out");
   }
-  if(_events.empty())backend->submit(_ops,scheduled,_overlap?&_retirement:nullptr,prepare);
-  else if(begin<_ops.size())backend->submit(std::vector<fuxi::Operation>(_ops.begin()+begin,_ops.end()),scheduled,_overlap?&_retirement:nullptr,prepare);
-  else {if(prepare)backend->submit({},scheduled,nullptr,prepare);else scheduled();}
+  if(_events.empty())backend->submit(_ops,scheduled,_overlap?&_retirement:nullptr,prepare,declared);
+  else if(begin<_ops.size())backend->submit(std::vector<fuxi::Operation>(_ops.begin()+begin,_ops.end()),scheduled,_overlap?&_retirement:nullptr,prepare,declared);
+  else {if(prepare)backend->submit({},scheduled,nullptr,prepare,declared);else scheduled();}
   if(backboard){std::lock_guard<std::mutex> lock(backend->mutex);
    for(id r in _resources){if(![r isKindOfClass:[FuxiTexture class]] || ![(FuxiTexture *)r iosurface])continue;auto *texture=((FuxiTexture *)r)->_texture;if(!texture)continue;
     for(const auto &op:_ops)if(op.pipeline || op.clearOnly)for(unsigned i=0;i<op.colorCount;++i){auto c=op.color(i);if(c.texture==texture && c.store && texture->isDefined(c.level))_surfaceFrame=true;}}

@@ -2529,6 +2529,13 @@ The existing aggregate frame-trace line adds:
 - `drain_reasons=indices-upload,indices-gpu-writable,prepare`: counts of calls
   encountering each reason. Upload is a subset of GPU-writable and normally
   zero; reasons may overlap. Upload bytes alone never cause a drain.
+- `drain_reasons` now ends `prepare:N,prepare-conflict:C,prepare-unknown:U`.
+  `prepare` still counts calls carrying a prepare callback. The overlap shadow
+  refresh declares its destinations (`PrepareWrite`: buffer, offset, bytes) and
+  waits only (`prepare-conflict`, also in `wait_reasons` conflict) for busy
+  flights whose all-memory `uses` (coherent included) alias them; it no longer
+  drains. Only an undeclared callback (`prepare-unknown`) still drains. Not yet
+  observed on device.
 - `index_submits=upload,readonly,gpu_writable`: calls containing upload indices,
   ordinary indices without an observed pending writer, or a pending GPU index
   writer. Mixed calls can occupy multiple categories.

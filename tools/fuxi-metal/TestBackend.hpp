@@ -21,6 +21,7 @@
 #include "BackboardGate.hpp"
 namespace fuxi {
 struct Buffer {void *contents;size_t length,allocated;bool upload=false;};
+struct PrepareWrite {Buffer *buffer;uint64_t offset,bytes;};
 struct Texture : TextureLevels {size_t allocated{},charged{};uint32_t format=80;Buffer *backingBuffer{};size_t backingOffset{},backingRow{};bool shadow=false;std::vector<uint8_t> pixels{};
  size_t offset(uint32_t level) const {size_t o=0;for(uint32_t l=0;l<level;++l)o+=levelWidth(l)*levelHeight(l)*metalTexelBytes(format);return o;}
 };
@@ -103,7 +104,7 @@ public:
  bool destroy(Texture *t) {if(t){limits.release(t->charged);delete t;}return !poisoned;}
  void destroy(Pipeline *p) {if(p && !--p->references)delete p;}
  bool requiresSampling(const Pipeline *p) const {return p->sampled;}
- void submit(const std::vector<Operation>& ops,const std::function<void()> &scheduled={},std::function<void()> *retirement=nullptr,const std::function<void()> &prepare={}) {
+ void submit(const std::vector<Operation>& ops,const std::function<void()> &scheduled={},std::function<void()> *retirement=nullptr,const std::function<void()> &prepare={},const std::vector<PrepareWrite> * =nullptr) {
   if(retirement && beforeSubmit)beforeSubmit();
   if(prepare)prepare();
   if(retirement){auto copy=ops;submit(copy,scheduled);*retirement=[this]{requireLive();};return;}
