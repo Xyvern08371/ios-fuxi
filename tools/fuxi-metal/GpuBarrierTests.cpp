@@ -21,9 +21,9 @@ int main(){
  };
  auto pixels=[&](const char *label,Texture *t){Operation get{};get.texture=t;get.dst=read;b.submit({get});printf("PIXELS %s ",label);for(unsigned i=0;i<1024;++i)printf("%02x",((uint8_t *)read->contents)[i]);puts("");};
  auto multi=draw;for(unsigned i=0;i<4;++i){multi.samples[i]=layers[i];multi.sampleCount[i]=1;}
- auto s=run("batch",{multi},1);assert(s.imageBarriers==5);pixels("batch",target);
+ auto s=run("batch",{multi},1);assert(s.imageBarriers==(perf?1u:5u));pixels("batch",target);
  auto *mips=b.allocateTexture(80,5,16,16,3);for(unsigned l=0;l<3;++l)put(mips,71+l*31,l);auto mipDraw=draw;mipDraw.samples[0]=mips;mipDraw.sampleCount[0]=3;
- s=run("mip-batch",{mipDraw},1);assert(s.imageBarriers==(perf?3u:4u));pixels("mip-batch",target);b.destroy(mips);
+ s=run("mip-batch",{mipDraw},1);assert(s.imageBarriers==(perf?0u:4u));pixels("mip-batch",target);b.destroy(mips);
  std::vector<Operation> ops;for(unsigned i=0;i<12;++i){auto d=draw;d.encoderID=i+1;d.load=i?1:2;d.areaWidth=i%2?8:16;d.areaHeight=d.areaWidth;d.scissor.extent={d.areaWidth,d.areaHeight};d.samples[0]=layers[i%4];ops.push_back(d);}
  Operation copy{};copy.sourceTexture=target;copy.texture=backdrop;ops.push_back(copy);
  auto sampled=draw;sampled.texture=blur;sampled.samples[0]=backdrop;sampled.encoderID=20;ops.push_back(sampled);
@@ -42,6 +42,17 @@ int main(){
  // A producer copy and a sample upload remain between their consumers.
  put(target,173);small=draw;small.load=1;copy.texture=layers[1];auto consumer=small;consumer.samples[0]=layers[1];run("producer-copy",{small,copy,consumer},2);pixels("producer-copy",target);
  Operation upload{};upload.src=bytes;upload.texture=layers[1];upload.upload=true;run("sample-upload",{small,upload,consumer},2);pixels("sample-upload",target);
+ // Linear-texture shadows: one sample of an unchanged backing per submit under bit 4; a GPU write to the backing forces a fresh copy.
+ {auto *sb=b.allocate(4096);auto *sh=b.linearTexture(sb,80,1,16,16,0,64);assert(sh->shadow);memset(sb->contents,77,4096);
+  std::vector<Operation> many(6,draw);for(unsigned i=0;i<many.size();++i){many[i].encoderID=i+1;many[i].load=i?1:2;many[i].samples[0]=sh;}
+  auto copies=counter("render_merge_copies");bool merged=merge && cross;s=run("shadow-dedupe",many,merged?1:6);pixels("shadow-dedupe",target);
+  assert(counter("render_merge_copies")-copies==(merged || perf?1u:6u));assert(s.shadowRefreshSkipped==(perf && !merged?5u:0u));
+  // Bit 4 samples in GENERAL: no SHADER_READ_ONLY transition in either direction, one TRANSFER_DST in and one out for the shadow.
+  if(perf){for(unsigned k=0;k<4;++k)assert(!s.layoutKinds[2*4+k] && !s.layoutKinds[k*4+2]);assert(s.layoutKinds[1*4+3]+s.layoutKinds[0*4+3]==1 && s.layoutKinds[3*4+1]==1);}
+  Operation fill{};fill.dst=sb;fill.size=4096;fill.value=199;auto lo=many[0];lo.load=1;copies=counter("render_merge_copies");
+  s=run("shadow-fill",{many[0],fill,lo},2);pixels("shadow-fill",target);assert(counter("render_merge_copies")-copies==2 && s.shadowRefreshSkipped==0);
+  s=run("shadow-transitions",{lo,lo},merge?1:2);if(perf)assert(s.imageBarriers<=2);
+  b.destroy(sh);b.destroy(sb);}
  // Recording failure restores the layouts and defined bits despite queued batches.
  auto layout=target->layout,sourceLayout=layers[0]->layout;auto defined=target->definedLevels;b.failBeforeQueue=true;bool failed=false;
  try{b.submit({draw,consumer});}catch(...){failed=true;}assert(failed && !b.poisoned && target->layout==layout && layers[0]->layout==sourceLayout && target->definedLevels==defined);

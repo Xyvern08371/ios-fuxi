@@ -797,6 +797,11 @@ public:
   deps[0].srcAccessMask=VK_ACCESS_MEMORY_READ_BIT|VK_ACCESS_MEMORY_WRITE_BIT;deps[0].dstAccessMask=VK_ACCESS_COLOR_ATTACHMENT_READ_BIT|VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
   deps[1].srcSubpass=0;deps[1].dstSubpass=VK_SUBPASS_EXTERNAL;deps[1].srcStageMask=VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
   deps[1].dstStageMask=VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;deps[1].srcAccessMask=VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;deps[1].dstAccessMask=VK_ACCESS_MEMORY_READ_BIT|VK_ACCESS_MEMORY_WRITE_BIT;
+  if(systemTranslationPolicy().perf&4){ // narrow external dependencies to the stages and accesses this backend uses
+   const VkPipelineStageFlags producers=VK_PIPELINE_STAGE_VERTEX_SHADER_BIT|VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT|VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT|VK_PIPELINE_STAGE_TRANSFER_BIT;
+   deps[0].srcStageMask=producers;deps[0].srcAccessMask=VK_ACCESS_SHADER_WRITE_BIT|VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT|VK_ACCESS_TRANSFER_WRITE_BIT;
+   deps[1].dstStageMask=VK_PIPELINE_STAGE_VERTEX_INPUT_BIT|producers;deps[1].dstAccessMask=VK_ACCESS_SHADER_READ_BIT|VK_ACCESS_SHADER_WRITE_BIT|VK_ACCESS_COLOR_ATTACHMENT_READ_BIT|VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT|VK_ACCESS_TRANSFER_READ_BIT|VK_ACCESS_TRANSFER_WRITE_BIT|VK_ACCESS_INPUT_ATTACHMENT_READ_BIT|VK_ACCESS_UNIFORM_READ_BIT|VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT|VK_ACCESS_INDEX_READ_BIT;
+  }
   if(orderedColorAccess){deps[0].dstStageMask|=VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;deps[0].dstAccessMask|=VK_ACCESS_INPUT_ATTACHMENT_READ_BIT;deps[1].srcStageMask|=VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;deps[1].srcAccessMask|=VK_ACCESS_INPUT_ATTACHMENT_READ_BIT;}
   VkRenderPassCreateInfo ri{};ri.sType=VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;ri.attachmentCount=used;ri.pAttachments=attachments;ri.subpassCount=1;ri.pSubpasses=&sub;ri.dependencyCount=2;ri.pDependencies=deps;
   VkRenderPass render{};check(CreateRenderPass(device,&ri,nullptr,&render));
@@ -1313,14 +1318,21 @@ public:
    auto recordStart=std::chrono::steady_clock::now();uint64_t recordObjects=objectNanos;
    VkCommandBufferBeginInfo bi{};bi.sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;bi.flags=VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;check(BeginCommandBuffer(cmd,&bi));
    if(timestamps){CmdResetQueryPool(cmd,timestamps,0,2);CmdWriteTimestamp(cmd,VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,timestamps,0);}
+   auto pb=[&](auto &&...a){if(currentFrame)++currentFrame->pipelineBarriers;CmdPipelineBarrier(cmd,a...);};
    VkMemoryBarrier barrier{};barrier.sType=VK_STRUCTURE_TYPE_MEMORY_BARRIER;barrier.srcAccessMask=VK_ACCESS_HOST_WRITE_BIT;barrier.dstAccessMask=VK_ACCESS_MEMORY_READ_BIT|VK_ACCESS_MEMORY_WRITE_BIT;
-   CmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_HOST_BIT,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,0,1,&barrier,0,nullptr,0,nullptr);
+   pb(VK_PIPELINE_STAGE_HOST_BIT,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,0,1,&barrier,0,nullptr,0,nullptr);
    // Merged runs contain only read-only nonattachment samples, so a mip can
    // request only SHADER_READ_ONLY here, or GENERAL for a shared attachment.
    // Deduplicate these pre-pass barriers; singleton hazards keep every barrier.
    bool hoisting=false;std::unordered_map<VkImage,uint32_t> hoisted;
+   // Image-barrier policy (perf bit 4): only these stages touch images, so layout barriers need not name ALL_COMMANDS.
+   const VkPipelineStageFlags barrierProducers=VK_PIPELINE_STAGE_VERTEX_SHADER_BIT|VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT|VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT|VK_PIPELINE_STAGE_TRANSFER_BIT;
    std::vector<VkImageMemoryBarrier> pendingImages;std::vector<Texture *> pendingTextures;
-   auto flushImages=[&]{if(pendingImages.empty())return;CmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT|VK_PIPELINE_STAGE_HOST_BIT,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,0,0,nullptr,0,nullptr,pendingImages.size(),pendingImages.data());pendingImages.clear();pendingTextures.clear();};
+   auto flushImages=[&]{if(pendingImages.empty())return;VkPipelineStageFlags src=VK_PIPELINE_STAGE_ALL_COMMANDS_BIT|VK_PIPELINE_STAGE_HOST_BIT,dst=VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+    if(boundaryPerf){src=barrierProducers|VK_PIPELINE_STAGE_HOST_BIT;dst=VK_PIPELINE_STAGE_TRANSFER_BIT;for(auto &ib:pendingImages)if(ib.newLayout!=VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL)dst=barrierProducers;}
+    pb(src,dst,0,0,nullptr,0,nullptr,pendingImages.size(),pendingImages.data());pendingImages.clear();pendingTextures.clear();};
+   // Perf bit 4: sampled images stay GENERAL (a sample-only layout buys nothing on linear/sysmem Turnip images and costs a ping-pong transition per use).
+   auto sampleGeneral=[&](size_t opIndex,unsigned slot){return generalSamples[opIndex][slot] || boundaryPerf;};
    auto transition=[&](Texture *t,VkImageLayout next,uint32_t base=0,uint32_t count=0) {
     if(!count)count=t->levels-base;
     for(uint32_t l=base;l<base+count;++l){
@@ -1328,11 +1340,16 @@ public:
      auto &layout=l?t->levelLayouts[l]:t->layout;
      // GENERAL reuse relies on the entry HOST and inter-op memory dependencies.
      // Real layout changes and shadow transfer destinations retain barriers.
-     if(layout==next && (((systemTranslationPolicy().perf&1) && next==VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL) || (boundaryPerf && (next==VK_IMAGE_LAYOUT_GENERAL || next==VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)))){if(currentFrame && next==VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)++currentFrame->readBarriersSkipped;continue;}
+     if(layout==next && (((systemTranslationPolicy().perf&1) && next==VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL) || (boundaryPerf && (next==VK_IMAGE_LAYOUT_GENERAL || next==VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)))){if(currentFrame && (next==VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL || boundaryPerf))++currentFrame->readBarriersSkipped;continue;}
      if(currentFrame)++currentFrame->imageBarriers;
      VkImageMemoryBarrier ib{};ib.sType=VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;ib.oldLayout=layout;ib.newLayout=next;
      ib.srcAccessMask=layout==VK_IMAGE_LAYOUT_UNDEFINED?0:VK_ACCESS_MEMORY_READ_BIT|VK_ACCESS_MEMORY_WRITE_BIT|VK_ACCESS_HOST_WRITE_BIT;
-     ib.dstAccessMask=VK_ACCESS_MEMORY_READ_BIT|VK_ACCESS_MEMORY_WRITE_BIT;ib.srcQueueFamilyIndex=ib.dstQueueFamilyIndex=VK_QUEUE_FAMILY_IGNORED;
+     ib.dstAccessMask=VK_ACCESS_MEMORY_READ_BIT|VK_ACCESS_MEMORY_WRITE_BIT;
+     if(boundaryPerf){ // reads need only the execution dependency; writes become available, and only the accesses that follow are made visible
+      if(layout!=VK_IMAGE_LAYOUT_UNDEFINED)ib.srcAccessMask=VK_ACCESS_SHADER_WRITE_BIT|VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT|VK_ACCESS_TRANSFER_WRITE_BIT|VK_ACCESS_HOST_WRITE_BIT;
+      ib.dstAccessMask=next==VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL?VK_ACCESS_TRANSFER_WRITE_BIT:VK_ACCESS_SHADER_READ_BIT|VK_ACCESS_SHADER_WRITE_BIT|VK_ACCESS_COLOR_ATTACHMENT_READ_BIT|VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT|VK_ACCESS_TRANSFER_READ_BIT|VK_ACCESS_TRANSFER_WRITE_BIT|VK_ACCESS_INPUT_ATTACHMENT_READ_BIT;
+     }
+     if(currentFrame){auto kind=[](VkImageLayout l){return l==VK_IMAGE_LAYOUT_GENERAL?1u:l==VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL?2u:l==VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL?3u:0u;};++currentFrame->layoutKinds[kind(layout)*4+kind(next)];}ib.srcQueueFamilyIndex=ib.dstQueueFamilyIndex=VK_QUEUE_FAMILY_IGNORED;
      ib.image=t->image;ib.subresourceRange={VK_IMAGE_ASPECT_COLOR_BIT,l,1,0,1};
 #ifdef FUXI_MTL_HOST_TEST
      imageTransitions.push_back({t,l,layout,next});
@@ -1340,7 +1357,7 @@ public:
      if(boundaryPerf){
       for(size_t i=0;i<pendingTextures.size();++i){auto *old=pendingTextures[i];if(old->image==t->image?pendingImages[i].subresourceRange.baseMipLevel==l:memoryAlias(old,t) || hostRangesOverlap(old->mapped,old->allocated,t->mapped,t->allocated)){flushImages();break;}}
       pendingImages.push_back(ib);pendingTextures.push_back(t);
-     }else CmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT|VK_PIPELINE_STAGE_HOST_BIT,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,0,0,nullptr,0,nullptr,1,&ib);layout=next;
+     }else pb(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT|VK_PIPELINE_STAGE_HOST_BIT,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,0,0,nullptr,0,nullptr,1,&ib);layout=next;
     }
    };
    // Bound each descriptor type and sets independently; grow geometrically, retain one pool.
@@ -1368,17 +1385,35 @@ public:
    };
    struct BoundSet {VkDescriptorSetLayout layout;unsigned count;std::array<BindingValue,16> bindings;VkDescriptorSet set;};
    std::vector<BoundSet> boundSets;if(systemTranslationPolicy().submitFast)boundSets.reserve(std::min<size_t>(ops.size(),256));
-   auto refresh=[&](Texture *t){if(!t || !t->shadow)return;
-    transition(t,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);flushImages();
+   auto copyShadow=[&](Texture *t){
     VkBufferImageCopy region{};region.bufferOffset=t->backingOffset;region.bufferRowLength=t->backingRow/texelBytes(t->format);
     region.imageSubresource={VK_IMAGE_ASPECT_COLOR_BIT,0,0,1};region.imageExtent={t->width,t->height,1};
     CmdCopyBufferToImage(cmd,t->backingBuffer->buffer,t->image,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,1,&region);t->setDefined(0);if(timing)timing->textureRepitchedBytes+=uint64_t(t->width)*t->height*texelBytes(t->format);
    };
-   std::vector<Texture *> refreshed;
+   auto refresh=[&](Texture *t){if(!t || !t->shadow)return;transition(t,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);flushImages();copyShadow(t);};
+   std::vector<Texture *> refreshed,refreshedSubmit,collected;
+   // Perf bit 4: a shadow is copied from its backing buffer once per submit when nothing in the submit can change that backing
+   // (no buffer destination, no storage-buffer/image shader, no written texture overlapping it). The CPU snapshot is applied before submit.
+   bool shadowStable=boundaryPerf;
+   if(boundaryPerf)for(size_t n=0;n<ops.size() && shadowStable;++n)if(ops[n].pipeline)for(unsigned j=0;j<draws[n].descriptorCount;++j){auto t=draws[n].descriptors[j].type;if(t==VK_DESCRIPTOR_TYPE_STORAGE_BUFFER || t==VK_DESCRIPTOR_TYPE_STORAGE_IMAGE || t==VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER){shadowStable=false;break;}}
+   auto backingStable=[&](Texture *t){
+    if(!shadowStable)return false;auto *backing=t->backingBuffer;if(!backing)return false;
+    auto hits=[&](Texture *w){return w && (backing->memory==w->memory || hostRangesOverlap(backing->contents,backing->length,w->mapped,w->allocated));};
+    for(auto &op:ops){
+     if(op.dst && (op.dst==backing || op.dst->memory==backing->memory || hostRangesOverlap(backing->contents,backing->length,op.dst->contents,op.dst->length)))return false;
+     if(op.pipeline || op.clearOnly){for(unsigned i=0;i<std::min(op.colorCount,8u);++i)if(hits(op.color(i).texture))return false;}
+     else if(op.texture && (op.upload || op.sourceTexture || op.generateMips) && hits(op.texture))return false;
+    }
+    return true;
+   };
    auto refreshImages=[&](size_t opIndex){diagnosticOp=opIndex;const auto &op=ops[opIndex];
     // Once per run, after preceding writes and before any sample transitions.
     // Never deduplicate the transfer-destination transition with a read layout.
-    auto readShadow=[&](Texture *t){if(t && t->shadow && std::find(refreshed.begin(),refreshed.end(),t)==refreshed.end()){refresh(t);refreshed.push_back(t);}};
+    auto readShadow=[&](Texture *t){if(!t || !t->shadow || std::find(refreshed.begin(),refreshed.end(),t)!=refreshed.end())return;
+     if(boundaryPerf){refreshed.push_back(t);
+      if(std::find(refreshedSubmit.begin(),refreshedSubmit.end(),t)!=refreshedSubmit.end() && backingStable(t)){if(currentFrame)++currentFrame->shadowRefreshSkipped;return;}
+      refreshedSubmit.push_back(t);collected.push_back(t);return;}
+     refresh(t);refreshed.push_back(t);};
     for(auto *sample:op.samples)readShadow(sample);readShadow(op.sourceTexture);
     if(!op.pipeline && !op.upload && !op.sourceTexture && !op.clearOnly)readShadow(op.texture);
    };
@@ -1388,14 +1423,14 @@ public:
      if(base>=t->levels || !count || count>t->levels-base)throw std::runtime_error("sample mip range");
      auto range=accessed[opIndex][slot];
      for(uint32_t l=range.first;!range.empty() && l<=range.last;++l)if(!t->isDefined(l)){if(allowUndefinedRead())break;throw std::runtime_error("undefined sampled mip");}
-     transition(t,generalSamples[opIndex][slot]?VK_IMAGE_LAYOUT_GENERAL:VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,base,count);
+     transition(t,sampleGeneral(opIndex,slot)?VK_IMAGE_LAYOUT_GENERAL:VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,base,count);
     }
     if(op.sourceTexture && !op.pipeline && !op.sourceTexture->isDefined(op.srcLevel))throw std::runtime_error("undefined source texture mip");
     if(op.sourceTexture && !op.pipeline)transition(op.sourceTexture,VK_IMAGE_LAYOUT_GENERAL,op.srcLevel,1);
     if(op.pipeline && op.sourceTexture && !op.samples[0]){
      auto *t=op.sourceTexture;auto range=accessed[opIndex][0];
      for(uint32_t l=range.first;!range.empty() && l<=range.last;++l)if(!t->isDefined(l)){if(allowUndefinedRead())break;throw std::runtime_error("undefined sampled mip");}
-     transition(t,generalSamples[opIndex][0]?VK_IMAGE_LAYOUT_GENERAL:VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,op.sampleBase[0],op.sampleCount[0]);
+     transition(t,sampleGeneral(opIndex,0)?VK_IMAGE_LAYOUT_GENERAL:VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,op.sampleBase[0],op.sampleCount[0]);
     }
     if(op.texture && !op.pipeline && !op.clearOnly)transition(op.texture,VK_IMAGE_LAYOUT_GENERAL,op.generateMips?op.mipBase:(!op.upload && !op.sourceTexture?op.srcLevel:op.dstLevel),op.generateMips?op.mipCount:1);
     if(op.pipeline || op.clearOnly)for(unsigned i=0;i<op.colorCount;++i){auto c=op.color(i);if(c.texture)transition(c.texture,VK_IMAGE_LAYOUT_GENERAL,c.level,1);}
@@ -1406,6 +1441,8 @@ public:
     size_t passEnd=mergeEnds.empty()?opIndex:mergeEnds[opIndex];
     bool continuation=opIndex && !mergeEnds.empty() && mergeEnds[opIndex-1]>=opIndex;
     if(!continuation){boundPipeline={};boundLayout={};boundSet={};dynamicBound=false;refreshed.clear();for(size_t i=opIndex;i<=passEnd;++i)refreshImages(i);
+     // One transfer-destination barrier for every shadow in the run, then the copies.
+     if(!collected.empty()){for(auto *t:collected)transition(t,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);flushImages();for(auto *t:collected)copyShadow(t);collected.clear();}
      hoisting=passEnd>opIndex;hoisted.clear();for(size_t i=opIndex;i<=passEnd;++i)prepareImages(i);hoisting=false;flushImages();diagnosticOp=opIndex;}
     if(op.generateMips){auto *t=op.texture;
      if(!t->isDefined(op.mipBase))throw std::runtime_error("undefined mip generation source");
@@ -1414,7 +1451,7 @@ public:
       region.srcOffsets[1]={(int32_t)t->levelWidth(l-1),(int32_t)t->levelHeight(l-1),1};region.dstOffsets[1]={(int32_t)t->levelWidth(l),(int32_t)t->levelHeight(l),1};
       CmdBlitImage(cmd,t->image,VK_IMAGE_LAYOUT_GENERAL,t->image,VK_IMAGE_LAYOUT_GENERAL,1,&region,VK_FILTER_LINEAR);
       barrier.srcAccessMask=VK_ACCESS_TRANSFER_WRITE_BIT;barrier.dstAccessMask=VK_ACCESS_TRANSFER_READ_BIT|VK_ACCESS_TRANSFER_WRITE_BIT;
-      CmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_TRANSFER_BIT,0,1,&barrier,0,nullptr,0,nullptr);t->setDefined(l);
+      pb(VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_TRANSFER_BIT,0,1,&barrier,0,nullptr,0,nullptr);t->setDefined(l);
      }
     }else
     if(op.texture && op.pipeline) {
@@ -1475,7 +1512,7 @@ public:
          if(found!=viewCache.end())view=found->view;
          else {check(CreateImageView(device,&vi,nullptr,&view));++reuseCounts.views;++submitObjectCreates;++submitViewCreates;
           try {if(viewCache.size()<viewCacheLimit)viewCache.push_back({t,vi.format,components,base,count,view});else sampleViews.push_back(view);}catch(...){DestroyImageView(device,view,nullptr);throw;}}
-         }image={d.type==VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER && sam?sam->sampler:VK_NULL_HANDLE,view,generalSamples[opIndex][d.slot]?VK_IMAGE_LAYOUT_GENERAL:VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};write.pImageInfo=&image;
+         }image={d.type==VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER && sam?sam->sampler:VK_NULL_HANDLE,view,sampleGeneral(opIndex,d.slot)?VK_IMAGE_LAYOUT_GENERAL:VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};write.pImageInfo=&image;
 #ifdef FUXI_MTL_HOST_TEST
         sampleViewUses.push_back({t,base,count,image.imageLayout});
 #endif
@@ -1527,10 +1564,10 @@ public:
       CmdCopyImageToBuffer(cmd,op.sourceTexture->image,VK_IMAGE_LAYOUT_GENERAL,aliasBuffer->buffer,1,&snapshot);
       // The source read must finish before any aliased destination clear/write.
       barrier.srcAccessMask=VK_ACCESS_TRANSFER_READ_BIT|VK_ACCESS_TRANSFER_WRITE_BIT;barrier.dstAccessMask=VK_ACCESS_TRANSFER_READ_BIT|VK_ACCESS_TRANSFER_WRITE_BIT;
-      CmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_TRANSFER_BIT,0,1,&barrier,0,nullptr,0,nullptr);
+      pb(VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_TRANSFER_BIT,0,1,&barrier,0,nullptr,0,nullptr);
      }
      if(!op.texture->isDefined(op.dstLevel) && (op.dstX || op.dstY || op.dstZ || (op.width && op.width!=op.texture->levelWidth(op.dstLevel)) || (op.height && op.height!=op.texture->levelHeight(op.dstLevel)) || (op.depth && op.depth!=op.texture->levelDepth(op.dstLevel)))){VkClearColorValue zero{};VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT,op.dstLevel,1,0,1};CmdClearColorImage(cmd,op.texture->image,VK_IMAGE_LAYOUT_GENERAL,&zero,1,&range);
-      barrier.srcAccessMask=VK_ACCESS_TRANSFER_WRITE_BIT;barrier.dstAccessMask=VK_ACCESS_TRANSFER_WRITE_BIT;CmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_TRANSFER_BIT,0,1,&barrier,0,nullptr,0,nullptr);}
+      barrier.srcAccessMask=VK_ACCESS_TRANSFER_WRITE_BIT;barrier.dstAccessMask=VK_ACCESS_TRANSFER_WRITE_BIT;pb(VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_TRANSFER_BIT,0,1,&barrier,0,nullptr,0,nullptr);}
      op.texture->setDefined(op.dstLevel);
      VkImageCopy region{};region.srcOffset={(int32_t)op.srcX,(int32_t)op.srcY,(int32_t)op.srcZ};region.dstOffset={(int32_t)op.dstX,(int32_t)op.dstY,(int32_t)op.dstZ};region.srcSubresource={VK_IMAGE_ASPECT_COLOR_BIT,op.srcLevel,0,1};region.dstSubresource={VK_IMAGE_ASPECT_COLOR_BIT,op.dstLevel,0,1};region.extent={op.width?op.width:op.texture->levelWidth(op.dstLevel),op.height?op.height:op.texture->levelHeight(op.dstLevel),copyDepth};
      if(aliasCopies[opIndex]){
@@ -1539,7 +1576,7 @@ public:
      }else CmdCopyImage(cmd,op.sourceTexture->image,VK_IMAGE_LAYOUT_GENERAL,op.texture->image,VK_IMAGE_LAYOUT_GENERAL,1,&region);
     } else if(op.texture && op.upload) {
      if(!op.texture->isDefined(op.dstLevel) && (op.dstX || op.dstY || op.dstZ || (op.width && op.width!=op.texture->levelWidth(op.dstLevel)) || (op.height && op.height!=op.texture->levelHeight(op.dstLevel)) || (op.depth && op.depth!=op.texture->levelDepth(op.dstLevel)))){VkClearColorValue zero{};VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT,op.dstLevel,1,0,1};CmdClearColorImage(cmd,op.texture->image,VK_IMAGE_LAYOUT_GENERAL,&zero,1,&range);
-      barrier.srcAccessMask=VK_ACCESS_TRANSFER_WRITE_BIT;barrier.dstAccessMask=VK_ACCESS_TRANSFER_WRITE_BIT;CmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_TRANSFER_BIT,0,1,&barrier,0,nullptr,0,nullptr);}
+      barrier.srcAccessMask=VK_ACCESS_TRANSFER_WRITE_BIT;barrier.dstAccessMask=VK_ACCESS_TRANSFER_WRITE_BIT;pb(VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_TRANSFER_BIT,0,1,&barrier,0,nullptr,0,nullptr);}
      op.texture->setDefined(op.dstLevel);
      VkBufferImageCopy region{};region.bufferOffset=op.from;region.imageOffset={(int32_t)op.dstX,(int32_t)op.dstY,(int32_t)op.dstZ};region.imageSubresource={VK_IMAGE_ASPECT_COLOR_BIT,op.dstLevel,0,1};region.imageExtent={op.width?op.width:op.texture->levelWidth(op.dstLevel),op.height?op.height:op.texture->levelHeight(op.dstLevel),op.depth?op.depth:op.texture->levelDepth(op.dstLevel)};region.bufferRowLength=op.rowBytes?op.rowBytes/texelBytes(op.texture->format):0;region.bufferImageHeight=op.imageBytes?uint32_t(op.imageBytes/op.rowBytes):0;
      CmdCopyBufferToImage(cmd,op.src->buffer,op.texture->image,VK_IMAGE_LAYOUT_GENERAL,1,&region);
@@ -1549,11 +1586,19 @@ public:
      CmdCopyImageToBuffer(cmd,op.texture->image,VK_IMAGE_LAYOUT_GENERAL,op.dst->buffer,1,&region);
     } else if(op.src) {VkBufferCopy region{op.from,op.to,op.size};CmdCopyBuffer(cmd,op.src->buffer,op.dst->buffer,1,&region);}
     else CmdFillBuffer(cmd,op.dst->buffer,op.to,op.size,uint32_t(op.value)*0x01010101u);
-    if(opIndex==passEnd){barrier.srcAccessMask=VK_ACCESS_MEMORY_WRITE_BIT;barrier.dstAccessMask=VK_ACCESS_MEMORY_READ_BIT|VK_ACCESS_MEMORY_WRITE_BIT;
-    CmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,0,1,&barrier,0,nullptr,0,nullptr);}
+    if(opIndex==passEnd){
+     // Perf bit 4. A draw pass whose shaders write only attachments is already closed by the render pass external dependency
+     // (color writes -> later shader/transfer/attachment accesses); only a pass with storage descriptors, or any transfer op, needs the global barrier.
+     bool attachmentsOnly=boundaryPerf && !op.generateMips && op.texture && op.pipeline && !op.src && !op.dst;
+     if(attachmentsOnly)for(unsigned j=0;j<draw.descriptorCount;++j){auto t=draw.descriptors[j].type;if(t==VK_DESCRIPTOR_TYPE_STORAGE_BUFFER || t==VK_DESCRIPTOR_TYPE_STORAGE_IMAGE || t==VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER)attachmentsOnly=false;}
+     if(attachmentsOnly){if(currentFrame)++currentFrame->postBarriersSkipped;}
+     else if(boundaryPerf){barrier.srcAccessMask=VK_ACCESS_MEMORY_WRITE_BIT;barrier.dstAccessMask=VK_ACCESS_MEMORY_READ_BIT|VK_ACCESS_MEMORY_WRITE_BIT;
+      pb(barrierProducers|VK_PIPELINE_STAGE_HOST_BIT,VK_PIPELINE_STAGE_VERTEX_INPUT_BIT|barrierProducers,0,1,&barrier,0,nullptr,0,nullptr);}
+     else {barrier.srcAccessMask=VK_ACCESS_MEMORY_WRITE_BIT;barrier.dstAccessMask=VK_ACCESS_MEMORY_READ_BIT|VK_ACCESS_MEMORY_WRITE_BIT;
+     pb(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,0,1,&barrier,0,nullptr,0,nullptr);}}
    }
    barrier.srcAccessMask=VK_ACCESS_MEMORY_WRITE_BIT;barrier.dstAccessMask=VK_ACCESS_HOST_READ_BIT;
-   CmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,VK_PIPELINE_STAGE_HOST_BIT,0,1,&barrier,0,nullptr,0,nullptr);
+   pb(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,VK_PIPELINE_STAGE_HOST_BIT,0,1,&barrier,0,nullptr,0,nullptr);
    if(timestamps)CmdWriteTimestamp(cmd,VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,timestamps,1);
    check(EndCommandBuffer(cmd));
    auto recordNS=since(recordStart)-(objectNanos-recordObjects)-descriptorNanos;

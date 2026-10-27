@@ -86,3 +86,15 @@ git diff --check
 The frontend runner executes policy tests under ASan/UBSan and explicitly skips native Objective-C tests on Linux. The merge runner builds with warnings as errors and ASan/UBSan, checks existing merge/shadow/fetch/storage/mip/variant pixel controls across all masks, tests the extension-hidden fallback, and runs host benchmarks without timing thresholds. [CI registration](../tools/ci/build.sh#L238) keeps CPU policy tests in the normal metal build and optionally runs the Vulkan suite when `FUXI_MTL_TEST_ICD` names a supplied local ICD (`FUXI_MTL_TEST_GLSLANG` supplies the compiler).
 
 No macOS/iOS build, native Objective-C execution, Turnip/Adreno GPU timing, device/phone access or GMEM measurement was performed. Linux lavapipe checks validate recording counts and rendered behavior, not tiler performance. The DrawPlanCache planning block was left untouched.
+
+## Bit 4 narrowing: GENERAL sampling, masks, post-pass skip, shadow refresh once per submit
+
+Code only; device effect **not yet observed**. All of it is under the existing `fuxigpuperf` value 4 (already part of the device mask 7); no new bit or boot argument.
+
+- New trace fields: `pipeline_barriers/frame` (actual `vkCmdPipelineBarrier` calls, including entry/final), `layout_transitions/frame=old>new:n` (und/gen/ro/dst), `post_barriers_skipped/frame`, `shadow_refresh_skipped/frame`. With bit 4, `read_barriers_skipped` also counts GENERAL same-layout skips.
+- Sampled images stay `GENERAL` (the GENERAL <-> SHADER_READ_ONLY ping-pong disappears). Spec-valid for any sampled image.
+- Image barriers use VERTEX|FRAGMENT|COLOR_ATTACHMENT_OUTPUT|TRANSFER stages (plus HOST in src) and write-only source / consumer-only destination accesses instead of ALL_COMMANDS and MEMORY_READ|WRITE. A batch whose targets are all TRANSFER_DST names only TRANSFER as destination. This backend has no compute stages. Render pass external dependencies are narrowed the same way.
+- The global ALL_COMMANDS barrier after a draw pass is skipped when the pass has no storage descriptors: the render pass external dependency (COLOR_ATTACHMENT_WRITE to later shader/transfer/attachment accesses) already closes it, and WAR follows from its execution dependency. Transfer ops and storage-writing passes keep a (narrower) global barrier.
+- Shadow refresh: one TRANSFER_DST barrier for every shadow in a run, then the copies. A shadow already refreshed earlier in the submit is not copied again unless the submit has a buffer destination, a storage descriptor, or a written texture overlapping its backing.
+- Not done: the CPU snapshot of refused no-copy buffers (6.7 MB/frame) has no CPU mutation signal (see the chunk-compare regression in metal.md), so it still copies.
+- Turnip evidence is from memory of `tu_cmd_buffer.cc` (`tu_barrier`, `vk2tu_access`, `tu_flush_for_access`; no Mesa source is available offline): MEMORY_READ|WRITE sets all flush/invalidate bits and ALL_COMMANDS forces wait-for-idle. Not verified against the pinned source.

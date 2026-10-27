@@ -51,7 +51,7 @@ void main() {color=textureLod(image,vec2(0.5),constants.lod);}
         subprocess.run(common+sanitized+definitions+[str(ROOT/'tools/fuxi-metal/RenderMergeTests.cpp'), '-ldl', '-pthread', '-o', str(d/'test')], check=True)
         def invoke(binary, args, cli=(), trace="1", **overrides):
             p = subprocess.run([str(binary), *map(str, cli)], env=dict(env, FUXI_MTL_TEST_BOOTARGS='fuxigpuframetrace='+trace+' '+args, **overrides), text=True, capture_output=True, timeout=90)
-            assert p.returncode == 0, p.stderr
+            assert p.returncode == 0, (args, p.stderr)
             assert 'AddressSanitizer' not in p.stderr and 'runtime error:' not in p.stderr, p.stderr
             return p.stdout
         subprocess.run(common+sanitized+definitions+[str(ROOT/'tools/fuxi-metal/GpuBarrierTests.cpp'), '-ldl', '-pthread', '-o', str(d/'barriers')], check=True)
@@ -65,11 +65,12 @@ void main() {color=textureLod(image,vec2(0.5),constants.lod);}
             print(label+'\n'+'\n'.join(line for line in output.splitlines() if line.startswith('COUNTS ')))
         counts = lambda output, label: tuple(map(int, re.search(r'COUNTS '+label+r' images=(\d+) image_calls=(\d+) barriers=(\d+) passes=(\d+)', output).groups()))
         assert counts(before, 'batch') == (5, 5, 8, 1)
-        assert counts(after, 'batch') == (5, 1, 4, 1)
+        # Mask 7 before the stage/access narrowing, GENERAL sampling and draw-pass post-barrier skip: batch (5,1,4,1), ca (4,3,9,3), mip-batch (3,1,4,1).
+        assert counts(after, 'batch') == (1, 1, 3, 1)
         ca_before, ca_after = counts(before, 'ca'), counts(after, 'ca')
-        assert ca_before == (29, 29, 57, 25) and ca_after == (4, 3, 9, 3)
+        assert ca_before == (29, 29, 57, 25) and ca_after == (2, 2, 5, 3)
         assert counts(before, 'mip-batch') == (4, 4, 7, 1)
-        assert counts(after, 'mip-batch') == (3, 1, 4, 1)
+        assert counts(after, 'mip-batch') == (0, 0, 2, 1)
         for args in ('', 'fuxigpuperf=4', controls+'fuxigpuperf=4', controls+'fuxigpuperf=5', controls+'fuxigpuperf=6'):
             assert pixels(invoke(d/'barriers', args)) == pixels(before), 'boundary controls differ: '+args
         print('PASS: CA boundary A/B pixels, exact batch counts, all independent bit combinations')

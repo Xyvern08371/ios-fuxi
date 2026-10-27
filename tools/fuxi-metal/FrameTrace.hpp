@@ -66,7 +66,7 @@ struct FrameSample {
  uint64_t textureShadowBytes=0,textureRepitchedBytes=0;std::array<uint64_t,3> textureShadowUses{};
  uint64_t snapshotBytes=0,shadowCopyBytes=0,shadowScannedIndices=0;std::array<uint64_t,size_t(ShadowFullReason::count)> shadowFullReasons{};
  uint64_t planHits=0,planMisses=0;
- uint64_t queueSubmits=0,imageBarriers=0,readBarriersSkipped=0,crossEncoderMerges=0;
+ uint64_t queueSubmits=0,imageBarriers=0,readBarriersSkipped=0,crossEncoderMerges=0,pipelineBarriers=0,shadowRefreshSkipped=0,postBarriersSkipped=0;std::array<uint64_t,16> layoutKinds{}; // old*4+new over undefined,general,shader-read,transfer-dst
  uint64_t drainWaits=0,conflictWaits=0,slotWaits=0,shadowWaits=0;
  uint64_t drainSubmits=0,prepareDrains=0,prepareUnknownDrains=0,prepareConflictWaits=0,indexUploadDrains=0,indexGPUWritableDrains=0,indexUploadSubmits=0,indexReadOnlySubmits=0,indexGPUWritableSubmits=0;
  uint64_t snapshotReusedBytes=0,shadowSkippedBytes=0;
@@ -172,7 +172,7 @@ public:
   totals.snapshotBytes+=s.snapshotBytes;totals.shadowCopyBytes+=s.shadowCopyBytes;totals.shadowScannedIndices+=s.shadowScannedIndices;for(size_t i=0;i<totals.shadowFullReasons.size();++i)totals.shadowFullReasons[i]+=s.shadowFullReasons[i];
   totals.frontendDrawSamples+=s.frontendDrawSamples;totals.leaseWrites+=s.leaseWrites;totals.leaseReads+=s.leaseReads;
   totals.planHits+=s.planHits;totals.planMisses+=s.planMisses;
-  totals.queueSubmits+=s.queueSubmits;totals.imageBarriers+=s.imageBarriers;totals.readBarriersSkipped+=s.readBarriersSkipped;totals.crossEncoderMerges+=s.crossEncoderMerges;
+  totals.queueSubmits+=s.queueSubmits;totals.imageBarriers+=s.imageBarriers;totals.readBarriersSkipped+=s.readBarriersSkipped;totals.crossEncoderMerges+=s.crossEncoderMerges;totals.pipelineBarriers+=s.pipelineBarriers;totals.shadowRefreshSkipped+=s.shadowRefreshSkipped;totals.postBarriersSkipped+=s.postBarriersSkipped;for(size_t i=0;i<totals.layoutKinds.size();++i)totals.layoutKinds[i]+=s.layoutKinds[i];
   totals.drainWaits+=s.drainWaits;totals.conflictWaits+=s.conflictWaits;totals.slotWaits+=s.slotWaits;
   totals.shadowWaits+=s.shadowWaits;totals.drainSubmits+=s.drainSubmits;totals.prepareDrains+=s.prepareDrains;totals.prepareUnknownDrains+=s.prepareUnknownDrains;totals.prepareConflictWaits+=s.prepareConflictWaits;totals.indexUploadDrains+=s.indexUploadDrains;totals.indexGPUWritableDrains+=s.indexGPUWritableDrains;
   totals.indexUploadSubmits+=s.indexUploadSubmits;totals.indexReadOnlySubmits+=s.indexReadOnlySubmits;totals.indexGPUWritableSubmits+=s.indexGPUWritableSubmits;
@@ -206,6 +206,7 @@ public:
   fprintf(out," interval=%.3f/%.3f ms cadence_ticks=1:%llu,2:%llu,3:%llu,4+:%llu",p(&FrameSample::interval,50),p(&FrameSample::interval,90),(unsigned long long)cadence[0],(unsigned long long)cadence[1],(unsigned long long)cadence[2],(unsigned long long)cadence[3]);
   fprintf(out," submits/frame=%.2f image_barriers/frame=%.2f read_barriers_skipped/frame=%.2f cross_encoder_merges/frame=%.2f wait_reasons=drain:%llu,conflict:%llu,slots:%llu",totals.queueSubmits/n,totals.imageBarriers/n,totals.readBarriersSkipped/n,totals.crossEncoderMerges/n,(unsigned long long)totals.drainWaits,(unsigned long long)totals.conflictWaits,(unsigned long long)totals.slotWaits);
   fprintf(out," drain_submits=%llu drain_reasons=indices-upload:%llu,indices-gpu-writable:%llu,prepare:%llu,prepare-conflict:%llu,prepare-unknown:%llu index_submits=upload:%llu,readonly:%llu,gpu_writable:%llu shadow_waits=%llu snapshot_reused_bytes/frame=%.2f shadow_skipped_bytes/frame=%.2f",(unsigned long long)totals.drainSubmits,(unsigned long long)totals.indexUploadDrains,(unsigned long long)totals.indexGPUWritableDrains,(unsigned long long)totals.prepareDrains,(unsigned long long)totals.prepareConflictWaits,(unsigned long long)totals.prepareUnknownDrains,(unsigned long long)totals.indexUploadSubmits,(unsigned long long)totals.indexReadOnlySubmits,(unsigned long long)totals.indexGPUWritableSubmits,(unsigned long long)totals.shadowWaits,totals.snapshotReusedBytes/n,totals.shadowSkippedBytes/n);
+  fprintf(out," pipeline_barriers/frame=%.2f shadow_refresh_skipped/frame=%.2f post_barriers_skipped/frame=%.2f layout_transitions/frame=",totals.pipelineBarriers/n,totals.shadowRefreshSkipped/n,totals.postBarriersSkipped/n);{static const char *k[]={"und","gen","ro","dst"};bool any=false;for(size_t i=0;i<16;++i)if(totals.layoutKinds[i]){fprintf(out,"%s%s>%s:%.2f",any?",":"",k[i/4],k[i%4],totals.layoutKinds[i]/n);any=true;}if(!any)fputc('-',out);}
   fprintf(out," plan_hits/frame=%.2f plan_misses/frame=%.2f",totals.planHits/n,totals.planMisses/n);
   fprintf(out," snapshot_bytes/frame=%.2f shadow_copy_bytes/frame=%.2f",totals.snapshotBytes/n,totals.shadowCopyBytes/n);
   fprintf(out," shadow_scanned_indices/frame=%.2f shadow_full_reasons=",totals.shadowScannedIndices/n);for(size_t i=0;i<totals.shadowFullReasons.size();++i)fprintf(out,"%s%s:%.2f",i?",":"",shadowFullReasonNames[i],totals.shadowFullReasons[i]/n);
