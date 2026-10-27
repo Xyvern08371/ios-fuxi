@@ -54,5 +54,22 @@ int main(){
  auto sleptCPU=frameCPUDelta(cpuStart,frameThreadCPU());assert(sleptCPU<frameNanos(wallStart)/2);
  cpuStart=frameThreadCPU();while(frameCPUDelta(cpuStart,frameThreadCPU())<2000000){}
  assert(frameCPUDelta(cpuStart,frameThreadCPU())>=2000000);
+ { // exclusive nested phases, drained encode phases, bounded phase lines
+  FrameSample s;auto wall=FrameClock::now();
+  {FrameTraceScope scope(&s);PhaseTimer outer(SubPhase::other);std::this_thread::sleep_for(std::chrono::milliseconds(4));{PhaseTimer inner(SubPhase::cmdBegin);std::this_thread::sleep_for(std::chrono::milliseconds(2));}scanAdd(ScanKind::viewProbes,7);scanMax(ScanKind::boundSetMax,5);scanMax(ScanKind::boundSetMax,3);}
+  assert(s.subCalls[size_t(SubPhase::cmdBegin)]==1 && s.subNs[size_t(SubPhase::cmdBegin)]>=2000000);
+  assert(s.subCalls[size_t(SubPhase::other)]==1 && s.subNs[size_t(SubPhase::other)]>=4000000 && s.subNs[size_t(SubPhase::other)]+s.subNs[size_t(SubPhase::cmdBegin)]<=frameNanos(wall)); // inclusive nesting would exceed elapsed time
+  assert(s.scans[size_t(ScanKind::viewProbes)]==7 && s.scans[size_t(ScanKind::boundSetMax)]==5);
+  {PhaseTimer none(SubPhase::passes);} // no current frame: no accumulation, no crash
+  if(systemTranslationPolicy().frameTrace){
+   wall=FrameClock::now();{PhaseTimer a(EncPhase::draw);std::this_thread::sleep_for(std::chrono::milliseconds(3));{PhaseTimer b(EncPhase::state);std::this_thread::sleep_for(std::chrono::milliseconds(2));}}
+   drainEncodePhases(s);assert(s.encCalls[size_t(EncPhase::draw)]==1 && s.encNs[size_t(EncPhase::draw)]>=3000000 && s.encNs[size_t(EncPhase::draw)]+s.encNs[size_t(EncPhase::state)]<=frameNanos(wall) && s.encNs[size_t(EncPhase::state)]>=2000000);
+   assert(encAccum.calls[size_t(EncPhase::draw)]==0);
+  }
+  FrameTraceWindow w;for(unsigned i=0;i<4;++i)w.add(s);
+  FILE *o=tmpfile();assert(o);w.report(o);rewind(o);char text[8192];bool sawSubmit=false,sawScan=false;
+  while(fgets(text,sizeof(text),o)){if(strstr(text,"submit phases")){sawSubmit=true;assert(strlen(text)<=401 && strstr(text,"cmd_begin=") && strstr(text,"other="));}if(strstr(text,"scan counts")){sawScan=true;assert(strlen(text)<=401 && strstr(text,"view_probes=7.0") && strstr(text,"bound_set_max=5.0"));}}
+  assert(sawSubmit && sawScan);fclose(o);
+ }
  puts("PASS: bounded frame percentiles/reset/overflow/max, log fields, CPU mask and thread-local attribution");
 }

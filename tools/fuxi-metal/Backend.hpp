@@ -954,6 +954,7 @@ public:
  // The caller must invoke retirement exactly once, before Backend destruction.
  // Slots pin every referenced object, including resources released by the client.
  void submit(std::vector<Operation> ops,const std::function<void()> &scheduled={},std::function<void()> *retirement=nullptr,const std::function<void()> &prepare={},const std::vector<PrepareWrite> *prepareWrites=nullptr) {
+  PhaseTimer submitPhase(SubPhase::other);
   auto submitStart=std::chrono::steady_clock::now();auto submitQueued=submitStart;
   auto since=[](std::chrono::steady_clock::time_point t){return (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-t).count();};
   auto *timing=systemTranslationPolicy().frameTrace?currentFrame:nullptr;
@@ -1044,8 +1045,8 @@ public:
   // Exclusive prepare phases: object API/cache time is subtracted from recording.
   uint64_t objectNanos=0,descriptorNanos=0;
   struct Measure {
-   uint64_t &total;FrameClock::time_point start=FrameClock::now();
-   explicit Measure(uint64_t &t):total(t){}
+   uint64_t &total;FrameClock::time_point start=FrameClock::now();PhaseTimer phase;
+   Measure(uint64_t &t,SubPhase p):total(t),phase(p){}
    ~Measure(){total+=frameNanos(start);}
   };
   try {
@@ -1056,8 +1057,8 @@ public:
    std::vector<std::array<MipRange,resourceSlots>> accessed(ops.size());
    std::vector<std::array<bool,resourceSlots>> generalSamples(ops.size());
    std::vector<Buffer *> buffers;
-   auto addBuffer=[&](Buffer *b){if(b && std::find(buffers.begin(),buffers.end(),b)==buffers.end())buffers.push_back(b);};
-   auto addTexture=[&](Texture *t){if(t && std::find(textures.begin(),textures.end(),t)==textures.end())textures.push_back(t);if(t && t->backingBuffer)addBuffer(t->backingBuffer);};
+   auto addBuffer=[&](Buffer *b){if(b){auto f=std::find(buffers.begin(),buffers.end(),b);scanAdd(ScanKind::useProbes,size_t(f-buffers.begin())+1);if(f==buffers.end())buffers.push_back(b);}};
+   auto addTexture=[&](Texture *t){if(t){auto f=std::find(textures.begin(),textures.end(),t);scanAdd(ScanKind::useProbes,size_t(f-textures.begin())+1);if(f==textures.end())textures.push_back(t);}if(t && t->backingBuffer)addBuffer(t->backingBuffer);};
    for(size_t n=0;n<ops.size();++n){diagnosticOp=n;auto &op=ops[n];addBuffer(op.src);addBuffer(op.dst);addBuffer(op.indices);addTexture(op.texture);addTexture(op.sourceTexture);
     if(op.texture && op.texture->shadow && (op.pipeline || op.clearOnly || op.upload || op.sourceTexture || op.generateMips))throw std::runtime_error("read-only linear shadow GPU write refused");
     if(op.texture && op.dstLevel>=op.texture->levels)throw std::runtime_error("destination mip level");
@@ -1315,7 +1316,7 @@ public:
    size_t neutralSize=0;for(const auto &draw:draws)for(unsigned i=0;i<draw.descriptorCount;++i){const auto &d=draw.descriptors[i];if(d.source==2){
     if((d.type!=VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER && d.type!=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER) || d.offset || !d.range || d.range>maxBufferLength)throw std::runtime_error("planned neutral buffer bounds/type");
     neutralSize=std::max(neutralSize,size_t(d.range));}}
-   if(aliasBytes){Measure measure{objectNanos};
+   if(aliasBytes){Measure measure{objectNanos,SubPhase::objects};
     // Single synchronous lane: prior fence is complete before scratch is reused.
     // Larger requests keep the transient path; retained memory is quota charged.
     if(systemTranslationPolicy().pipelined && aliasBytes<=aliasScratchLimit){
@@ -1325,14 +1326,14 @@ public:
     }else aliasBuffer=allocateUnlocked(aliasBytes);
     addBuffer(aliasBuffer);
    }
-   if(neutralSize){Measure measure{objectNanos};neutralBuffer=allocateUnlocked(neutralSize);addBuffer(neutralBuffer);}
+   if(neutralSize){Measure measure{objectNanos,SubPhase::objects};neutralBuffer=allocateUnlocked(neutralSize);addBuffer(neutralBuffer);}
    for(auto *t:textures)oldTextures.push_back({t,t->layout,t->levelLayouts,t->defined,t->definedLevels});
    auto flushStart=std::chrono::steady_clock::now();
    // Direct shared host writes are not tracked. Only Vulkan HOST_COHERENT permits omission.
    for(auto *t:textures)if(t->mapped && !coherent(t->memoryType)) {VkMappedMemoryRange r{};r.sType=VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;r.memory=t->memory;r.size=VK_WHOLE_SIZE;++flushCalls;check(FlushMappedMemoryRanges(device,1,&r));}
    for(auto *b:buffers)if(!coherent(b->memoryType)) {VkMappedMemoryRange r{};r.sType=VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;r.memory=b->memory;r.size=VK_WHOLE_SIZE;++flushCalls;check(FlushMappedMemoryRanges(device,1,&r));}
    {auto ns=since(flushStart);submitFlushNanos+=ns;if(currentFrame)currentFrame->flush+=ns;}
-   {Measure measure{objectNanos};
+   {Measure measure{objectNanos,SubPhase::objects};
     if(!commandPool){VkCommandPoolCreateInfo pi{};pi.sType=VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;pi.queueFamilyIndex=family;check(CreateCommandPool(device,&pi,nullptr,&commandPool));++reuseCounts.commandPools;++submitObjectCreates;++submitPoolCreates;
      VkCommandBufferAllocateInfo ai{};ai.sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;ai.commandPool=commandPool;ai.level=VK_COMMAND_BUFFER_LEVEL_PRIMARY;ai.commandBufferCount=1;
      check(AllocateCommandBuffers(device,&ai,&command));++reuseCounts.commandBuffers;++submitObjectCreates;++submitPoolCreates;
@@ -1343,9 +1344,9 @@ public:
    }
    VkCommandBuffer cmd=command;VkQueryPool timestamps=queryPool;VkFence fence=submitFence;
    auto recordStart=std::chrono::steady_clock::now();uint64_t recordObjects=objectNanos;
-   VkCommandBufferBeginInfo bi{};bi.sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;bi.flags=VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;check(BeginCommandBuffer(cmd,&bi));
+   VkCommandBufferBeginInfo bi{};bi.sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;bi.flags=VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;{PhaseTimer phase(SubPhase::cmdBegin);check(BeginCommandBuffer(cmd,&bi));}
    if(timestamps){CmdResetQueryPool(cmd,timestamps,0,2);CmdWriteTimestamp(cmd,VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,timestamps,0);}
-   auto pb=[&](auto &&...a){if(currentFrame)++currentFrame->pipelineBarriers;CmdPipelineBarrier(cmd,a...);};
+   auto pb=[&](auto &&...a){if(currentFrame)++currentFrame->pipelineBarriers;{PhaseTimer phase(SubPhase::barriers);CmdPipelineBarrier(cmd,a...);}};
    VkMemoryBarrier barrier{};barrier.sType=VK_STRUCTURE_TYPE_MEMORY_BARRIER;barrier.srcAccessMask=VK_ACCESS_HOST_WRITE_BIT;barrier.dstAccessMask=VK_ACCESS_MEMORY_READ_BIT|VK_ACCESS_MEMORY_WRITE_BIT;
    pb(VK_PIPELINE_STAGE_HOST_BIT,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,0,1,&barrier,0,nullptr,0,nullptr);
    // Merged runs contain only read-only nonattachment samples, so a mip can
@@ -1389,7 +1390,7 @@ public:
    };
    // Bound each descriptor type and sets independently; grow geometrically, retain one pool.
    VkDescriptorPool submitPool{};
-   {Measure measure{objectNanos};std::vector<VkDescriptorPoolSize> sizes;uint32_t sets=0;
+   {Measure measure{objectNanos,SubPhase::objects};std::vector<VkDescriptorPoolSize> sizes;uint32_t sets=0;
     for(size_t i=0;i<ops.size();++i){if(!ops[i].texture || !ops[i].pipeline || !draws[i].descriptorCount)continue;if(sets==4096)throw std::runtime_error("submit descriptor set bound");++sets;
      for(unsigned j=0;j<draws[i].descriptorCount;++j){auto ty=(VkDescriptorType)draws[i].descriptors[j].type;auto it=std::find_if(sizes.begin(),sizes.end(),[&](const VkDescriptorPoolSize &z){return z.type==ty;});if(it==sizes.end())sizes.push_back({ty,1});else {if(it->descriptorCount==65536)throw std::runtime_error("submit descriptor type bound");++it->descriptorCount;}}}
     if(sets>4096)throw std::runtime_error("submit descriptor set bound");
@@ -1444,7 +1445,7 @@ public:
     for(auto *sample:op.samples)readShadow(sample);readShadow(op.sourceTexture);
     if(!op.pipeline && !op.upload && !op.sourceTexture && !op.clearOnly)readShadow(op.texture);
    };
-   auto prepareImages=[&](size_t opIndex){diagnosticOp=opIndex;const auto &op=ops[opIndex];
+   auto prepareImages=[&](size_t opIndex){PhaseTimer phase(SubPhase::barriers);diagnosticOp=opIndex;const auto &op=ops[opIndex];
     for(unsigned slot=0;slot<resourceSlots;++slot)if(auto *t=op.samples[slot]){
      uint32_t base=op.sampleBase[slot],count=op.sampleCount[slot]?op.sampleCount[slot]:t->levels-base;
      if(base>=t->levels || !count || count>t->levels-base)throw std::runtime_error("sample mip range");
@@ -1491,14 +1492,14 @@ public:
      auto render=renderPass(op.pipeline,passOp?&*passOp:&op);
      VkFramebufferCreateInfo fi{};fi.sType=VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;fi.renderPass=render;
      fi.attachmentCount=used;fi.pAttachments=compactViews;fi.width=op.texture->levelWidth(op.dstLevel);fi.height=op.texture->levelHeight(op.dstLevel);fi.layers=1;VkFramebuffer frame{};
-     {Measure measure{objectNanos};auto found=std::find_if(frameCache.begin(),frameCache.end(),[&](auto c){return c.textures==targets && c.render==render && c.levels==levels;});
-      if(found!=frameCache.end())frame=found->frame;
+     {Measure measure{objectNanos,SubPhase::objects};uint64_t frameProbes=0;auto found=std::find_if(frameCache.begin(),frameCache.end(),[&](const auto &c){++frameProbes;return c.textures==targets && c.render==render && c.levels==levels;});
+      scanAdd(ScanKind::frameProbes,frameProbes);if(found!=frameCache.end())frame=found->frame;
       else {check(CreateFramebuffer(device,&fi,nullptr,&frame));++reuseCounts.frames;++submitObjectCreates;++submitFrameCreates;
        try {if(frameCache.size()<frameCacheLimit)frameCache.push_back({targets,render,levels,frame});else frames.push_back(frame);}catch(...){DestroyFramebuffer(device,frame,nullptr);throw;}}
      }
      VkRenderPassBeginInfo ri{};ri.sType=VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;ri.renderPass=render;ri.framebuffer=frame;
      ri.renderArea={{0,0},boundaryPerf && passEnd>opIndex?mergeAreas[opIndex]:VkExtent2D{op.areaWidth?op.areaWidth:op.texture->levelWidth(op.dstLevel),op.areaHeight?op.areaHeight:op.texture->levelHeight(op.dstLevel)}};ri.clearValueCount=used;ri.pClearValues=clears;
-     if(currentFrame)++currentFrame->passes;CmdBeginRenderPass(cmd,&ri,VK_SUBPASS_CONTENTS_INLINE);
+     if(currentFrame)++currentFrame->passes;{PhaseTimer phase(SubPhase::passes);CmdBeginRenderPass(cmd,&ri,VK_SUBPASS_CONTENTS_INLINE);}
      }else if(currentFrame)++currentFrame->mergedDraws;
      auto pipeline=topologyPipeline(op.pipeline,op.topology);
      if(pipeline!=boundPipeline){CmdBindPipeline(cmd,VK_PIPELINE_BIND_POINT_GRAPHICS,pipeline);boundPipeline=pipeline;}
@@ -1510,7 +1511,7 @@ public:
       VkDescriptorSetAllocateInfo sai{};sai.sType=VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;sai.descriptorPool=submitPool;sai.descriptorSetCount=1;sai.pSetLayouts=&op.pipeline->setLayout;
       bool fast=systemTranslationPolicy().submitFast;
       std::optional<std::array<BindingValue,16>> bindings;if(fast)bindings.emplace();std::array<VkWriteDescriptorSet,16> writes;
-      VkDescriptorSet set{};if(!fast){Measure measure{descriptorNanos};check(AllocateDescriptorSets(device,&sai,&set));if(systemTranslationPolicy().frameTrace)++frameCounts.descriptors;}
+      VkDescriptorSet set{};if(!fast){Measure measure{descriptorNanos,SubPhase::descriptors};check(AllocateDescriptorSets(device,&sai,&set));if(systemTranslationPolicy().frameTrace)++frameCounts.descriptors;}
       for(unsigned i=0;i<draw.descriptorCount;++i){const auto &d=draw.descriptors[i];
        VkWriteDescriptorSet write{};write.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;write.dstSet=set;write.dstBinding=d.binding;write.descriptorCount=1;write.descriptorType=(VkDescriptorType)d.type;
        VkDescriptorImageInfo image{};VkDescriptorBufferInfo buffer{};
@@ -1534,9 +1535,9 @@ public:
         if(!t || (d.type==VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER && d.sampler!=UINT32_MAX && !sam) || d.format!=(uint32_t)t->vkFormat)throw std::runtime_error("planned texture format mismatch");
         VkImageViewCreateInfo vi{};vi.sType=VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;vi.image=t->image;vi.viewType=viewTypeFor(t->textureType);vi.format=(VkFormat)d.format;vi.components={(VkComponentSwizzle)d.components[0],(VkComponentSwizzle)d.components[1],(VkComponentSwizzle)d.components[2],(VkComponentSwizzle)d.components[3]};uint32_t base=op.sampleBase[d.slot],count=op.sampleCount[d.slot]?op.sampleCount[d.slot]:t->levels-base;vi.subresourceRange={VK_IMAGE_ASPECT_COLOR_BIT,base,count,0,1};
         VkImageView view{};
-        {Measure measure{objectNanos};std::array<uint32_t,4> components{d.components[0],d.components[1],d.components[2],d.components[3]};
-         auto found=std::find_if(viewCache.begin(),viewCache.end(),[&](const auto &c){return c.texture==t && c.format==vi.format && c.components==components && c.base==base && c.count==count;});
-         if(found!=viewCache.end())view=found->view;
+        {Measure measure{objectNanos,SubPhase::objects};std::array<uint32_t,4> components{d.components[0],d.components[1],d.components[2],d.components[3]};
+         uint64_t viewProbes=0;auto found=std::find_if(viewCache.begin(),viewCache.end(),[&](const auto &c){++viewProbes;return c.texture==t && c.format==vi.format && c.components==components && c.base==base && c.count==count;});
+         scanAdd(ScanKind::viewProbes,viewProbes);if(found!=viewCache.end())view=found->view;
          else {check(CreateImageView(device,&vi,nullptr,&view));++reuseCounts.views;++submitObjectCreates;++submitViewCreates;
           try {if(viewCache.size()<viewCacheLimit)viewCache.push_back({t,vi.format,components,base,count,view});else sampleViews.push_back(view);}catch(...){DestroyImageView(device,view,nullptr);throw;}}
          }image={d.type==VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER && sam?sam->sampler:VK_NULL_HANDLE,view,sampleGeneral(opIndex,d.slot)?VK_IMAGE_LAYOUT_GENERAL:VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};write.pImageInfo=&image;
@@ -1545,10 +1546,11 @@ public:
 #endif
        }else {auto b=op.buffers[d.stages==1?0:1][d.slot];if(!b.buffer || !d.range || d.offset>((b.length()+15)&~size_t(15)) || d.range>((b.length()+15)&~size_t(15))-d.offset)throw std::runtime_error("planned buffer range mismatch");buffer={b.buffer->buffer,d.offset,d.range};write.pBufferInfo=&buffer;}
        if(fast){auto &value=(*bindings)[i];value={d.binding,d.type,image,buffer};writes[i]=write;writes[i].pImageInfo=write.pImageInfo?&value.image:nullptr;writes[i].pBufferInfo=write.pBufferInfo?&value.buffer:nullptr;}
-       else {Measure measure{descriptorNanos};UpdateDescriptorSets(device,1,&write,0,nullptr);}
+       else {Measure measure{descriptorNanos,SubPhase::descriptors};UpdateDescriptorSets(device,1,&write,0,nullptr);}
       }
-      if(fast){Measure measure{descriptorNanos};uint64_t hash=0xcbf29ce484222325ull;for(unsigned i=0;i<draw.descriptorCount;++i){auto &v=(*bindings)[i];for(uint64_t x:{uint64_t(v.binding)<<32|v.type,uint64_t(uintptr_t(v.image.sampler)),uint64_t(uintptr_t(v.image.imageView))^uint64_t(v.image.imageLayout)<<56,uint64_t(uintptr_t(v.buffer.buffer)),uint64_t(v.buffer.offset),uint64_t(v.buffer.range)})hash=(hash^x)*0x100000001b3ull;}hash^=uint64_t(uintptr_t(op.pipeline->setLayout));
-       auto found=std::find_if(boundSets.begin(),boundSets.end(),[&](const auto &entry){return entry.hash==hash && entry.layout==op.pipeline->setLayout && entry.count==draw.descriptorCount && std::equal(bindings->begin(),bindings->begin()+draw.descriptorCount,entry.bindings.begin());});
+      if(fast){Measure measure{descriptorNanos,SubPhase::descriptors};uint64_t probes=0,compares=0,hash=0xcbf29ce484222325ull;for(unsigned i=0;i<draw.descriptorCount;++i){auto &v=(*bindings)[i];for(uint64_t x:{uint64_t(v.binding)<<32|v.type,uint64_t(uintptr_t(v.image.sampler)),uint64_t(uintptr_t(v.image.imageView))^uint64_t(v.image.imageLayout)<<56,uint64_t(uintptr_t(v.buffer.buffer)),uint64_t(v.buffer.offset),uint64_t(v.buffer.range)})hash=(hash^x)*0x100000001b3ull;}hash^=uint64_t(uintptr_t(op.pipeline->setLayout));
+       auto found=std::find_if(boundSets.begin(),boundSets.end(),[&](const auto &entry){++probes;return entry.hash==hash && (++compares,true) && entry.layout==op.pipeline->setLayout && entry.count==draw.descriptorCount && std::equal(bindings->begin(),bindings->begin()+draw.descriptorCount,entry.bindings.begin());});
+       scanAdd(ScanKind::boundSetProbes,probes);scanAdd(ScanKind::boundSetCompares,compares);scanMax(ScanKind::boundSetMax,boundSets.size());
        if(found!=boundSets.end())set=found->set;
        else {check(AllocateDescriptorSets(device,&sai,&set));if(systemTranslationPolicy().frameTrace)++frameCounts.descriptors;
         for(unsigned i=0;i<draw.descriptorCount;++i)writes[i].dstSet=set;UpdateDescriptorSets(device,draw.descriptorCount,writes.data(),0,nullptr);
@@ -1557,10 +1559,10 @@ public:
       }
       if(set!=boundSet || op.pipeline->layout!=boundLayout){CmdBindDescriptorSets(cmd,VK_PIPELINE_BIND_POINT_GRAPHICS,op.pipeline->layout,0,1,&set,0,nullptr);boundSet=set;boundLayout=op.pipeline->layout;}
      }
-     for(unsigned i=0;i<draw.pushCount;++i){auto &w=draw.pushes[i];CmdPushConstants(cmd,op.pipeline->layout,w.stages,w.offset,w.size,w.bytes);}
+     {PhaseTimer phase(SubPhase::record);for(unsigned i=0;i<draw.pushCount;++i){auto &w=draw.pushes[i];CmdPushConstants(cmd,op.pipeline->layout,w.stages,w.offset,w.size,w.bytes);}
      for(unsigned i=0;i<draw.vertexCount;++i){auto b=op.buffers[0][draw.vertexSlots[i]].buffer;VkDeviceSize offset=draw.vertexOffsets[i];CmdBindVertexBuffers(cmd,draw.vertexBindings[i],1,&b->buffer,&offset);}
-     if(draw.indexed){CmdBindIndexBuffer(cmd,op.indices->buffer,draw.indexOffset,op.indexWidth==2?VK_INDEX_TYPE_UINT16:VK_INDEX_TYPE_UINT32);CmdDrawIndexed(cmd,draw.count,1,draw.first,0,0);}else CmdDraw(cmd,draw.count,1,draw.first,0);
-     if(opIndex==passEnd)CmdEndRenderPass(cmd);
+     if(draw.indexed){CmdBindIndexBuffer(cmd,op.indices->buffer,draw.indexOffset,op.indexWidth==2?VK_INDEX_TYPE_UINT16:VK_INDEX_TYPE_UINT32);CmdDrawIndexed(cmd,draw.count,1,draw.first,0,0);}else CmdDraw(cmd,draw.count,1,draw.first,0);}
+     if(opIndex==passEnd){PhaseTimer phase(SubPhase::passes);CmdEndRenderPass(cmd);}
     } else if(op.texture && op.clearOnly && ((op.areaWidth && op.areaWidth!=op.texture->levelWidth(op.dstLevel)) || (op.areaHeight && op.areaHeight!=op.texture->levelHeight(op.dstLevel)))) {
      // Empty partial passes still execute Metal load/store over the chosen area.
      // A render pass CLEAR obeys renderArea; vkCmdClearColorImage cannot do so.
@@ -1576,7 +1578,7 @@ public:
      VkFramebuffer frame{};check(CreateFramebuffer(device,&fi,nullptr,&frame));try{frames.push_back(frame);}catch(...){DestroyFramebuffer(device,frame,nullptr);throw;}
      ++reuseCounts.frames;++submitObjectCreates;++submitFrameCreates;
      VkRenderPassBeginInfo ri{};ri.sType=VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;ri.renderPass=render;ri.framebuffer=frame;ri.renderArea={{0,0},{op.areaWidth?op.areaWidth:fi.width,op.areaHeight?op.areaHeight:fi.height}};ri.clearValueCount=used;ri.pClearValues=clears;
-     if(currentFrame)++currentFrame->passes;CmdBeginRenderPass(cmd,&ri,VK_SUBPASS_CONTENTS_INLINE);CmdEndRenderPass(cmd);
+     if(currentFrame)++currentFrame->passes;{PhaseTimer phase(SubPhase::passes);CmdBeginRenderPass(cmd,&ri,VK_SUBPASS_CONTENTS_INLINE);CmdEndRenderPass(cmd);}
      for(unsigned i=0;i<op.colorCount;++i){auto c=op.color(i);if(c.texture)c.texture->setDefined(c.level,c.store && (c.load==2 || (c.load==1 && c.texture->isDefined(c.level))));}
     } else if(op.texture && op.clearOnly) {
      for(unsigned i=0;i<op.colorCount;++i){auto c=op.color(i);auto *t=c.texture;if(!t)continue;
@@ -1628,7 +1630,7 @@ public:
    barrier.srcAccessMask=VK_ACCESS_MEMORY_WRITE_BIT;barrier.dstAccessMask=VK_ACCESS_HOST_READ_BIT;
    pb(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,VK_PIPELINE_STAGE_HOST_BIT,0,1,&barrier,0,nullptr,0,nullptr);
    if(timestamps)CmdWriteTimestamp(cmd,VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,timestamps,1);
-   check(EndCommandBuffer(cmd));
+   {PhaseTimer phase(SubPhase::cmdEnd);check(EndCommandBuffer(cmd));}
    auto recordNS=since(recordStart)-(objectNanos-recordObjects)-descriptorNanos;
    submitRecordNanos+=recordNS;
    if(timing){timing->record+=recordNS;timing->desc+=descriptorNanos;}
@@ -1645,7 +1647,7 @@ public:
 #endif
    auto submitToQueue=[&]{
     auto start=FrameClock::now();
-    check(frameKernelCall([&]{return QueueSubmit(queue,1,&si,fence);}));
+    {PhaseTimer phase(SubPhase::queueSubmit);check(frameKernelCall([&]{return QueueSubmit(queue,1,&si,fence);}));}
     if(currentFrame){++currentFrame->queueSubmits;currentFrame->queueSubmit+=frameNanos(start);}
     if(cpuTiming)cpuTiming->backendCPU+=frameCPUDelta(backendCPU,frameThreadCPU());
     if(currentFrame)currentFrame->backendSubmit+=frameNanos(locked);
@@ -1655,9 +1657,9 @@ public:
    auto waitStart=currentFrame?FrameClock::now():FrameClock::time_point{}; // Lavapipe can JIT a generic CA shader on its submission worker. The
    // offline qualifier may extend only its host wait; production stays 2 s.
 #if defined(FUXI_MTL_HOST_TEST) && defined(FUXI_MTL_HOST_FENCE_NS)
-   check(WaitForFences(device,1,&fence,VK_TRUE,FUXI_MTL_HOST_FENCE_NS));
+   {PhaseTimer phase(SubPhase::fence);check(WaitForFences(device,1,&fence,VK_TRUE,FUXI_MTL_HOST_FENCE_NS));}
 #else
-   check(WaitForFences(device,1,&fence,VK_TRUE,2000000000ULL));
+   {PhaseTimer phase(SubPhase::fence);check(WaitForFences(device,1,&fence,VK_TRUE,2000000000ULL));}
 #endif
    if(currentFrame)currentFrame->gpuWait+=frameNanos(waitStart);
    submitted=false;completed=true;submitWaitNanos+=since(submitQueued);auto submitDone=std::chrono::steady_clock::now();
@@ -1697,9 +1699,9 @@ public:
     if(*retired)return;*retired=true;
     auto waitStart=FrameClock::now();VkResult result;
 #if defined(FUXI_MTL_HOST_TEST) && defined(FUXI_MTL_HOST_FENCE_NS)
-    result=WaitForFences(device,1,&fence,VK_TRUE,FUXI_MTL_HOST_FENCE_NS);
+    {PhaseTimer phase(SubPhase::fence);result=WaitForFences(device,1,&fence,VK_TRUE,FUXI_MTL_HOST_FENCE_NS);}
 #else
-    result=WaitForFences(device,1,&fence,VK_TRUE,2000000000ULL);
+    {PhaseTimer phase(SubPhase::fence);result=WaitForFences(device,1,&fence,VK_TRUE,2000000000ULL);}
 #endif
     if(currentFrame)currentFrame->gpuWait+=frameNanos(waitStart);
     auto lockStart=FrameClock::now();std::lock_guard<std::mutex> lock(mutex);

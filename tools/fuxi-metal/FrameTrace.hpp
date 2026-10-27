@@ -52,7 +52,25 @@ struct FrameCounts {uint64_t pipelines=0,descriptors=0,allocations=0;};
 inline thread_local FrameCounts frameCounts;
 enum class MergeSplit : size_t {none,encoder,attachments,area,actions,attachmentSample,storage,shadow,fetch,nonDraw,bufferAlias,count};
 inline constexpr const char *mergeSplitNames[]={"none","encoder","attachments","area","actions","attachment_sample","storage","shadow","fetch","non_draw","buffer_alias"};
+// Exclusive per-phase wall time (nested phases pause their parent). Encode phases cover the frontend entry-point families on the calling thread and
+// are drained into the sample at commit; submit phases accumulate into the current sample. Disabled (no clock reads) unless frame tracing is on.
+enum class EncPhase : size_t {encBegin,encEnd,pipeline,texSamp,bufBytes,state,draw,blit,newBuffer,newTexture,iosurface,newOther,cbMisc,count};
+inline constexpr const char *encPhaseNames[]={"enc_begin","enc_end","set_pipeline","set_tex_samp","set_buf_bytes","set_state","draw","blit","new_buffer","new_texture","iosurface","new_other","cb_misc"};
+enum class SubPhase : size_t {other,cmdBegin,cmdEnd,objects,descriptors,passes,barriers,record,queueSubmit,fence,count};
+inline constexpr const char *subPhaseNames[]={"other","cmd_begin","cmd_end","objects","descriptors","passes","barriers","record","queue_submit","fence"};
+// Per-frame probe counts of per-draw linear structures: bound-set entries visited, full binding compares, view-cache entries visited, use-list entries visited, frame-cache entries visited.
+enum class ScanKind : size_t {boundSetProbes,boundSetCompares,viewProbes,useProbes,frameProbes,boundSetMax,count};
+inline constexpr const char *scanKindNames[]={"bound_set_probes","bound_set_compares","view_probes","use_list_probes","frame_probes","bound_set_max"};
+inline uint64_t phaseNow() {
+#if defined(__APPLE__) && !defined(FUXI_MTL_HOST_TEST)
+ static const mach_timebase_info_data_t base=[]{mach_timebase_info_data_t b{};mach_timebase_info(&b);return b;}();
+ return mach_absolute_time()*base.numer/base.denom;
+#else
+ return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+#endif
+}
 struct FrameSample {
+ std::array<uint64_t,size_t(EncPhase::count)> encNs{},encCalls{};std::array<uint64_t,size_t(SubPhase::count)> subNs{},subCalls{};std::array<uint64_t,size_t(ScanKind::count)> scans{};
  uint64_t backendCPU=0,frontendCPU=0,frontendWall=0,frontendDraw=0,frontendDrawSamples=0;
  uint64_t cpuSampledSubmits=0,cpuOmittedSubmits=0;
  uint64_t pipe=0,desc=0,record=0,kernelIO=0;
@@ -80,6 +98,32 @@ struct FrameSample {
  uint64_t draws=0,passes=0,gpuSamples=0;FrameCounts counts{};unsigned cpu=4096;bool encodeCountsUnknown=false;
 };
 inline thread_local FrameSample *currentFrame=nullptr;
+struct EncAccum {std::array<uint64_t,size_t(EncPhase::count)> ns{},calls{};};
+inline thread_local EncAccum encAccum;
+inline void scanAdd(ScanKind k,uint64_t n){if(currentFrame)currentFrame->scans[size_t(k)]+=n;}
+inline void scanMax(ScanKind k,uint64_t n){if(currentFrame && currentFrame->scans[size_t(k)]<n)currentFrame->scans[size_t(k)]=n;}
+class PhaseTimer {
+ uint64_t *ns=nullptr,*calls=nullptr;PhaseTimer *previous=nullptr;uint64_t resume=0;
+ inline static thread_local PhaseTimer *active=nullptr;
+ void begin(uint64_t *n,uint64_t *c){
+#ifndef FUXI_MTL_NO_PHASES
+  ns=n;calls=c;uint64_t now=phaseNow();previous=active;if(previous)*previous->ns+=now-previous->resume;resume=now;active=this;
+#else
+  (void)n;(void)c;
+#endif
+ }
+public:
+ explicit PhaseTimer(EncPhase p){if(systemTranslationPolicy().frameTrace)begin(&encAccum.ns[size_t(p)],&encAccum.calls[size_t(p)]);}
+ explicit PhaseTimer(SubPhase p){if(auto *f=currentFrame)begin(&f->subNs[size_t(p)],&f->subCalls[size_t(p)]);}
+ ~PhaseTimer(){
+#ifndef FUXI_MTL_NO_PHASES
+  if(!ns)return;uint64_t now=phaseNow();*ns+=now-resume;++*calls;active=previous;if(previous)previous->resume=now;
+#endif
+ }
+ PhaseTimer(const PhaseTimer &)=delete;
+ PhaseTimer &operator=(const PhaseTimer &)=delete;
+};
+inline void drainEncodePhases(FrameSample &s){s.encNs=encAccum.ns;s.encCalls=encAccum.calls;encAccum={};}
 struct FrameTraceScope {
  FrameSample *previous;
  explicit FrameTraceScope(FrameSample *sample):previous(currentFrame){currentFrame=sample;}
@@ -187,6 +231,25 @@ public:
   for(size_t i=0;i<n;++i)scratch[i]=samples[i].*field;
   std::sort(scratch.begin(),scratch.begin()+n);return scratch[(n*percent+99)/100-1];
  }
+ template<size_t N> void phaseLine(FILE *out,const char *title,const char *const (&names)[N],std::array<uint64_t,N> FrameSample::*ns,std::array<uint64_t,N> FrameSample::*calls) {
+  size_t n=size_t(std::min<uint64_t>(count,capacity));if(!n)return;
+  bool any=false;for(size_t k=0;k<n && !any;++k)for(size_t i=0;i<N;++i)any|=(samples[k].*calls)[i]!=0;if(!any)return;
+  char line[640];int len=snprintf(line,sizeof line,"FUXI MTL: %s n=%zu (avg/max ms/frame/calls)",title,n);
+  for(size_t i=0;i<N && len>=0 && len<380;++i){
+   uint64_t sum=0,max=0,c=0;for(size_t k=0;k<n;++k){uint64_t v=(samples[k].*ns)[i];sum+=v;max=std::max(max,v);c+=(samples[k].*calls)[i];}
+   if(!c)continue;len+=snprintf(line+len,sizeof line-size_t(len)," %s=%.2f/%.2f/%.1f",names[i],sum/double(n)/1e6,max/1e6,c/double(n));
+  }
+  if(len>399)len=399;line[len]=0;fprintf(out,"%s\n",line);
+ }
+ void reportPhases(FILE *out) {
+  phaseLine(out,"encode phases",encPhaseNames,&FrameSample::encNs,&FrameSample::encCalls);
+  phaseLine(out,"submit phases",subPhaseNames,&FrameSample::subNs,&FrameSample::subCalls);
+  size_t n=size_t(std::min<uint64_t>(count,capacity));if(!n)return;
+  char line[400];int len=snprintf(line,sizeof line,"FUXI MTL: scan counts n=%zu (avg/frame, max for bound_set_max)",n);
+  for(size_t i=0;i<size_t(ScanKind::count) && len>0 && len<360;++i){uint64_t sum=0,max=0;for(size_t k=0;k<n;++k){sum+=samples[k].scans[i];max=std::max(max,samples[k].scans[i]);}
+   len+=snprintf(line+len,sizeof line-size_t(len)," %s=%.1f",scanKindNames[i],i==size_t(ScanKind::boundSetMax)?double(max):sum/double(n));}
+  if(len>399)len=399;line[len]=0;fprintf(out,"%s\n",line);
+ }
  void report(FILE *out=stderr) {
   auto p=[&](uint64_t FrameSample::*field,unsigned percent){return percentile(field,percent)/1e6;};
   double n=count?double(count):1;
@@ -227,6 +290,7 @@ public:
   stage("pipe_cpu",&FrameSample::pipeCPU);stage("desc_cpu",&FrameSample::descCPU);stage("record_cpu",&FrameSample::recordCPU);stage("flush_cpu",&FrameSample::flushCPU);stage("kernel_io_cpu",&FrameSample::kernelIOCPU);stage("queue_submit_cpu",&FrameSample::queueSubmitCPU);
   fprintf(out," cpu_sampled_submits/frame=%.2f cpu_omitted_submits/frame=%.2f",totals.cpuSampledSubmits/n,totals.cpuOmittedSubmits/n);
   fputc('\n',out);
+  reportPhases(out);
   funlockfile(out);
   count=wallMax=draws=passes=encodeUnknown=gpuUnavailable=mergedDraws=0;mergeSplits.fill(0);counts={};totals={};cpus.fill(0);cadence.fill(0);
  }

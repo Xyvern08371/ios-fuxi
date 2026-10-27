@@ -18,5 +18,6 @@ int main(){
  for(unsigned i=0;i<100;++i){FrameSample s;{FrameTraceScope scope(&s);b.submit(ops);}window.add(s);}
  auto sets=frameCounts.descriptors-sb;
  printf("CA_BENCH draws=%zu median_submit_ms=%.3f p90=%.3f passes/frame=%.1f image_barriers/frame=%.1f sets/frame=%.1f\n",ops.size(),window.percentile(&FrameSample::backendSubmit,50)/1e6,window.percentile(&FrameSample::backendSubmit,90)/1e6,double(window.percentile(&FrameSample::passes,50)),double(window.percentile(&FrameSample::imageBarriers,50)),sets/100.0);
+ if(getenv("CA_BENCH_REPORT"))window.report(stdout);
  for(auto *t:pool)b.destroy(t);for(auto *t:targets)b.destroy(t);b.destroy(p);b.dropPipelineCacheForTest();b.destroy(sam);b.destroy(data);b.close();
 }
