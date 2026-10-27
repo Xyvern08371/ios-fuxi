@@ -103,7 +103,7 @@ struct Operation {
  Buffer *src, *dst; size_t from, to, size; uint8_t value;
  Texture *texture{};Pipeline *pipeline{};float clear[4]{};bool renderDraw=false;
  Texture *sourceTexture{};Sampler *sampler{};uint32_t vertices=3;bool upload=false,clearOnly=false;
- uint32_t srcX{},srcY{},dstX{},dstY{},width{},height{};size_t rowBytes{};
+ uint32_t srcX{},srcY{},dstX{},dstY{},width{},height{};size_t rowBytes{};uint32_t srcZ{},dstZ{},depth{};size_t imageBytes{};
  Texture *samples[resourceSlots]{};Sampler *samplers[resourceSlots]{};BufferBind buffers[2][resourceSlots]{};Buffer *indices{};uint64_t indexOffset{};uint32_t first{},load=2,store=1,indexWidth=2;Topology topology=Topology::Triangle;
  VkViewport viewport{0,256,256,-256,0,1};VkRect2D scissor{{0,0},{256,256}};
  // Metal renderTargetWidth/Height: the pass's top-left render area; 0 means the whole target.
@@ -583,17 +583,20 @@ public:
   }catch(...) {guard.unlock();destroy(t);throw;}
  }
  static size_t texelBytes(uint32_t f){return metalTexelBytes(f);}
+ // MTLTextureType 0 is 1D, 2 is 2D and 7 is 3D; the sampled view must match the SPIR-V Dim the translator declares.
+ static VkImageType imageTypeFor(uint32_t type){return type==0?VK_IMAGE_TYPE_1D:type==7?VK_IMAGE_TYPE_3D:VK_IMAGE_TYPE_2D;}
+ static VkImageViewType viewTypeFor(uint32_t type){return type==0?VK_IMAGE_VIEW_TYPE_1D:type==7?VK_IMAGE_VIEW_TYPE_3D:VK_IMAGE_VIEW_TYPE_2D;}
  static VkFormat pixelFormat(uint32_t f) {
   switch(f){case 23:return VK_FORMAT_R16_UINT;case 25:return VK_FORMAT_R16_SFLOAT;case 43:return VK_FORMAT_A1R5G5B5_UNORM_PACK16;case 55:return VK_FORMAT_R32_SFLOAT;case 105:return VK_FORMAT_R32G32_SFLOAT;case 94:return VK_FORMAT_A2R10G10B10_UNORM_PACK32;case 80:return VK_FORMAT_B8G8R8A8_UNORM;case 81:return VK_FORMAT_B8G8R8A8_SRGB;case 70:return VK_FORMAT_R8G8B8A8_UNORM;case 115:return VK_FORMAT_R16G16B16A16_SFLOAT;case 10:case 1:return VK_FORMAT_R8_UNORM;case 30:return VK_FORMAT_R8G8_UNORM;default:throw std::runtime_error("unsupported pixel format");}
  }
- Texture *allocateTexture(uint32_t format=80,uint32_t usage=5,uint32_t width=256,uint32_t height=256,uint32_t levels=1,uint32_t type=2) {
+ Texture *allocateTexture(uint32_t format=80,uint32_t usage=5,uint32_t width=256,uint32_t height=256,uint32_t levels=1,uint32_t type=2,uint32_t depth=1) {
   std::unique_lock<std::mutex> guard(mutex);requireLive();
-  return allocateTextureUnlocked(format,usage,width,height,levels,type);
+  return allocateTextureUnlocked(format,usage,width,height,levels,type,depth);
  }
- Texture *allocateTextureUnlocked(uint32_t format,uint32_t usage,uint32_t width,uint32_t height,uint32_t levels=1,uint32_t type=2) {
-  if(!textureShapeAccepted(type,height,usage))throw std::runtime_error("texture dimension/usage");
+ Texture *allocateTextureUnlocked(uint32_t format,uint32_t usage,uint32_t width,uint32_t height,uint32_t levels=1,uint32_t type=2,uint32_t depth=1) {
+  if(!textureShapeAccepted(type,height,usage,depth,levels))throw std::runtime_error("texture dimension/usage");
   if(!levels || levels>mipCount(width,height))throw std::runtime_error("texture mip count");
-  if(!limits.extent(width,height,texelBytes(format)))throw std::runtime_error("texture extent/bytes outside device limit");
+  if(!limits.extent(width,height,texelBytes(format)) || !limits.volume(width,height,depth,texelBytes(format)))throw std::runtime_error("texture extent/bytes outside device limit");
   if((usage&~21u) || format==81 || (format==1 && ((usage&4) || !usage)))throw std::runtime_error("unsupported texture usage/sRGB/A8 attachment");
   usage=(usage&5)?usage&5:(format==1?1:5);
   if(format==1 && (usage&4))throw std::runtime_error("A8 attachment");
@@ -602,18 +605,18 @@ public:
   if(usage&1)needed|=VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT;
   if(usage&4)needed|=VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT;
   if((features.optimalTilingFeatures&needed)!=needed)throw std::runtime_error("texture format features unavailable");
-  auto *t=new Texture{};t->width=width;t->height=height;t->levels=levels;t->textureType=type;t->format=format;t->vkFormat=pixelFormat(format);
+  auto *t=new Texture{};t->width=width;t->height=height;t->depth=depth;t->levels=levels;t->textureType=type;t->format=format;t->vkFormat=pixelFormat(format);
   t->blendable=features.optimalTilingFeatures&VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT;t->filterable=features.optimalTilingFeatures&VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT;
   t->canGenerate=(features.optimalTilingFeatures&(VK_FORMAT_FEATURE_BLIT_SRC_BIT|VK_FORMAT_FEATURE_BLIT_DST_BIT|VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT))==(VK_FORMAT_FEATURE_BLIT_SRC_BIT|VK_FORMAT_FEATURE_BLIT_DST_BIT|VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT);
   try {
-   VkImageCreateInfo ii{};ii.sType=VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;ii.imageType=type==0?VK_IMAGE_TYPE_1D:VK_IMAGE_TYPE_2D;ii.format=t->vkFormat;
-   ii.extent={width,height,1};ii.mipLevels=levels;ii.arrayLayers=1;ii.samples=VK_SAMPLE_COUNT_1_BIT;ii.tiling=VK_IMAGE_TILING_OPTIMAL;
+   VkImageCreateInfo ii{};ii.sType=VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;ii.imageType=imageTypeFor(type);ii.format=t->vkFormat;
+   ii.extent={width,height,depth};ii.mipLevels=levels;ii.arrayLayers=1;ii.samples=VK_SAMPLE_COUNT_1_BIT;ii.tiling=VK_IMAGE_TILING_OPTIMAL;
    ii.usage=(orderedColorAccess && (usage&4)?VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT:0)|VK_IMAGE_USAGE_TRANSFER_SRC_BIT|VK_IMAGE_USAGE_TRANSFER_DST_BIT|(usage&4?VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT:0)|(usage&1?VK_IMAGE_USAGE_SAMPLED_BIT:0);
    if(GetPhysicalDeviceImageFormatProperties2){
     VkPhysicalDeviceImageFormatInfo2 query{};query.sType=VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_FORMAT_INFO_2;query.format=ii.format;query.type=ii.imageType;query.tiling=ii.tiling;query.usage=ii.usage;
     VkImageFormatProperties2 supported{};supported.sType=VK_STRUCTURE_TYPE_IMAGE_FORMAT_PROPERTIES_2;
     check(GetPhysicalDeviceImageFormatProperties2(physical,&query,&supported));const auto &limit=supported.imageFormatProperties;
-    if(width>limit.maxExtent.width || height>limit.maxExtent.height || levels>limit.maxMipLevels || !(limit.sampleCounts&VK_SAMPLE_COUNT_1_BIT))throw std::runtime_error("texture image format limits unavailable");
+    if(width>limit.maxExtent.width || height>limit.maxExtent.height || depth>limit.maxExtent.depth || levels>limit.maxMipLevels || !(limit.sampleCounts&VK_SAMPLE_COUNT_1_BIT))throw std::runtime_error("texture image format limits unavailable");
    }
    t->usage=ii.usage;check(CreateImage(device,&ii,nullptr,&t->image));VkMemoryRequirements req{};GetImageMemoryRequirements(device,t->image,&req);t->allocated=req.size;
    uint32_t memoryType=0;while(memoryType<memory.memoryTypeCount && (!(req.memoryTypeBits&(1u<<memoryType)) || !(memory.memoryTypes[memoryType].propertyFlags&VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)))++memoryType;
@@ -630,7 +633,7 @@ public:
     check(result);if(systemTranslationPolicy().frameTrace)++frameCounts.allocations;++liveMemoryObjects;liveMemoryBytes+=ai.allocationSize;
    }
    t->memoryBytes=ai.allocationSize;check(frameKernelCall([&]{return BindImageMemory(device,t->image,t->memory,0);}));
-   VkImageViewCreateInfo vi{};vi.sType=VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;vi.image=t->image;vi.viewType=t->textureType==0?VK_IMAGE_VIEW_TYPE_1D:VK_IMAGE_VIEW_TYPE_2D;vi.format=ii.format;
+   VkImageViewCreateInfo vi{};vi.sType=VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;vi.image=t->image;vi.viewType=viewTypeFor(t->textureType);vi.format=ii.format;
    vi.subresourceRange={VK_IMAGE_ASPECT_COLOR_BIT,0,levels,0,1};check(CreateImageView(device,&vi,nullptr,&t->view));t->recyclable=true;return t;
   }catch(...) {destroyTextureUnlocked(t);throw;}
  }
@@ -983,22 +986,27 @@ public:
     if(op.texture && op.texture->shadow && (op.pipeline || op.clearOnly || op.upload || op.sourceTexture || op.generateMips))throw std::runtime_error("read-only linear shadow GPU write refused");
     if(op.texture && op.dstLevel>=op.texture->levels)throw std::runtime_error("destination mip level");
     if(op.texture && op.srcLevel>=(op.sourceTexture?op.sourceTexture:op.texture)->levels)throw std::runtime_error("source mip level");
-    if(op.generateMips){if(!op.texture || !op.mipCount || op.mipBase>=op.texture->levels || op.mipCount>op.texture->levels-op.mipBase || !op.texture->canGenerate)throw std::runtime_error("mipmap generation range/format");continue;}
+    if(op.generateMips){if(!op.texture || op.texture->textureType==7 || !op.mipCount || op.mipBase>=op.texture->levels || op.mipCount>op.texture->levels-op.mipBase || !op.texture->canGenerate)throw std::runtime_error("mipmap generation range/format");continue;}
     if(!op.pipeline && op.texture && !op.clearOnly){
      auto *src=op.sourceTexture?op.sourceTexture:op.texture;auto *dst=op.texture;
      uint32_t sw=src->levelWidth(op.srcLevel),sh=src->levelHeight(op.srcLevel),dw=dst->levelWidth(op.dstLevel),dh=dst->levelHeight(op.dstLevel);
-     size_t width=op.width?op.width:(op.upload||op.sourceTexture?dw:sw),height=op.height?op.height:(op.upload||op.sourceTexture?dh:sh),pixel=texelBytes(dst->format);
+     uint32_t sd=src->levelDepth(op.srcLevel),dd=dst->levelDepth(op.dstLevel);
+     size_t width=op.width?op.width:(op.upload||op.sourceTexture?dw:sw),height=op.height?op.height:(op.upload||op.sourceTexture?dh:sh),depth=op.depth?op.depth:(op.upload||op.sourceTexture?dd:sd),pixel=texelBytes(dst->format);
      size_t row=op.rowBytes?op.rowBytes:width*pixel;
      if(!width || !height || row<width*pixel || row%pixel || row>maxBufferLength/height ||
         ((op.upload || op.sourceTexture) && (op.dstX>dw || width>dw-op.dstX || op.dstY>dh || height>dh-op.dstY)) ||
         (!op.upload && (op.srcX>sw || width>sw-op.srcX || op.srcY>sh || height>sh-op.srcY)))throw std::runtime_error("texture transfer region/stride bounds");
-     size_t bytes=(height-1)*row+width*pixel;
+     // Depth slices exist only on 3D images; 2D transfers keep depth 1 and z 0.
+     if(!depth || (op.sourceTexture && src->textureType!=dst->textureType) || ((op.upload || op.sourceTexture) && (op.dstZ>dd || depth>dd-op.dstZ)) || (!op.upload && (op.srcZ>sd || depth>sd-op.srcZ)) ||
+        (dst->textureType!=7 && (depth!=1 || op.dstZ || op.srcZ)) || (op.imageBytes && (dst->textureType!=7 || !op.rowBytes || op.imageBytes>maxBufferLength || op.imageBytes%row || op.imageBytes/row<height)))throw std::runtime_error("texture transfer depth/image stride");
+     size_t imageStride=op.imageBytes?op.imageBytes:row*height;
+     size_t bytes=(depth-1)*imageStride+(height-1)*row+width*pixel;
      if(op.sourceTexture){
       if(src->format!=dst->format)throw std::runtime_error("texture copy format mismatch");
       // Snapshot all same-image/memory copies, including disjoint rectangles and
       // view-relative mips. Never issue an overlapping vkCmdCopyImage.
       aliasCopies[n]=src==dst || src->memory==dst->memory || hostRangesOverlap(src->mapped,src->allocated,dst->mapped,dst->allocated);
-      if(aliasCopies[n])aliasBytes=std::max(aliasBytes,width*height*pixel);
+      if(aliasCopies[n])aliasBytes=std::max(aliasBytes,width*height*depth*pixel);
      }
      auto *transferBuffer=op.upload?op.src:op.sourceTexture?nullptr:op.dst;
      if(transferBuffer && (transferBuffer->memory==dst->memory || hostRangesOverlap(transferBuffer->contents,transferBuffer->length,dst->mapped,dst->allocated)))throw std::runtime_error("image/buffer transfer alias");
@@ -1416,7 +1424,7 @@ public:
         if(d.slot>=resourceSlots || (d.sampler>=resourceSlots && d.sampler!=UINT32_MAX))throw std::runtime_error("planned sample slot");auto *t=d.slot==0 && !op.samples[0]?op.sourceTexture:op.samples[d.slot];auto *sam=d.sampler==UINT32_MAX?nullptr:d.sampler==0 && !op.samplers[0]?op.sampler:op.samplers[d.sampler];
         if(d.sampler==UINT32_MAX && (d.binding>=16 || !op.pipeline->bakedSamplers[d.binding]))throw std::runtime_error("planned constexpr sampler mismatch");
         if(!t || (d.type==VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER && d.sampler!=UINT32_MAX && !sam) || d.format!=(uint32_t)t->vkFormat)throw std::runtime_error("planned texture format mismatch");
-        VkImageViewCreateInfo vi{};vi.sType=VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;vi.image=t->image;vi.viewType=t->textureType==0?VK_IMAGE_VIEW_TYPE_1D:VK_IMAGE_VIEW_TYPE_2D;vi.format=(VkFormat)d.format;vi.components={(VkComponentSwizzle)d.components[0],(VkComponentSwizzle)d.components[1],(VkComponentSwizzle)d.components[2],(VkComponentSwizzle)d.components[3]};uint32_t base=op.sampleBase[d.slot],count=op.sampleCount[d.slot]?op.sampleCount[d.slot]:t->levels-base;vi.subresourceRange={VK_IMAGE_ASPECT_COLOR_BIT,base,count,0,1};
+        VkImageViewCreateInfo vi{};vi.sType=VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;vi.image=t->image;vi.viewType=viewTypeFor(t->textureType);vi.format=(VkFormat)d.format;vi.components={(VkComponentSwizzle)d.components[0],(VkComponentSwizzle)d.components[1],(VkComponentSwizzle)d.components[2],(VkComponentSwizzle)d.components[3]};uint32_t base=op.sampleBase[d.slot],count=op.sampleCount[d.slot]?op.sampleCount[d.slot]:t->levels-base;vi.subresourceRange={VK_IMAGE_ASPECT_COLOR_BIT,base,count,0,1};
         VkImageView view{};
         {Measure measure{objectNanos};std::array<uint32_t,4> components{d.components[0],d.components[1],d.components[2],d.components[3]};
          auto found=std::find_if(viewCache.begin(),viewCache.end(),[&](auto c){return c.texture==t && c.format==vi.format && c.components==components && c.base==base && c.count==count;});
@@ -1469,31 +1477,31 @@ public:
       t->setDefined(c.level,c.store && (c.load==2 || (c.load==1 && t->isDefined(c.level))));
      }
     } else if(op.texture && op.sourceTexture) {
-     uint32_t copyWidth=op.width?op.width:op.texture->levelWidth(op.dstLevel),copyHeight=op.height?op.height:op.texture->levelHeight(op.dstLevel);
+     uint32_t copyWidth=op.width?op.width:op.texture->levelWidth(op.dstLevel),copyHeight=op.height?op.height:op.texture->levelHeight(op.dstLevel),copyDepth=op.depth?op.depth:op.texture->levelDepth(op.dstLevel);
      if(aliasCopies[opIndex]){
-      VkBufferImageCopy snapshot{};snapshot.imageOffset={(int32_t)op.srcX,(int32_t)op.srcY,0};snapshot.imageSubresource={VK_IMAGE_ASPECT_COLOR_BIT,op.srcLevel,0,1};snapshot.imageExtent={copyWidth,copyHeight,1};
+      VkBufferImageCopy snapshot{};snapshot.imageOffset={(int32_t)op.srcX,(int32_t)op.srcY,(int32_t)op.srcZ};snapshot.imageSubresource={VK_IMAGE_ASPECT_COLOR_BIT,op.srcLevel,0,1};snapshot.imageExtent={copyWidth,copyHeight,copyDepth};
       CmdCopyImageToBuffer(cmd,op.sourceTexture->image,VK_IMAGE_LAYOUT_GENERAL,aliasBuffer->buffer,1,&snapshot);
       // The source read must finish before any aliased destination clear/write.
       barrier.srcAccessMask=VK_ACCESS_TRANSFER_READ_BIT|VK_ACCESS_TRANSFER_WRITE_BIT;barrier.dstAccessMask=VK_ACCESS_TRANSFER_READ_BIT|VK_ACCESS_TRANSFER_WRITE_BIT;
       CmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_TRANSFER_BIT,0,1,&barrier,0,nullptr,0,nullptr);
      }
-     if(!op.texture->isDefined(op.dstLevel) && (op.dstX || op.dstY || (op.width && op.width!=op.texture->levelWidth(op.dstLevel)) || (op.height && op.height!=op.texture->levelHeight(op.dstLevel)))){VkClearColorValue zero{};VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT,op.dstLevel,1,0,1};CmdClearColorImage(cmd,op.texture->image,VK_IMAGE_LAYOUT_GENERAL,&zero,1,&range);
+     if(!op.texture->isDefined(op.dstLevel) && (op.dstX || op.dstY || op.dstZ || (op.width && op.width!=op.texture->levelWidth(op.dstLevel)) || (op.height && op.height!=op.texture->levelHeight(op.dstLevel)) || (op.depth && op.depth!=op.texture->levelDepth(op.dstLevel)))){VkClearColorValue zero{};VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT,op.dstLevel,1,0,1};CmdClearColorImage(cmd,op.texture->image,VK_IMAGE_LAYOUT_GENERAL,&zero,1,&range);
       barrier.srcAccessMask=VK_ACCESS_TRANSFER_WRITE_BIT;barrier.dstAccessMask=VK_ACCESS_TRANSFER_WRITE_BIT;CmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_TRANSFER_BIT,0,1,&barrier,0,nullptr,0,nullptr);}
      op.texture->setDefined(op.dstLevel);
-     VkImageCopy region{};region.srcOffset={(int32_t)op.srcX,(int32_t)op.srcY,0};region.dstOffset={(int32_t)op.dstX,(int32_t)op.dstY,0};region.srcSubresource={VK_IMAGE_ASPECT_COLOR_BIT,op.srcLevel,0,1};region.dstSubresource={VK_IMAGE_ASPECT_COLOR_BIT,op.dstLevel,0,1};region.extent={op.width?op.width:op.texture->levelWidth(op.dstLevel),op.height?op.height:op.texture->levelHeight(op.dstLevel),1};
+     VkImageCopy region{};region.srcOffset={(int32_t)op.srcX,(int32_t)op.srcY,(int32_t)op.srcZ};region.dstOffset={(int32_t)op.dstX,(int32_t)op.dstY,(int32_t)op.dstZ};region.srcSubresource={VK_IMAGE_ASPECT_COLOR_BIT,op.srcLevel,0,1};region.dstSubresource={VK_IMAGE_ASPECT_COLOR_BIT,op.dstLevel,0,1};region.extent={op.width?op.width:op.texture->levelWidth(op.dstLevel),op.height?op.height:op.texture->levelHeight(op.dstLevel),copyDepth};
      if(aliasCopies[opIndex]){
       VkBufferImageCopy snapshot{};snapshot.imageOffset=region.dstOffset;snapshot.imageSubresource=region.dstSubresource;snapshot.imageExtent=region.extent;
       CmdCopyBufferToImage(cmd,aliasBuffer->buffer,op.texture->image,VK_IMAGE_LAYOUT_GENERAL,1,&snapshot);
      }else CmdCopyImage(cmd,op.sourceTexture->image,VK_IMAGE_LAYOUT_GENERAL,op.texture->image,VK_IMAGE_LAYOUT_GENERAL,1,&region);
     } else if(op.texture && op.upload) {
-     if(!op.texture->isDefined(op.dstLevel) && (op.dstX || op.dstY || (op.width && op.width!=op.texture->levelWidth(op.dstLevel)) || (op.height && op.height!=op.texture->levelHeight(op.dstLevel)))){VkClearColorValue zero{};VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT,op.dstLevel,1,0,1};CmdClearColorImage(cmd,op.texture->image,VK_IMAGE_LAYOUT_GENERAL,&zero,1,&range);
+     if(!op.texture->isDefined(op.dstLevel) && (op.dstX || op.dstY || op.dstZ || (op.width && op.width!=op.texture->levelWidth(op.dstLevel)) || (op.height && op.height!=op.texture->levelHeight(op.dstLevel)) || (op.depth && op.depth!=op.texture->levelDepth(op.dstLevel)))){VkClearColorValue zero{};VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT,op.dstLevel,1,0,1};CmdClearColorImage(cmd,op.texture->image,VK_IMAGE_LAYOUT_GENERAL,&zero,1,&range);
       barrier.srcAccessMask=VK_ACCESS_TRANSFER_WRITE_BIT;barrier.dstAccessMask=VK_ACCESS_TRANSFER_WRITE_BIT;CmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_TRANSFER_BIT,0,1,&barrier,0,nullptr,0,nullptr);}
      op.texture->setDefined(op.dstLevel);
-     VkBufferImageCopy region{};region.bufferOffset=op.from;region.imageOffset={(int32_t)op.dstX,(int32_t)op.dstY,0};region.imageSubresource={VK_IMAGE_ASPECT_COLOR_BIT,op.dstLevel,0,1};region.imageExtent={op.width?op.width:op.texture->levelWidth(op.dstLevel),op.height?op.height:op.texture->levelHeight(op.dstLevel),1};region.bufferRowLength=op.rowBytes?op.rowBytes/texelBytes(op.texture->format):0;
+     VkBufferImageCopy region{};region.bufferOffset=op.from;region.imageOffset={(int32_t)op.dstX,(int32_t)op.dstY,(int32_t)op.dstZ};region.imageSubresource={VK_IMAGE_ASPECT_COLOR_BIT,op.dstLevel,0,1};region.imageExtent={op.width?op.width:op.texture->levelWidth(op.dstLevel),op.height?op.height:op.texture->levelHeight(op.dstLevel),op.depth?op.depth:op.texture->levelDepth(op.dstLevel)};region.bufferRowLength=op.rowBytes?op.rowBytes/texelBytes(op.texture->format):0;region.bufferImageHeight=op.imageBytes?uint32_t(op.imageBytes/op.rowBytes):0;
      CmdCopyBufferToImage(cmd,op.src->buffer,op.texture->image,VK_IMAGE_LAYOUT_GENERAL,1,&region);
     } else if(op.texture) {
      if(!op.texture->isDefined(op.srcLevel))throw std::runtime_error("undefined readback texture");
-     VkBufferImageCopy region{};region.bufferOffset=op.to;region.imageOffset={(int32_t)op.srcX,(int32_t)op.srcY,0};region.imageSubresource={VK_IMAGE_ASPECT_COLOR_BIT,op.srcLevel,0,1};region.imageExtent={op.width?op.width:op.texture->levelWidth(op.srcLevel),op.height?op.height:op.texture->levelHeight(op.srcLevel),1};region.bufferRowLength=op.rowBytes?op.rowBytes/texelBytes(op.texture->format):0;
+     VkBufferImageCopy region{};region.bufferOffset=op.to;region.imageOffset={(int32_t)op.srcX,(int32_t)op.srcY,(int32_t)op.srcZ};region.imageSubresource={VK_IMAGE_ASPECT_COLOR_BIT,op.srcLevel,0,1};region.imageExtent={op.width?op.width:op.texture->levelWidth(op.srcLevel),op.height?op.height:op.texture->levelHeight(op.srcLevel),op.depth?op.depth:op.texture->levelDepth(op.srcLevel)};region.bufferRowLength=op.rowBytes?op.rowBytes/texelBytes(op.texture->format):0;region.bufferImageHeight=op.imageBytes?uint32_t(op.imageBytes/op.rowBytes):0;
      CmdCopyImageToBuffer(cmd,op.texture->image,VK_IMAGE_LAYOUT_GENERAL,op.dst->buffer,1,&region);
     } else if(op.src) {VkBufferCopy region{op.from,op.to,op.size};CmdCopyBuffer(cmd,op.src->buffer,op.dst->buffer,1,&region);}
     else CmdFillBuffer(cmd,op.dst->buffer,op.to,op.size,uint32_t(op.value)*0x01010101u);

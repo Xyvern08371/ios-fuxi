@@ -2710,3 +2710,38 @@ artifact verification remain unavailable. All **12**
 patches are unchanged. Frame-trace definitions/tests are unchanged from
 `53ddcd8`. No device access or new device measurement, external project changes,
 vendoring, Apple/GPL code or binaries, push or workflow run occurred.
+
+
+## 3D sampled textures (backboardd GPU-gate latch, boot K164)
+
+OBSERVED (K164): backboardd requested `type=7 format=70 size=16x16x16 mips=1
+usage=0x1` (MTLTextureType3D, RGBA8Unorm, ShaderRead; probably a CoreAnimation
+colour lookup table), FuxiMetal refused it on `textureType` and the refusal
+latched the GPU gate (`next-respawn=CPU`). The swizzle in that descriptor was the
+identity (2,3,4,5) and was never the cause.
+
+Change (host-tested on lavapipe, device effect not yet observed):
+- `newTextureWithDescriptor` accepts `MTLTextureType3D` when ShaderRead only
+  (no RenderTarget), one mip, one array slice, one sample, depth within the 2D
+  device limit and `ResourceLimits::volume`. `textureShapeAccepted` gained
+  depth/levels arguments; `allocateTexture` gained a trailing `depth`.
+- Backend: `VK_IMAGE_TYPE_3D` images with depth extent, `VK_IMAGE_VIEW_TYPE_3D`
+  sampled views (`viewTypeFor`/`imageTypeFor`, also used by the descriptor path;
+  the translator-reflected `texture_type` 7 already matches `Texture::textureType`),
+  `depth` in `TextureLevels` (`levelDepth`). Sampler address mode W was already
+  mapped from `rAddressMode`. The component swizzle path is unchanged.
+- Transfers: `Operation` gained `srcZ/dstZ/depth/imageBytes` (0 = whole level
+  depth / tightly packed rows). `replaceRegion`/`getBytes` (z origin, depth,
+  bytesPerImage), buffer<->texture and texture<->texture blits carry slices;
+  Vulkan `bufferImageHeight = bytesPerImage / bytesPerRow`; alias snapshots cover
+  all slices. A 2D transfer still requires depth 1, z 0 and no image stride.
+- Still refused cleanly: 3D render targets/clears, 3D with mips or
+  `generateMipmaps`, linear (buffer-backed) 3D, IOSurface 3D, array/cube/MSAA,
+  2D<->3D copies, depth slices on 1D/2D textures, out-of-range z/depth,
+  `bytesPerImage` not a multiple of `bytesPerRow`.
+- Tests: `tools/test-fuxi-metal-m9p.py` (16x16x16 RGBA8 upload/readback tight and
+  padded, partial box, overlapping z copy, refusals; sampling a 3D texture in a
+  draw needs the external translator and was not run), plus a 3D block in
+  `BlitFrontendTests.mm` (compiles only on macOS; checked by inspection).
+- New log fields: none. Expected device evidence: no `texture reject
+  textureType 7` line and no `gate runtime-failure`; not yet observed.

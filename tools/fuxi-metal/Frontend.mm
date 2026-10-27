@@ -667,10 +667,10 @@ static bool textureValue(MTLTextureDescriptor *d,const char *field,uint64_t valu
 static bool textureDescriptorAccepted(MTLTextureDescriptor *d,uint32_t dimension) {
 #define CHECK(field,value,accepted) do {__typeof__(value) actual=(value);if(!textureValue(d,field,(uint64_t)actual,(accepted)))return false;}while(0)
  CHECK("descriptor",d,actual!=nil);
- CHECK("textureType",d.textureType,(actual==MTLTextureType2D || actual==MTLTextureType1D));
- CHECK("textureType.shapeUsage",d.textureType,fuxi::textureShapeAccepted((uint32_t)actual,(uint32_t)d.height,(uint32_t)d.usage));
+ CHECK("textureType",d.textureType,(actual==MTLTextureType2D || actual==MTLTextureType1D || actual==MTLTextureType3D));
+ CHECK("textureType.shapeUsage",d.textureType,fuxi::textureShapeAccepted((uint32_t)actual,(uint32_t)d.height,(uint32_t)d.usage,(uint32_t)d.depth,(uint32_t)d.mipmapLevelCount));
  CHECK("pixelFormat",d.pixelFormat,fuxi::textureFormatAccepted((uint32_t)actual));
- CHECK("width",d.width,actual && actual<=dimension);CHECK("height",d.height,actual && actual<=dimension);CHECK("depth",d.depth,actual==1);
+ CHECK("width",d.width,actual && actual<=dimension);CHECK("height",d.height,actual && actual<=dimension);CHECK("depth",d.depth,actual && (d.textureType==MTLTextureType3D || actual==1) && actual<=dimension);
  CHECK("mipmapLevelCount",d.mipmapLevelCount,actual && actual<=fuxi::mipCount((uint32_t)d.width,(uint32_t)d.height));CHECK("arrayLength",d.arrayLength,actual==1);CHECK("sampleCount",d.sampleCount,actual==1);CHECK("swizzle.identity",identitySwizzle(d.swizzle),actual);
  CHECK("storageMode",d.storageMode,actual==MTLStorageModePrivate || actual==MTLStorageModeShared || actual==MTLStorageModeMemoryless);CHECK("cpuCacheMode",d.cpuCacheMode,actual==MTLCPUCacheModeDefaultCache || actual==MTLCPUCacheModeWriteCombined);
  CHECK("hazardTrackingMode",d.hazardTrackingMode,actual==MTLHazardTrackingModeDefault || actual==MTLHazardTrackingModeTracked);
@@ -697,7 +697,7 @@ static bool textureDescriptorAccepted(MTLTextureDescriptor *d,uint32_t dimension
 - (id)device {CENSUS();return _device;}
 - (NSUInteger)width {CENSUS();return _texture->levelWidth(_baseLevel);}
 - (NSUInteger)height {CENSUS();return _texture->levelHeight(_baseLevel);}
-- (NSUInteger)depth {CENSUS();return 1;}
+- (NSUInteger)depth {CENSUS();return _texture->levelDepth(_baseLevel);}
 - (NSUInteger)arrayLength {CENSUS();return 1;}
 - (NSUInteger)protectionOptions {CENSUS();return 0;}
 - (NSUInteger)mipmapLevelCount {CENSUS();return _levelCount?_levelCount:_texture->levels;}
@@ -743,9 +743,10 @@ static bool textureDescriptorAccepted(MTLTextureDescriptor *d,uint32_t dimension
  if(level>=[self mipmapLevelCount])invalid(@"texture CPU mip level");
  uint32_t absolute=_baseLevel+(uint32_t)level;
  size_t pixel=fuxi::Backend::texelBytes((uint32_t)[self pixelFormat]),width=_texture->levelWidth(absolute),height=_texture->levelHeight(absolute);
- if(!bytes || slice || r.origin.z || r.size.depth!=1 || !r.size.width || !r.size.height ||
+ bool volume=_texture->textureType==7;size_t depth=_texture->levelDepth(absolute);
+ if(!bytes || slice || (!volume && (r.origin.z || r.size.depth!=1)) || !r.size.depth || r.origin.z>depth || r.size.depth>depth-r.origin.z || !r.size.width || !r.size.height ||
     r.origin.x>width || r.size.width>width-r.origin.x || r.origin.y>height || r.size.height>height-r.origin.y ||
-    row<r.size.width*pixel || row>SIZE_MAX/r.size.height || (image && image<row*r.size.height))invalid(@"texture CPU region/stride");
+    row<r.size.width*pixel || row>SIZE_MAX/r.size.height || (image && image<row*r.size.height) || (r.size.depth>1 && image>SIZE_MAX/r.size.depth))invalid(@"texture CPU region/stride");
  auto *backend=owner(_device)->backend;fuxi::Buffer *staging=nullptr;
  try {
   if(gpuScanout)backend->requireLive();
@@ -760,12 +761,14 @@ static bool textureDescriptorAccepted(MTLTextureDescriptor *d,uint32_t dimension
     if(write)memmove(buffer,cpu,r.size.width*pixel);else memmove(cpu,buffer,r.size.width*pixel);}
    return;
   }
-  staging=backend->allocate(width*height*pixel);fuxi::Operation op{};op.texture=_texture;op.srcLevel=op.dstLevel=absolute;
-  bool full=!r.origin.x && !r.origin.y && r.size.width==width && r.size.height==height;
+  staging=backend->allocate(width*height*depth*pixel);fuxi::Operation op{};op.texture=_texture;op.srcLevel=op.dstLevel=absolute;
+  // Staging is the whole level, rows then slices tightly packed; the caller's slices are image bytes apart.
+  size_t sliceStride=image?image:row*r.size.height;
+  bool full=!r.origin.x && !r.origin.y && !r.origin.z && r.size.width==width && r.size.height==height && r.size.depth==depth;
   if(!write || (!full && _texture->isDefined(absolute))){op.dst=staging;backend->submit({op});}
-  if(write){for(size_t y=0;y<r.size.height;++y)memcpy((uint8_t *)staging->contents+((r.origin.y+y)*width+r.origin.x)*pixel,(uint8_t *)bytes+y*row,r.size.width*pixel);
+  if(write){for(size_t z=0;z<r.size.depth;++z)for(size_t y=0;y<r.size.height;++y)memcpy((uint8_t *)staging->contents+(((r.origin.z+z)*height+r.origin.y+y)*width+r.origin.x)*pixel,(uint8_t *)bytes+z*sliceStride+y*row,r.size.width*pixel);
    op={};op.texture=_texture;op.srcLevel=op.dstLevel=absolute;op.src=staging;op.upload=true;backend->submit({op});
-  }else for(size_t y=0;y<r.size.height;++y)memcpy((uint8_t *)bytes+y*row,(uint8_t *)staging->contents+((r.origin.y+y)*width+r.origin.x)*pixel,r.size.width*pixel);
+  }else for(size_t z=0;z<r.size.depth;++z)for(size_t y=0;y<r.size.height;++y)memcpy((uint8_t *)bytes+z*sliceStride+y*row,(uint8_t *)staging->contents+(((r.origin.z+z)*height+r.origin.y+y)*width+r.origin.x)*pixel,r.size.width*pixel);
   backend->destroy(staging);
  }catch(const std::exception &e){backend->destroy(staging);invalid([NSString stringWithUTF8String:e.what()]);}
 }
@@ -1560,18 +1563,19 @@ static NSString *renderPassText(MTLRenderPassDescriptor *d){
 - (FuxiTexture *)texture:(id)t slice:(NSUInteger)s level:(NSUInteger)l origin:(MTLOrigin)o size:(MTLSize)z {FRONTEND_TIME(_command);
  if(_ended || !_command->_encoding || _command->_status!=MTLCommandBufferStatusNotEnqueued)invalid(@"inactive blit encoder");
  if(![t isKindOfClass:[FuxiTexture class]] || [t device]!=[self device])invalid(@"foreign texture/device");
- if(s || l>=[t mipmapLevelCount] || o.z || !z.width || !z.height || z.depth!=1 || o.x>std::max(NSUInteger(1),[t width]>>l) || z.width>std::max(NSUInteger(1),[t width]>>l)-o.x || o.y>std::max(NSUInteger(1),[t height]>>l) || z.height>std::max(NSUInteger(1),[t height]>>l)-o.y)invalid(@"texture copy region bounds");return t;
+ bool volume=[t textureType]==MTLTextureType3D;NSUInteger levelDepth=std::max(NSUInteger(1),[t depth]>>l);
+ if(s || l>=[t mipmapLevelCount] || (volume?(!z.depth || o.z>levelDepth || z.depth>levelDepth-o.z):(o.z || z.depth!=1)) || !z.width || !z.height || o.x>std::max(NSUInteger(1),[t width]>>l) || z.width>std::max(NSUInteger(1),[t width]>>l)-o.x || o.y>std::max(NSUInteger(1),[t height]>>l) || z.height>std::max(NSUInteger(1),[t height]>>l)-o.y)invalid(@"texture copy region bounds");return t;
 }
 - (FuxiBuffer *)imageBuffer:(id)b offset:(NSUInteger)offset row:(NSUInteger)row image:(NSUInteger)image size:(MTLSize)size pixel:(NSUInteger)pixel {FRONTEND_TIME(_command);
- if(![b isKindOfClass:[FuxiBuffer class]] || [b device]!=[self device] || row<size.width*pixel || row%pixel || row>fuxi::Backend::maxBufferLength/size.height || (image && image<row*size.height) || offset%4 || offset%pixel)invalid(@"texture buffer stride/alignment");
- size_t bytes=(size.height-1)*row+size.width*pixel;
+ if(![b isKindOfClass:[FuxiBuffer class]] || [b device]!=[self device] || row<size.width*pixel || row%pixel || row>fuxi::Backend::maxBufferLength/size.height || (image && image<row*size.height) || (size.depth>1 && (!image || image%row || image>fuxi::Backend::maxBufferLength)) || offset%4 || offset%pixel)invalid(@"texture buffer stride/alignment");
+ size_t bytes=(size.depth-1)*(size.depth>1?image:0)+(size.height-1)*row+size.width*pixel;
  if(offset>[b length] || bytes>[b length]-offset)invalid(@"texture buffer bounds");return b;
 }
 - (void)copyFromTexture:(id)t sourceSlice:(NSUInteger)s sourceLevel:(NSUInteger)l sourceOrigin:(MTLOrigin)o sourceSize:(MTLSize)z
  toBuffer:(id)b destinationOffset:(NSUInteger)offset destinationBytesPerRow:(NSUInteger)row destinationBytesPerImage:(NSUInteger)image {FRONTEND_TIME(_command);@try {CENSUS();
  FuxiTexture *src=[self texture:t slice:s level:l origin:o size:z];
  FuxiBuffer *dst=[self imageBuffer:b offset:offset row:row image:image size:z pixel:fuxi::Backend::texelBytes((uint32_t)[src pixelFormat])];
- fuxi::Operation op{};op.texture=src->_texture;op.srcLevel=src->_baseLevel+(uint32_t)l;op.dst=dst->_buffer;op.to=offset;op.srcX=o.x;op.srcY=o.y;op.width=z.width;op.height=z.height;op.rowBytes=row;
+ fuxi::Operation op{};op.texture=src->_texture;op.srcLevel=src->_baseLevel+(uint32_t)l;op.dst=dst->_buffer;op.to=offset;op.srcX=o.x;op.srcY=o.y;op.srcZ=o.z;op.width=z.width;op.height=z.height;op.depth=z.depth;op.rowBytes=row;op.imageBytes=z.depth>1?image:0;
  retainCommandResource(_command,src,false,fuxi::ShadowFullReason::blit);retainCommandResource(_command,dst,false,fuxi::ShadowFullReason::blit);_command->_ops.push_back(op);
 } @catch(NSException *e) {(void)e;[self rejectSelector:_cmd];}}
 - (void)copyFromBuffer:(id)b sourceOffset:(NSUInteger)offset sourceBytesPerRow:(NSUInteger)row sourceBytesPerImage:(NSUInteger)image
@@ -1579,16 +1583,16 @@ static NSString *renderPassText(MTLRenderPassDescriptor *d){
  if(caTrace())fprintf(stderr,"FUXI MTL: trace bufferToTexture offset %lu row %lu %lux%lu to %lu,%lu format %lu\n",(unsigned long)offset,(unsigned long)row,(unsigned long)z.width,(unsigned long)z.height,(unsigned long)o.x,(unsigned long)o.y,(unsigned long)[t pixelFormat]);
  FuxiTexture *dst=[self texture:t slice:s level:l origin:o size:z];
  FuxiBuffer *src=[self imageBuffer:b offset:offset row:row image:image size:z pixel:fuxi::Backend::texelBytes((uint32_t)[dst pixelFormat])];
- fuxi::Operation op{};op.src=src->_buffer;op.from=offset;op.texture=dst->_texture;op.dstLevel=dst->_baseLevel+(uint32_t)l;op.upload=true;op.dstX=o.x;op.dstY=o.y;op.width=z.width;op.height=z.height;op.rowBytes=row;
+ fuxi::Operation op{};op.src=src->_buffer;op.from=offset;op.texture=dst->_texture;op.dstLevel=dst->_baseLevel+(uint32_t)l;op.upload=true;op.dstX=o.x;op.dstY=o.y;op.dstZ=o.z;op.width=z.width;op.height=z.height;op.depth=z.depth;op.rowBytes=row;op.imageBytes=z.depth>1?image:0;
  retainCommandResource(_command,src,false,fuxi::ShadowFullReason::blit);retainCommandResource(_command,dst,false,fuxi::ShadowFullReason::blit);_command->_ops.push_back(op);
 } @catch(NSException *e) {(void)e;[self rejectSelector:_cmd];}}
 - (void)copyFromTexture:(id)t sourceSlice:(NSUInteger)s sourceLevel:(NSUInteger)l sourceOrigin:(MTLOrigin)o sourceSize:(MTLSize)z
  toTexture:(id)d destinationSlice:(NSUInteger)ds destinationLevel:(NSUInteger)dl destinationOrigin:(MTLOrigin)dest {FRONTEND_TIME(_command);@try {CENSUS();
  FuxiTexture *src=[self texture:t slice:s level:l origin:o size:z],*dst=[self texture:d slice:ds level:dl origin:dest size:z];
- if([src pixelFormat]!=[dst pixelFormat])invalid(@"texture copy format mismatch");
+ if([src pixelFormat]!=[dst pixelFormat] || [src textureType]!=[dst textureType])invalid(@"texture copy format/type mismatch");
  // Backend snapshots aliased image regions through a bounded transfer buffer.
  // Even disjoint rectangles can share a Vulkan image subresource or allocation.
- fuxi::Operation op{};op.sourceTexture=src->_texture;op.texture=dst->_texture;op.srcLevel=src->_baseLevel+(uint32_t)l;op.dstLevel=dst->_baseLevel+(uint32_t)dl;op.srcX=o.x;op.srcY=o.y;op.dstX=dest.x;op.dstY=dest.y;op.width=z.width;op.height=z.height;
+ fuxi::Operation op{};op.sourceTexture=src->_texture;op.texture=dst->_texture;op.srcLevel=src->_baseLevel+(uint32_t)l;op.dstLevel=dst->_baseLevel+(uint32_t)dl;op.srcX=o.x;op.srcY=o.y;op.srcZ=o.z;op.dstX=dest.x;op.dstY=dest.y;op.dstZ=dest.z;op.width=z.width;op.height=z.height;op.depth=z.depth;
  retainCommandResource(_command,src,false,fuxi::ShadowFullReason::blit);retainCommandResource(_command,dst,false,fuxi::ShadowFullReason::blit);_command->_ops.push_back(op);
 } @catch(NSException *e) {(void)e;[self rejectSelector:_cmd];}}
 // Ordinary color transfers have no depth/stencil or row-linear PVRTC option.
@@ -1605,8 +1609,8 @@ static NSString *renderPassText(MTLRenderPassDescriptor *d){
 - (void)copyFromTexture:(id<MTLTexture>)src toTexture:(id<MTLTexture>)dst {FRONTEND_TIME(_command);@try {CENSUS();
  (void)[self texture:src slice:0 level:0 origin:MTLOriginMake(0,0,0) size:MTLSizeMake(1,1,1)];
  (void)[self texture:dst slice:0 level:0 origin:MTLOriginMake(0,0,0) size:MTLSizeMake(1,1,1)];
- if(src.width!=dst.width || src.height!=dst.height || src.mipmapLevelCount!=dst.mipmapLevelCount || src.pixelFormat!=dst.pixelFormat)invalid(@"whole texture copy shape/format");
- for(NSUInteger l=0;l<src.mipmapLevelCount;++l)[self copyFromTexture:src sourceSlice:0 sourceLevel:l sourceOrigin:MTLOriginMake(0,0,0) sourceSize:MTLSizeMake(std::max(NSUInteger(1),src.width>>l),std::max(NSUInteger(1),src.height>>l),1) toTexture:dst destinationSlice:0 destinationLevel:l destinationOrigin:MTLOriginMake(0,0,0)];
+ if(src.width!=dst.width || src.height!=dst.height || src.depth!=dst.depth || src.textureType!=dst.textureType || src.mipmapLevelCount!=dst.mipmapLevelCount || src.pixelFormat!=dst.pixelFormat)invalid(@"whole texture copy shape/format");
+ for(NSUInteger l=0;l<src.mipmapLevelCount;++l)[self copyFromTexture:src sourceSlice:0 sourceLevel:l sourceOrigin:MTLOriginMake(0,0,0) sourceSize:MTLSizeMake(std::max(NSUInteger(1),src.width>>l),std::max(NSUInteger(1),src.height>>l),std::max(NSUInteger(1),src.depth>>l)) toTexture:dst destinationSlice:0 destinationLevel:l destinationOrigin:MTLOriginMake(0,0,0)];
 } @catch(NSException *e) {(void)e;[self rejectSelector:_cmd];}}
 - (void)fence:(id)f {FRONTEND_TIME(_command);CENSUS();
  if(_ended || !_command->_encoding || ![f isKindOfClass:[FuxiFence class]] || [f device]!=[self device]){[self rejectSelector:_cmd];return;}retainCommandResource(_command,f);
@@ -1860,7 +1864,7 @@ static NSString *surfaceDescriptorText(IOSurfaceRef surface,NSUInteger plane){
  if(clientMode==fuxi::ClientMode::census)return nil;
  if(!textureDescriptorAccepted(d,owner(self)->backend->maxTextureDimension()))return nil;
  FuxiTexture *t=[FuxiTexture new];t->_descriptorText=[textureDescriptorText(d) copy];t->_cacheMode=d.cpuCacheMode;t->_device=[self retain];t->_usage=d.usage;t->_shared=d.storageMode==MTLStorageModeShared;t->_memoryless=d.storageMode==MTLStorageModeMemoryless;
- try {t->_texture=owner(self)->backend->allocateTexture((uint32_t)d.pixelFormat,(uint32_t)d.usage,(uint32_t)d.width,(uint32_t)d.height,(uint32_t)d.mipmapLevelCount,(uint32_t)d.textureType);}catch(const std::exception &e) {failureLog("FUXI MTL: texture reject allocation 0 desc=%s reason=%s\n",textureDescriptorText(d).UTF8String,e.what());[t release];return nil;}return t;
+ try {t->_texture=owner(self)->backend->allocateTexture((uint32_t)d.pixelFormat,(uint32_t)d.usage,(uint32_t)d.width,(uint32_t)d.height,(uint32_t)d.mipmapLevelCount,(uint32_t)d.textureType,(uint32_t)d.depth);}catch(const std::exception &e) {failureLog("FUXI MTL: texture reject allocation 0 desc=%s reason=%s\n",textureDescriptorText(d).UTF8String,e.what());[t release];return nil;}return t;
 }
 - (id)newTextureWithBytesNoCopy:(void *)bytes length:(NSUInteger)length descriptor:(MTLTextureDescriptor *)d deallocator:(void (^)(void *,NSUInteger))deallocator {CENSUS();
  (void)bytes;(void)deallocator;
@@ -1886,7 +1890,7 @@ static NSString *surfaceDescriptorText(IOSurfaceRef surface,NSUInteger plane){
  CHECK("IOSurface.width",width,actual==d.width);CHECK("IOSurface.height",height,actual==d.height);
  CHECK("IOSurface.bytesPerElement",planes?IOSurfaceGetBytesPerElementOfPlane(surface,plane):IOSurfaceGetBytesPerElement(surface),actual==4);
  CHECK("IOSurface.pixelFormat",d.pixelFormat,actual==MTLPixelFormatBGRA8Unorm);
- CHECK("IOSurface.mipmapLevelCount",d.mipmapLevelCount,actual==1);CHECK("IOSurface.storageMode",d.storageMode,actual==MTLStorageModeShared);
+ CHECK("IOSurface.textureType",d.textureType,actual==MTLTextureType2D);CHECK("IOSurface.mipmapLevelCount",d.mipmapLevelCount,actual==1);CHECK("IOSurface.storageMode",d.storageMode,actual==MTLStorageModeShared);
  CHECK("IOSurface.hostImport",owner(self)->backend->supportsHostImport(),actual);
  CHECK("IOSurface.lock",IOSurfaceLock(surface,kIOSurfaceLockAvoidSync,nullptr),actual==0);
 #undef CHECK

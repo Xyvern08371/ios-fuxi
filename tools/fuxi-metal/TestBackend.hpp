@@ -23,7 +23,7 @@ namespace fuxi {
 struct Buffer {void *contents;size_t length,allocated;bool upload=false;};
 struct PrepareWrite {Buffer *buffer;uint64_t offset,bytes;};
 struct Texture : TextureLevels {size_t allocated{},charged{};uint32_t format=80;Buffer *backingBuffer{};size_t backingOffset{},backingRow{};bool shadow=false;std::vector<uint8_t> pixels{};
- size_t offset(uint32_t level) const {size_t o=0;for(uint32_t l=0;l<level;++l)o+=levelWidth(l)*levelHeight(l)*metalTexelBytes(format);return o;}
+ size_t offset(uint32_t level) const {size_t o=0;for(uint32_t l=0;l<level;++l)o+=levelWidth(l)*levelHeight(l)*levelDepth(l)*metalTexelBytes(format);return o;}
 };
 struct Pipeline {ShadowWindow shadowWindows[2][resourceSlots]{};CompileOptions options{};bool sampled=false;size_t references=1;};
 struct Sampler {};
@@ -36,7 +36,7 @@ struct Operation {
  Buffer *src, *dst; size_t from, to, size; uint8_t value;
  Texture *texture{};Pipeline *pipeline{};uint64_t encoderID{};float clear[4]{};bool renderDraw=false;
  Texture *sourceTexture{};Sampler *sampler{};uint32_t vertices=3;bool upload=false,clearOnly=false;
- uint32_t srcX{},srcY{},dstX{},dstY{},width{},height{};size_t rowBytes{};
+ uint32_t srcX{},srcY{},dstX{},dstY{},width{},height{};size_t rowBytes{};uint32_t srcZ{},dstZ{},depth{};size_t imageBytes{};
  Texture *samples[resourceSlots]{};Sampler *samplers[resourceSlots]{};BufferBind buffers[2][resourceSlots]{};Buffer *indices{};uint64_t indexOffset{};uint32_t first{},load=2,store=1,indexWidth=2;Topology topology=Topology::Triangle;
  Viewport viewport{0,256,256,-256,0,1};Rect scissor{{0,0},{256,256}};
  uint32_t areaWidth{},areaHeight{};
@@ -87,11 +87,11 @@ public:
  }
  Sampler *allocateSampler(bool,bool,uint32_t=0,float=0,float=0,const uint32_t * =nullptr,uint32_t=0,uint32_t=1) {return new Sampler{};}
  void destroy(Sampler *s) {delete s;}
- Texture *allocateTexture(uint32_t format=80,uint32_t usage=5,uint32_t width=256,uint32_t height=256,uint32_t levels=1,uint32_t type=2) {
+ Texture *allocateTexture(uint32_t format=80,uint32_t usage=5,uint32_t width=256,uint32_t height=256,uint32_t levels=1,uint32_t type=2,uint32_t depth=1) {
   if(!modelTextures)throw std::runtime_error("M4 CPU model has no rendering");
-  if(!textureShapeAccepted(type,height,usage))throw std::runtime_error("texture dimension/usage");
-  if(!limits.extent(width,height,texelBytes(format)))throw std::runtime_error("extent");
-  auto *t=new Texture{};t->format=format;t->width=width;t->height=height;t->levels=levels;t->textureType=type;t->allocated=t->offset(levels);limits.reserve(t->allocated);t->charged=t->allocated;t->pixels.resize(t->allocated);return t;
+  if(!textureShapeAccepted(type,height,usage,depth,levels))throw std::runtime_error("texture dimension/usage");
+  if(!limits.extent(width,height,texelBytes(format)) || !limits.volume(width,height,depth,texelBytes(format)))throw std::runtime_error("extent");
+  auto *t=new Texture{};t->format=format;t->width=width;t->height=height;t->depth=depth;t->levels=levels;t->textureType=type;t->allocated=t->offset(levels);limits.reserve(t->allocated);t->charged=t->allocated;t->pixels.resize(t->allocated);return t;
  }
  Pipeline *compilePipeline(void *,const char *v,void *,const char *f,const CompileOptions &options=CompileOptions{}) {
   if(!modelPipelines)throw std::runtime_error("M4 CPU model has no translation");
@@ -121,10 +121,11 @@ public:
     if(op.clearOnly){if(op.load==2){for(size_t i=0;i<w*h*pixel;i+=4){data[i]=(uint8_t)(op.clear[2]*255);data[i+1]=(uint8_t)(op.clear[1]*255);data[i+2]=(uint8_t)(op.clear[0]*255);data[i+3]=(uint8_t)(op.clear[3]*255);}}
      t->setDefined(l,op.store && (op.load==2 || (op.load==1 && t->isDefined(l))));
     }else {
-     size_t width=op.width?op.width:w,height=op.height?op.height:h,row=op.rowBytes?op.rowBytes:width*pixel;
-     if(op.upload){for(size_t y=0;y<height;++y)memcpy(data+((op.dstY+y)*w+op.dstX)*pixel,(uint8_t *)op.src->contents+op.from+y*row,width*pixel);t->setDefined(l);}
-     else if(op.sourceTexture){auto *src=op.sourceTexture;assert(src->isDefined(op.srcLevel));std::vector<uint8_t> snapshot(width*height*pixel);for(size_t y=0;y<height;++y)memcpy(snapshot.data()+y*width*pixel,src->pixels.data()+src->offset(op.srcLevel)+((op.srcY+y)*src->levelWidth(op.srcLevel)+op.srcX)*pixel,width*pixel);for(size_t y=0;y<height;++y)memcpy(data+((op.dstY+y)*w+op.dstX)*pixel,snapshot.data()+y*width*pixel,width*pixel);t->setDefined(l);}
-     else {if(!t->isDefined(l))throw std::runtime_error("undefined model readback");for(size_t y=0;y<height;++y)memcpy((uint8_t *)op.dst->contents+op.to+y*row,data+((op.srcY+y)*w+op.srcX)*pixel,width*pixel);}
+     size_t width=op.width?op.width:w,height=op.height?op.height:h,depth=op.depth?op.depth:t->levelDepth(l),row=op.rowBytes?op.rowBytes:width*pixel,image=op.imageBytes?op.imageBytes:row*height;
+     auto at=[&](Texture *x,uint32_t level,size_t px,size_t py,size_t pz){return x->pixels.data()+x->offset(level)+((pz*x->levelHeight(level)+py)*x->levelWidth(level)+px)*pixel;};
+     if(op.upload){for(size_t z=0;z<depth;++z)for(size_t y=0;y<height;++y)memcpy(at(t,l,op.dstX,op.dstY+y,op.dstZ+z),(uint8_t *)op.src->contents+op.from+z*image+y*row,width*pixel);t->setDefined(l);}
+     else if(op.sourceTexture){auto *src=op.sourceTexture;assert(src->isDefined(op.srcLevel));std::vector<uint8_t> snapshot(width*height*depth*pixel);for(size_t z=0;z<depth;++z)for(size_t y=0;y<height;++y)memcpy(snapshot.data()+(z*height+y)*width*pixel,at(src,op.srcLevel,op.srcX,op.srcY+y,op.srcZ+z),width*pixel);for(size_t z=0;z<depth;++z)for(size_t y=0;y<height;++y)memcpy(at(t,l,op.dstX,op.dstY+y,op.dstZ+z),snapshot.data()+(z*height+y)*width*pixel,width*pixel);t->setDefined(l);}
+     else {if(!t->isDefined(l))throw std::runtime_error("undefined model readback");for(size_t z=0;z<depth;++z)for(size_t y=0;y<height;++y)memcpy((uint8_t *)op.dst->contents+op.to+z*image+y*row,at(t,l,op.srcX,op.srcY+y,op.srcZ+z),width*pixel);}
     }
     continue;
    }
