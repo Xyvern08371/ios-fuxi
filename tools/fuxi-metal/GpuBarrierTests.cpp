@@ -3,6 +3,7 @@
 #include <cassert>
 #include <cstdio>
 int main(){
+ setenv("FUXI_MTL_SHADOW_HASH","0",1); // this test counts the copies of every refresh; the unchanged-backing skip has its own test
  using namespace fuxi;Backend b;bool merge=systemTranslationPolicy().merge,perf=systemTranslationPolicy().perf&4,cross=systemTranslationPolicy().perf&2;
  auto *target=b.allocateTexture(80,5,16,16),*backdrop=b.allocateTexture(80,5,16,16),*blur=b.allocateTexture(80,5,16,16);
  Texture *layers[4];for(auto &t:layers)t=b.allocateTexture(80,5,16,16);

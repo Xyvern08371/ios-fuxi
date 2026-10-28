@@ -23,7 +23,7 @@ inline unsigned translationLevel(const char *args,const char *key,unsigned maxim
 }
 inline unsigned translationPerf(const char *args){return translationLevel(args,"fuxigpuperf=",7);}
 inline unsigned translationFrameTrace(const char *args){return translationLevel(args,"fuxigpuframetrace=",2);}
-struct TranslationPolicy {bool stages=false,trace=false,async=false,compileBoost=false,frameTrace=false,pipelined=false,skipSampling=false,allowFeedback=false,overlap=false,submitFast=false,gmem=false,merge=false;unsigned perf=0;bool frameCPU=false,noSlab=false,shadowRename=false;};
+struct TranslationPolicy {bool stages=false,trace=false,async=false,compileBoost=false,frameTrace=false,pipelined=false,skipSampling=false,allowFeedback=false,overlap=false,submitFast=false,gmem=false,merge=false;unsigned perf=0;bool frameCPU=false,noSlab=false,shadowRename=false,shadowHash=true,passTimes=false;};
 inline TranslationPolicy translationPolicy(const char *args) {
  return {translationOption(args,"fuxigpustages="),translationOption(args,"fuxigputrace="),translationOption(args,"fuxigpuasync="),translationOption(args,"fuxicompileboost="),translationFrameTrace(args)!=0,translationOption(args,"fuxigpupipelined="),translationOption(args,"fuxigpuskip="),translationOption(args,"fuxigpufeedback="),translationOption(args,"fuxigpuoverlap="),translationOption(args,"fuxigpusubmit="),translationOption(args,"fuxigpugmem="),translationOption(args,"fuxigpumerge="),translationPerf(args),translationFrameTrace(args)==2};
 }
@@ -44,6 +44,8 @@ inline TranslationPolicy systemTranslationPolicy() {
   if(!trace){const char *v=getenv("FUXI_MTL_TRANSLATION_TRACE");p.trace=v && !strcmp(v,"1");}
   if(!async){const char *v=getenv("FUXI_MTL_ASYNC_PIPELINES");p.async=v && !strcmp(v,"1");}
   bool renameEnv=false;if(!renameKey){const char *v=getenv("FUXI_MTL_SHADOW_RENAME");p.shadowRename=renameEnv=v && !strcmp(v,"1");}
+  {const char *v=getenv("FUXI_MTL_SHADOW_HASH");if(v && !strcmp(v,"0"))p.shadowHash=false;v=getenv("FUXI_MTL_GPU_PASS_TIMES");p.passTimes=v && !strcmp(v,"1");
+   fprintf(stderr,"FUXI MTL: policy shadow_hash=%d gpu_pass_times=%d\n",int(p.shadowHash),int(p.passTimes));}
   fprintf(stderr,"FUXI MTL: policy shadow_rename=%d source=%s\n",int(p.shadowRename),renameKey?"boot":renameEnv?"env":"none");
   return p;
  }();return policy;

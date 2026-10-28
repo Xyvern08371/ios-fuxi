@@ -1,6 +1,7 @@
 /* Original host controls for bounded frame statistics and thread attribution. */
 #define FUXI_MTL_HOST_TEST
 #include "FrameTrace.hpp"
+#include "PassTimes.hpp"
 #include <cassert>
 #include <cstring>
 #include <thread>
@@ -70,6 +71,15 @@ int main(){
   FILE *o=tmpfile();assert(o);w.report(o);rewind(o);char text[8192];bool sawSubmit=false,sawScan=false;
   while(fgets(text,sizeof(text),o)){if(strstr(text,"submit phases")){sawSubmit=true;assert(strlen(text)<=401 && strstr(text,"cmd_begin=") && strstr(text,"other="));}if(strstr(text,"scan counts")){sawScan=true;assert(strlen(text)<=401 && strstr(text,"view_probes=7.0") && strstr(text,"bound_set_max=5.0"));}}
   assert(sawSubmit && sawScan);fclose(o);
+ }
+ { // per-pass GPU times: grouping by shape, ordering by total time, window reset
+  PassTimes times;PassInfo big{};big.width=1080;big.height=2400;big.colors=1;big.draws=40;big.load=1;big.store=1;PassInfo small{};small.width=64;small.height=16;small.colors=1;small.draws=2;small.copies=1;small.load=2;small.store=1;PassInfo copy{};copy.kind=2;
+  for(int i=0;i<3;++i)times.add({small,big,small,copy},{100000,2000000,150000,50000},3000000);
+  assert(times.submitCount()==3);char buffer[4096]{};FILE *o=fmemopen(buffer,sizeof buffer,"w");times.report(o);fclose(o);
+  assert(strstr(buffer,"submits=3 stamps/submit=4.0") && strstr(buffer,"pass_sum_ms/submit=2.300") && strstr(buffer,"whole_top_of_pipe_ms/submit=3.000"));
+  const char *first=strstr(buffer,"top1 ");assert(first && strstr(first,"pass 1080x2400 colors=1 load=L store=S") && strstr(first,"draws=40.0") && strstr(first,"avg_ms=2.000"));
+  const char *second=strstr(buffer,"top2 ");assert(second && strstr(second,"pass 64x16 colors=1 load=C store=S") && strstr(second,"n/submit=2.00") && strstr(second,"copies=1.0") && strstr(second,"avg_ms=0.125"));
+  assert(strstr(buffer,"top3 op 0x0") && !strstr(buffer,"top4 ") && times.submitCount()==0);
  }
  puts("PASS: bounded frame percentiles/reset/overflow/max, log fields, CPU mask and thread-local attribution");
 }

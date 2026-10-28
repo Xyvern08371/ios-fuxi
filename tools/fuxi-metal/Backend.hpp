@@ -23,6 +23,7 @@
 #include "ResourceLimits.hpp"
 #include "TransientMemory.hpp"
 #include "SlabMemory.hpp"
+#include "PassTimes.hpp"
 #include "ClientSetup.hpp"
 #include "DrawSafety.hpp"
 #include "TextureLevels.hpp"
@@ -81,7 +82,7 @@ inline void importCheck(VkResult r,int line=__builtin_LINE()) {
  X(CreatePipelineLayout) X(DestroyPipelineLayout) X(CreateGraphicsPipelines) X(DestroyPipeline) \
  X(CreatePipelineCache) X(DestroyPipelineCache) X(GetPipelineCacheData) \
  X(CmdBindVertexBuffers) X(CmdBindIndexBuffer) X(CmdDrawIndexed) X(CmdSetViewport) X(CmdSetScissor) X(CmdPushConstants) X(CmdBeginRenderPass) X(CmdEndRenderPass) X(CmdBindPipeline) X(CmdDraw) X(CmdCopyImageToBuffer) X(CmdPipelineBarrier) X(CreateFence) X(DestroyFence) X(QueueSubmit) X(WaitForFences)
-struct Buffer { VkBuffer buffer{}; VkDeviceMemory memory{}; void *contents{};void *key{};Buffer *spare{};void *shadowKey() const{return key?key:contents;}bool shadowBacking=false,directUse=false,spareFailed=false,aliased=false; size_t length{}, allocated{},charged{},memoryBytes{},memoryOffset{},references=1;uint32_t memoryType{};bool imported=false,upload=false,poolable=false; };
+struct Buffer { VkBuffer buffer{}; VkDeviceMemory memory{}; void *contents{};void *key{};Buffer *spare{};void *shadowKey() const{return key?key:contents;}bool shadowBacking=false,directUse=false,spareFailed=false,aliased=false; size_t length{}, allocated{},charged{},memoryBytes{},memoryOffset{},references=1;uint32_t memoryType{};bool imported=false,upload=false,poolable=false,gpuWritten=false; };
 // Host ranges a submit's prepare callback will write; absent means unknown (full drain).
 struct PrepareWrite {Buffer *buffer;uint64_t offset,bytes;};
 struct Texture : TextureLevels {VkImage image{};VkDeviceMemory memory{};VkImageView view{};size_t allocated{},charged{},memoryBytes{},references=1;
@@ -89,7 +90,7 @@ struct Texture : TextureLevels {VkImage image{};VkDeviceMemory memory{};VkImageV
  // layout is level zero; levelLayouts[1..levels) track the remaining mips.
  VkImageTiling tiling=VK_IMAGE_TILING_OPTIMAL;VkImageLayout layout=VK_IMAGE_LAYOUT_UNDEFINED;std::array<VkImageLayout,32> levelLayouts{};void *mapped{};bool imported=false,borrowedMemory=false;
  MemoryKey recycleKey{};bool recyclable=false,slabbed=false;uint64_t memOffset{},memExtent{};SlabMemory<VkDeviceMemory>::Block slabBlock{};std::array<uint64_t,7> importKey{};bool importCached=false;
- Buffer *backingBuffer{};size_t backingOffset{},backingRow{};bool shadow=false;
+ Buffer *backingBuffer{};size_t backingOffset{},backingRow{};bool shadow=false;uint64_t shadowHash{};bool shadowHashed=false; // hash of the backing rows the last recorded refresh copied
  std::vector<VkImageView> attachmentViews;bool canGenerate=false,filterable=true,blendable=false;};
 struct Sampler {size_t references=1;VkSampler sampler{};uint32_t filters=1;float lodMin=0,lodMax=0;};
 struct VariantKey {
@@ -208,7 +209,7 @@ private:
  // kind bits name the resource for conflict diagnostics: 1 buffer, 2 shadow backing, 4 texture, 8 surface, 16 index.
  struct HostUse {VkDeviceMemory memory;const void *address;size_t bytes;uint8_t kind=1;Buffer *buffer=nullptr;};
  struct SubmitSlot {
-  VkCommandPool commandPool{};VkCommandBuffer command{};VkFence submitFence{};VkQueryPool queryPool{};
+  VkCommandPool commandPool{};VkCommandBuffer command{};VkFence submitFence{};VkQueryPool queryPool{},passPool{};
   Buffer *aliasScratch=nullptr;VkDescriptorPool descriptorPool{};uint32_t descriptorSets{};
   std::vector<VkDescriptorPoolSize> descriptorCapacity;std::vector<HostUse> hostUses,writes,uses;bool busy=false;
  } slots[2];
@@ -220,10 +221,28 @@ private:
  static constexpr size_t frameCacheLimit=512,viewCacheLimit=512;
  static uint64_t frameKey(const std::array<Texture *,8> &t,VkRenderPass render,const std::array<uint32_t,8> &levels){uint64_t h=0xcbf29ce484222325ull;for(size_t i=0;i<8;++i)h=((h^uint64_t(uintptr_t(t[i])))*0x100000001b3ull^levels[i])*0x100000001b3ull;return (h^uint64_t(uintptr_t(render)))*0x100000001b3ull;}
  static uint64_t viewKey(const Texture *t,VkFormat format,const std::array<uint32_t,4> &c,uint32_t base,uint32_t count){uint64_t h=0xcbf29ce484222325ull;for(uint64_t x:{uint64_t(uintptr_t(t)),uint64_t(format),uint64_t(c[0])|uint64_t(c[1])<<8|uint64_t(c[2])<<16|uint64_t(c[3])<<24,uint64_t(base)<<32|count})h=(h^x)*0x100000001b3ull;return h;}
+ static constexpr uint32_t passStampLimit=255;static inline PassTimes passTimes;
+ void readPassTimes(VkQueryPool pool,const std::vector<PassInfo> &infos,uint64_t whole){
+  if(!pool || infos.empty())return;std::vector<uint64_t> ticks(infos.size()+1),delta(infos.size());
+  if(GetQueryPoolResults(device,pool,0,uint32_t(ticks.size()),ticks.size()*sizeof(uint64_t),ticks.data(),sizeof(uint64_t),VK_QUERY_RESULT_64_BIT)!=VK_SUCCESS)return;
+  uint64_t mask=timestampBits>=64?UINT64_MAX:(uint64_t(1)<<timestampBits)-1;
+  for(size_t i=0;i<infos.size();++i)delta[i]=uint64_t(double((ticks[i+1]-ticks[i])&mask)*timestampPeriod);
+  passTimes.add(infos,delta,whole);if(passTimes.submitCount()>=300)passTimes.report(stderr);
+ }
+ // Fast 4-lane multiply-xor hash over a pitched rectangle of bytes (change detection only, not security).
+ static uint64_t hashRows(const uint8_t *base,size_t rows,size_t pitch,size_t rowBytes){
+  uint64_t a=0x9E3779B97F4A7C15ull,b=0xC2B2AE3D27D4EB4Full,c=0x165667B19E3779F9ull,d=0x27D4EB2F165667C5ull;
+  auto mix=[](uint64_t h,uint64_t x){h=(h^x)*0x9E3779B97F4A7C15ull;return h^(h>>29);};
+  for(size_t r=0;r<rows;++r){const uint8_t *p=base+r*pitch;size_t n=rowBytes;
+   while(n>=32){uint64_t x[4];memcpy(x,p,32);a=mix(a,x[0]);b=mix(b,x[1]);c=mix(c,x[2]);d=mix(d,x[3]);p+=32;n-=32;}
+   if(n){uint64_t x[4]{};memcpy(x,p,n);a=mix(a,x[0]);b=mix(b,x[1]);c=mix(c,x[2]);d=mix(d,x[3]^n);}
+  }
+  return mix(mix(mix(mix(a,b),c),d),uint64_t(rows)<<32^rowBytes);
+ }
  void clearSubmitObjects(SubmitSlot &slot) {
   auto &descriptorPool=slot.descriptorPool;auto &queryPool=slot.queryPool;auto &submitFence=slot.submitFence;auto &commandPool=slot.commandPool;auto &command=slot.command;auto &descriptorSets=slot.descriptorSets;auto &descriptorCapacity=slot.descriptorCapacity;
   if(descriptorPool)DestroyDescriptorPool(device,descriptorPool,nullptr);
-  if(queryPool)DestroyQueryPool(device,queryPool,nullptr);
+  if(queryPool)DestroyQueryPool(device,queryPool,nullptr);if(slot.passPool)DestroyQueryPool(device,slot.passPool,nullptr);slot.passPool={};
   if(submitFence)DestroyFence(device,submitFence,nullptr);
   if(commandPool)DestroyCommandPool(device,commandPool,nullptr);
   descriptorPool={};queryPool={};submitFence={};commandPool={};command={};descriptorSets=0;descriptorCapacity.clear();
@@ -411,7 +430,7 @@ public:
   artifactCache.close();
   for(auto &slot:slots)clearSubmitObjects(slot);clearFrames();clearViews();for(auto &slot:slots){destroyUnlocked(slot.aliasScratch);slot.aliasScratch=nullptr;}
   objects.clear([&](Pipeline *p){drawPlans.invalidate(p);destroyPipelineUnlocked(p);});
-  pipelineCache.close();trimMemoryUnlocked(true);
+  pipelineCache.close();trimMemoryUnlocked(true);passTimes.report(stderr);
   if(device && DestroyDevice) DestroyDevice(device,nullptr);
   if(instance && DestroyInstance) DestroyInstance(instance,nullptr);
   if(library) dlclose(library);
@@ -1073,7 +1092,7 @@ public:
   // Empty completion participates in the same lock/order, but creates no BO or GPU fence.
   if(ops.empty()){if(cpuTiming)cpuTiming->backendCPU+=frameCPUDelta(backendCPU,frameThreadCPU());if(currentFrame)currentFrame->backendSubmit+=frameNanos(locked);++emptySubmits;if(scheduled)scheduled();return;}
   bool submitted=false,completed=false;std::vector<VkImageView> sampleViews;std::vector<VkFramebuffer> frames;std::vector<VkRenderPass> emptyRenders;std::vector<Texture *> textures;
-  struct TextureState {Texture *texture;VkImageLayout layout;std::array<VkImageLayout,32> levelLayouts;bool defined;uint32_t definedLevels;};std::vector<TextureState> oldTextures;
+  struct TextureState {Texture *texture;VkImageLayout layout;std::array<VkImageLayout,32> levelLayouts;bool defined;uint32_t definedLevels;uint64_t shadowHash;bool shadowHashed;};std::vector<TextureState> oldTextures;
   size_t diagnosticOp=0;Buffer *neutralBuffer=nullptr,*aliasBuffer=nullptr;size_t aliasBytes=0;
   std::vector<bool> aliasCopies(ops.size(),false);
   auto cleanup=[&] {if(aliasBuffer!=aliasScratch)destroyUnlocked(aliasBuffer);destroyUnlocked(neutralBuffer);for(auto v:sampleViews)DestroyImageView(device,v,nullptr);for(auto frame:frames)DestroyFramebuffer(device,frame,nullptr);for(auto render:emptyRenders)DestroyRenderPass(device,render,nullptr);};
@@ -1363,7 +1382,7 @@ public:
     addBuffer(aliasBuffer);
    }
    if(neutralSize){Measure measure{objectNanos,SubPhase::objects};neutralBuffer=allocateUnlocked(neutralSize);addBuffer(neutralBuffer);}
-   for(auto *t:textures)oldTextures.push_back({t,t->layout,t->levelLayouts,t->defined,t->definedLevels});
+   for(auto *t:textures)oldTextures.push_back({t,t->layout,t->levelLayouts,t->defined,t->definedLevels,t->shadowHash,t->shadowHashed});
    auto flushStart=std::chrono::steady_clock::now();auto flushPhase=std::make_unique<PhaseTimer>(SubPhase::flush);
    // Direct shared host writes are not tracked. Only Vulkan HOST_COHERENT permits omission.
    for(auto *t:textures)if(t->mapped && !coherent(t->memoryType)) {VkMappedMemoryRange r{};r.sType=VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;r.memory=t->memory;r.size=VK_WHOLE_SIZE;++flushCalls;check(FlushMappedMemoryRanges(device,1,&r));}
@@ -1377,13 +1396,16 @@ public:
     }else check(ResetCommandPool(device,commandPool,0));
     if(!submitFence){VkFenceCreateInfo fi{};fi.sType=VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;check(CreateFence(device,&fi,nullptr,&submitFence));++reuseCounts.fences;++submitObjectCreates;++submitPoolCreates;}
     else check(ResetFences(device,1,&submitFence));
+    if(systemTranslationPolicy().passTimes && supportsTimestamps() && !slot.passPool){VkQueryPoolCreateInfo pi{};pi.sType=VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;pi.queryType=VK_QUERY_TYPE_TIMESTAMP;pi.queryCount=passStampLimit+1;check(CreateQueryPool(device,&pi,nullptr,&slot.passPool));}
     if(supportsTimestamps() && !queryPool){VkQueryPoolCreateInfo qi{};qi.sType=VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;qi.queryType=VK_QUERY_TYPE_TIMESTAMP;qi.queryCount=2;check(CreateQueryPool(device,&qi,nullptr,&queryPool));++reuseCounts.queries;++submitObjectCreates;++submitPoolCreates;}
    }
-   VkCommandBuffer cmd=command;VkQueryPool timestamps=queryPool;VkFence fence=submitFence;
+   VkCommandBuffer cmd=command;VkQueryPool timestamps=queryPool;VkFence fence=submitFence;VkQueryPool passQ=timestamps && systemTranslationPolicy().passTimes?slot.passPool:VkQueryPool{};
    auto recordStart=std::chrono::steady_clock::now();uint64_t recordObjects=objectNanos;
    VkCommandBufferBeginInfo bi{};bi.sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;bi.flags=VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;{PhaseTimer phase(SubPhase::cmdBegin);check(BeginCommandBuffer(cmd,&bi));}
    if(timestamps){CmdResetQueryPool(cmd,timestamps,0,2);CmdWriteTimestamp(cmd,VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,timestamps,0);}
-   auto pb=[&](auto &&...a){if(currentFrame)++currentFrame->pipelineBarriers;{PhaseTimer phase(SubPhase::barriers);CmdPipelineBarrier(cmd,a...);}};
+   if(passQ){CmdResetQueryPool(cmd,passQ,0,passStampLimit+1);CmdWriteTimestamp(cmd,VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,passQ,0);}
+   uint32_t stampCopies=0,stampBarriers=0;std::vector<PassInfo> passInfos;PassInfo cur{};
+   auto pb=[&](auto &&...a){++stampBarriers;if(currentFrame)++currentFrame->pipelineBarriers;{PhaseTimer phase(SubPhase::barriers);CmdPipelineBarrier(cmd,a...);}};
    VkMemoryBarrier barrier{};barrier.sType=VK_STRUCTURE_TYPE_MEMORY_BARRIER;barrier.srcAccessMask=VK_ACCESS_HOST_WRITE_BIT;barrier.dstAccessMask=VK_ACCESS_MEMORY_READ_BIT|VK_ACCESS_MEMORY_WRITE_BIT;
    pb(VK_PIPELINE_STAGE_HOST_BIT,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,0,1,&barrier,0,nullptr,0,nullptr);
    // Merged runs contain only read-only nonattachment samples, so a mip can
@@ -1451,7 +1473,7 @@ public:
    struct BoundSet {VkDescriptorSetLayout layout;unsigned count;uint64_t hash;std::array<BindingValue,16> bindings;VkDescriptorSet set;};
    std::vector<BoundSet> boundSets;std::unordered_multimap<uint64_t,size_t> boundIndex;static constexpr size_t boundSetLimit=4096;if(systemTranslationPolicy().submitFast){boundSets.reserve(std::min<size_t>(ops.size(),boundSetLimit));boundIndex.reserve(std::min<size_t>(ops.size(),boundSetLimit)*2);}
    auto copyShadow=[&](Texture *t){
-    VkBufferImageCopy region{};region.bufferOffset=t->backingOffset;region.bufferRowLength=t->backingRow/texelBytes(t->format);
+    ++stampCopies;VkBufferImageCopy region{};region.bufferOffset=t->backingOffset;region.bufferRowLength=t->backingRow/texelBytes(t->format);
     region.imageSubresource={VK_IMAGE_ASPECT_COLOR_BIT,0,0,1};region.imageExtent={t->width,t->height,1};
     CmdCopyBufferToImage(cmd,t->backingBuffer->buffer,t->image,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,1,&region);t->setDefined(0);if(timing)timing->textureRepitchedBytes+=uint64_t(t->width)*t->height*texelBytes(t->format);
    };
@@ -1471,10 +1493,37 @@ public:
     }
     return true;
    };
+   // Unchanged-backing skip: a linear-texture shadow is re-copied only when a hash of its backing rows differs from the hash at the last recorded copy.
+   // Never when this or an earlier submit may write the backing on the GPU (sticky Buffer::gpuWritten); a failed submit restores the hash with the layouts.
+   std::unordered_map<Buffer *,bool> backingWrites;std::unordered_map<Texture *,uint64_t> submitHashes;
+   bool anyStorage=false;if(systemTranslationPolicy().shadowHash)for(size_t n=0;n<ops.size() && !anyStorage;++n)if(ops[n].pipeline)for(unsigned j=0;j<draws[n].descriptorCount;++j){auto t=draws[n].descriptors[j].type;if(t==VK_DESCRIPTOR_TYPE_STORAGE_BUFFER || t==VK_DESCRIPTOR_TYPE_STORAGE_IMAGE || t==VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER){anyStorage=true;break;}}
+   auto writesBacking=[&](Buffer *backing){
+    auto cached=backingWrites.find(backing);if(cached!=backingWrites.end())return cached->second;
+    bool w=anyStorage || backing->gpuWritten;
+    auto hits=[&](Texture *x){return x && (backing->memory==x->memory || hostRangesOverlap(backing->contents,backing->length,x->mapped,x->allocated));};
+    for(auto &op:ops){if(w)break;
+     if(op.dst && (op.dst==backing || op.dst->memory==backing->memory || hostRangesOverlap(backing->contents,backing->length,op.dst->contents,op.dst->length)))w=true;
+     else if(op.pipeline || op.clearOnly){for(unsigned i=0;i<std::min(op.colorCount,8u);++i)if(hits(op.color(i).texture))w=true;}
+     else if(op.texture && (op.upload || op.sourceTexture || op.generateMips) && hits(op.texture))w=true;
+    }
+    if(w)backing->gpuWritten=true;backingWrites[backing]=w;return w;
+   };
+   auto shadowUnchanged=[&](Texture *t)->bool{
+    if(!systemTranslationPolicy().shadowHash || !t->shadow)return false;
+    auto *backing=t->backingBuffer;size_t pixel=texelBytes(t->format),rowBytes=size_t(t->width)*pixel;
+    bool eligible=backing && backing->contents && t->height && rowBytes && t->backingRow>=rowBytes && t->backingOffset<=backing->length && (size_t(t->height)-1)*t->backingRow+rowBytes<=backing->length-t->backingOffset;
+    if(!eligible || writesBacking(backing)){t->shadowHashed=false;return false;}
+    uint64_t h;auto known=submitHashes.find(t);
+    if(known!=submitHashes.end())h=known->second;
+    else {auto start=FrameClock::now();h=hashRows((const uint8_t *)backing->contents+t->backingOffset,t->height,t->backingRow,rowBytes);submitHashes[t]=h;if(currentFrame)currentFrame->shadowHashNs+=frameNanos(start);}
+    if(t->shadowHashed && t->shadowHash==h && t->isDefined(0)){if(currentFrame){++currentFrame->shadowHashSkipped;currentFrame->shadowHashBytes+=rowBytes*t->height;}return true;}
+    t->shadowHash=h;t->shadowHashed=true;if(currentFrame)++currentFrame->shadowHashCopied;return false;
+   };
    auto refreshImages=[&](size_t opIndex){diagnosticOp=opIndex;const auto &op=ops[opIndex];
     // Once per run, after preceding writes and before any sample transitions.
     // Never deduplicate the transfer-destination transition with a read layout.
     auto readShadow=[&](Texture *t){if(!t || !t->shadow || std::find(refreshed.begin(),refreshed.end(),t)!=refreshed.end())return;
+     if(shadowUnchanged(t)){refreshed.push_back(t);return;}
      if(boundaryPerf){refreshed.push_back(t);
       if(std::find(refreshedSubmit.begin(),refreshedSubmit.end(),t)!=refreshedSubmit.end() && backingStable(t)){if(currentFrame)++currentFrame->shadowRefreshSkipped;return;}
       refreshedSubmit.push_back(t);collected.push_back(t);return;}
@@ -1526,6 +1575,8 @@ public:
      if(!continuation){
      std::optional<Operation> passOp;
      if(passEnd>opIndex){passOp=op;for(unsigned i=0;i<op.colorCount;++i){auto c=passOp->color(i);if(!c.texture)continue;c.store=ops[passEnd].color(i).store;passOp->setColor(i,c);}}
+     if(passQ){cur={};cur.width=op.texture->levelWidth(op.dstLevel);cur.height=op.texture->levelHeight(op.dstLevel);cur.colors=used;
+      for(unsigned i=0,u=0;i<op.colorCount && u<8;++i){auto c=op.color(i);if(!c.texture)continue;unsigned st=passEnd>opIndex?ops[passEnd].color(i).store:c.store;cur.load|=uint32_t(c.load&3u)<<(u*2);cur.store|=(st?1u:0u)<<u;++u;}}
      auto render=renderPass(op.pipeline,passOp?&*passOp:&op);
      VkFramebufferCreateInfo fi{};fi.sType=VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;fi.renderPass=render;
      fi.attachmentCount=used;fi.pAttachments=compactViews;fi.width=op.texture->levelWidth(op.dstLevel);fi.height=op.texture->levelHeight(op.dstLevel);fi.layers=1;VkFramebuffer frame{};
@@ -1540,7 +1591,7 @@ public:
      }else if(currentFrame)++currentFrame->mergedDraws;
      auto pipeline=topologyPipeline(op.pipeline,op.topology);
      if(pipeline!=boundPipeline){CmdBindPipeline(cmd,VK_PIPELINE_BIND_POINT_GRAPHICS,pipeline);boundPipeline=pipeline;}
-     if(currentFrame)++currentFrame->draws;
+     if(currentFrame)++currentFrame->draws;++cur.draws;
      if(!dynamicBound || memcmp(&boundViewport,&op.viewport,sizeof(op.viewport))){CmdSetViewport(cmd,0,1,&op.viewport);boundViewport=op.viewport;}
      if(!dynamicBound || memcmp(&boundScissor,&op.scissor,sizeof(op.scissor))){CmdSetScissor(cmd,0,1,&op.scissor);boundScissor=op.scissor;}
      dynamicBound=true;
@@ -1663,6 +1714,11 @@ public:
       pb(barrierProducers|VK_PIPELINE_STAGE_HOST_BIT,VK_PIPELINE_STAGE_VERTEX_INPUT_BIT|barrierProducers,0,1,&barrier,0,nullptr,0,nullptr);}
      else {barrier.srcAccessMask=VK_ACCESS_MEMORY_WRITE_BIT;barrier.dstAccessMask=VK_ACCESS_MEMORY_READ_BIT|VK_ACCESS_MEMORY_WRITE_BIT;
      pb(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,0,1,&barrier,0,nullptr,0,nullptr);}}
+    if(passQ && opIndex==passEnd && passInfos.size()<passStampLimit){ // stamp after the pass and its closing barrier
+     PassInfo info{};if(op.texture && op.pipeline)info=cur;
+     else {info.kind=op.clearOnly?1:2;if(op.texture){info.width=op.texture->levelWidth(op.dstLevel);info.height=op.texture->levelHeight(op.dstLevel);}if(op.clearOnly)info.colors=op.colorCount;}
+     info.copies=stampCopies;info.barriers=stampBarriers;stampCopies=stampBarriers=0;passInfos.push_back(info);CmdWriteTimestamp(cmd,VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,passQ,uint32_t(passInfos.size()));
+    }
    }
    barrier.srcAccessMask=VK_ACCESS_MEMORY_WRITE_BIT;barrier.dstAccessMask=VK_ACCESS_HOST_READ_BIT;
    pb(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,VK_PIPELINE_STAGE_HOST_BIT,0,1,&barrier,0,nullptr,0,nullptr);
@@ -1703,7 +1759,7 @@ public:
    if(timestamps){uint64_t ticks[2]{};check(GetQueryPoolResults(device,timestamps,0,2,sizeof(ticks),ticks,sizeof(uint64_t),VK_QUERY_RESULT_64_BIT));
     uint64_t mask=timestampBits>=64?UINT64_MAX:(uint64_t(1)<<timestampBits)-1;
     uint64_t elapsed=(uint64_t)(double((ticks[1]-ticks[0])&mask)*timestampPeriod);
-    gpuNanos.fetch_add(elapsed);if(currentFrame){currentFrame->gpuExec+=elapsed;++currentFrame->gpuSamples;}++gpuSamples;
+    gpuNanos.fetch_add(elapsed);if(currentFrame){currentFrame->gpuExec+=elapsed;++currentFrame->gpuSamples;}++gpuSamples;readPassTimes(passQ,passInfos,elapsed);
    }
    auto invalidateStart=std::chrono::steady_clock::now();
    for(auto *t:textures)if(t->mapped && !coherent(t->memoryType)) {VkMappedMemoryRange r{};r.sType=VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;r.memory=t->memory;r.size=VK_WHOLE_SIZE;++invalidateCalls;check(InvalidateMappedMemoryRanges(device,1,&r));}
@@ -1731,7 +1787,7 @@ public:
    for(const auto &op:ops){if(op.pipeline && std::find(pinnedPipelines.begin(),pinnedPipelines.end(),op.pipeline)==pinnedPipelines.end())pinnedPipelines.push_back(op.pipeline);
     auto add=[&](Sampler *s){if(s && std::find(pinnedSamplers.begin(),pinnedSamplers.end(),s)==pinnedSamplers.end())pinnedSamplers.push_back(s);};add(op.sampler);for(auto *s:op.samplers)add(s);}
    pinPhase.reset();auto retired=std::make_shared<bool>(false);
-   std::function<void()> finish=[this,&slot,fence,timestamps,pinnedBuffers,pinnedTextures,pinnedPipelines,pinnedSamplers,sampleViews,frames,emptyRenders,aliasBuffer,neutralBuffer,submitQueued,retired] {
+   std::function<void()> finish=[this,&slot,fence,timestamps,passQ,passInfos,pinnedBuffers,pinnedTextures,pinnedPipelines,pinnedSamplers,sampleViews,frames,emptyRenders,aliasBuffer,neutralBuffer,submitQueued,retired] {
     // Fence waits never hold the device/recording mutex. One owner retires each ticket.
     if(*retired)return;*retired=true;
     auto waitStart=FrameClock::now();VkResult result;
@@ -1752,7 +1808,7 @@ public:
      if(timestamps){uint64_t ticks[2]{};check(GetQueryPoolResults(device,timestamps,0,2,sizeof(ticks),ticks,sizeof(uint64_t),VK_QUERY_RESULT_64_BIT));
       uint64_t mask=timestampBits>=64?UINT64_MAX:(uint64_t(1)<<timestampBits)-1;
       uint64_t elapsed=uint64_t(double((ticks[1]-ticks[0])&mask)*timestampPeriod);
-      gpuNanos+=elapsed;if(currentFrame){currentFrame->gpuExec+=elapsed;++currentFrame->gpuSamples;}++gpuSamples;
+      gpuNanos+=elapsed;if(currentFrame){currentFrame->gpuExec+=elapsed;++currentFrame->gpuSamples;}++gpuSamples;readPassTimes(passQ,passInfos,elapsed);
      }
      auto invalidateStart=FrameClock::now();
      for(auto *t:pinnedTextures)if(t->mapped && !coherent(t->memoryType)){VkMappedMemoryRange r{};r.sType=VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;r.memory=t->memory;r.size=VK_WHOLE_SIZE;++invalidateCalls;check(InvalidateMappedMemoryRanges(device,1,&r));}
@@ -1772,7 +1828,7 @@ public:
    submitToQueue();if(scheduled)scheduled();
    submitted=false;completed=true;
    *retirement=std::move(finish);
-  } catch(...) {if(submitted){poisoned=true;slot.busy=false;submitWake.notify_all();}else if(!completed){for(auto old:oldTextures){old.texture->layout=old.layout;old.texture->levelLayouts=old.levelLayouts;old.texture->defined=old.defined;old.texture->definedLevels=old.definedLevels;}clearSubmitObjects(slot);cleanup();}
+  } catch(...) {if(submitted){poisoned=true;slot.busy=false;submitWake.notify_all();}else if(!completed){for(auto old:oldTextures){old.texture->layout=old.layout;old.texture->levelLayouts=old.levelLayouts;old.texture->defined=old.defined;old.texture->definedLevels=old.definedLevels;old.texture->shadowHash=old.shadowHash;old.texture->shadowHashed=old.shadowHashed;}clearSubmitObjects(slot);cleanup();}
    try{throw;}catch(const std::exception &e){if(diagnosticOp<ops.size() && !ops[diagnosticOp].diagnostic.empty())throw std::runtime_error(std::string(e.what())+" desc="+ops[diagnosticOp].diagnostic);throw;}
   }
  }

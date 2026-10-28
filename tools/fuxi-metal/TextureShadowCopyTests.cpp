@@ -42,7 +42,10 @@ int main(){
    assert(((uint8_t *)sources[i].buffer->contents)[0]==(full || fallback?0xa7:3));
   }
   assert(!memcmp(targetBuffer->contents,p+out->length-16*16*4,16*16*4));
-  assert(copied==bytes && trace.textureRepitchedBytes==repitched*5);return std::vector<uint8_t>(p,p+out->length);
+  // Unchanged-backing skip: the first run of a frame (full) has new bytes and copies each texture once; later runs of that frame copy nothing, with identical pixels.
+  bool hashOn=systemTranslationPolicy().shadowHash;
+  assert(copied==bytes && trace.textureRepitchedBytes==(hashOn?(full?repitched:0):repitched*5));
+  assert(hashOn?(full || (trace.shadowHashSkipped>0 && !trace.shadowHashCopied)):(!trace.shadowHashSkipped && !trace.shadowHashCopied));return std::vector<uint8_t>(p,p+out->length);
  };
  for(unsigned frame=0;frame<3;++frame){auto reference=run(true,frame,false);assert(run(false,frame,false)==reference);assert(run(false,frame,true)==reference);assert(run(false,frame,false)==reference);assert(run(false,frame,false,true)==reference);}
  printf("PASS: 25 linear textures/125 draws, CPU writes between frames, frozen post-commit bytes, sampled pitch mismatch full/bounded/fallback pixels; per-stage CPU bytes %llu -> %llu; GPU repitch bytes unchanged %llu (%s)\n",(unsigned long long)before,(unsigned long long)after,(unsigned long long)(repitched*5),systemTranslationPolicy().overlap?"overlap":"synchronous");
