@@ -771,7 +771,7 @@ static void ar_tests(uint8_t *panel) {
  // The monitor does not arm while a copy is open.
  fg_scanout_copy_open=1;ar_run();assert(fg_scanout_ar_state==4 && !(intf[0x2b4/4]&0x80000000u));fg_scanout_copy_open=0;
  ar_run();
- assert(fg_scanout_ar_state==1 && intf[0x2b4/4]==0x80000001u && fg_scanout_ar_fetch==0 && fg_scanout_ar_pending==1 && fg_scanout_ar_st[FG_AR_ON]==1);
+ assert(fg_scanout_ar_state==1 && intf[0x2b4/4]==0x80000000u && fg_scanout_ar_idx==0 && fg_scanout_ar_fetch==0 && fg_scanout_ar_pending==1 && fg_scanout_ar_st[FG_AR_ON]==1);
  // Verification: the write line is active in most samples with no START; the address latches at line 300.
  unsigned te=10,lines=0;
  for(unsigned i=0;i<60;i++){
@@ -795,14 +795,14 @@ static void ar_tests(uint8_t *panel) {
  assert(fg_scanout_ar_fetch==0 && !fg_scanout_ar_pending && fg_scanout_ar_hold==2u && fg_scanout_ar_ll[0]==1);
  assert(fuxi_gpu_scanout_acquire()==1 && fg_scanout_copy==2);
  assert(fuxi_gpu_scanout_publish()==1 && fg_scanout_front==2);
- intf[0x298/4]=((te+1)<<16)|(0x960u+1000);te++;
+ ticks+=8400;
  sspp[0xa4/4]=0xb9400000u;ar_run(); // latched, buffer 0 held until the next TE
  assert(fg_scanout_ar_fetch==2 && fg_scanout_ar_hold==1u);
  assert(fuxi_gpu_scanout_acquire()==1 && fg_scanout_copy==1);
  // With every other buffer busy (staged unlatched + latched + held) there is nothing to copy into.
  assert(fuxi_gpu_scanout_publish()==1 && fg_scanout_front==1 && fg_scanout_ar_pending);
  assert(!fuxi_gpu_scanout_acquire() && fg_scanout_ar_st[FG_AR_TARGET_WAIT]==1 && !fg_scanout_writable);
- intf[0x298/4]=((te+1)<<16)|(0x960u+1000);te++;ar_run();
+ ticks+=8400;ar_run();
  assert(!fg_scanout_ar_hold && fuxi_gpu_scanout_acquire()==1 && fg_scanout_copy==0);
  assert(fuxi_gpu_scanout_publish()==1 && fg_scanout_front==0);
  sspp[0xa4/4]=0xb8000000u;intf[0x2b0/4]=2400;ar_run();assert(!fg_scanout_ar_pending && fg_scanout_ar_fetch==0);
@@ -810,11 +810,11 @@ static void ar_tests(uint8_t *panel) {
  assert(fuxi_gpu_scanout_acquire()==1 && fuxi_gpu_scanout_publish()==1 && fg_scanout_front==1);
  sspp[0xa4/4]=0xb8a00000u;intf[0x2b0/4]=1500;ar_run();assert(fg_scanout_ar_st[FG_AR_LATCH_MID]==1 && fg_scanout_ar_ll[4]==1);
  // Idle: 48 TEs without a flip disable autorefresh and the staged source is the latched one.
- intf[0x2b0/4]=2400;te+=50;intf[0x298/4]=(te<<16)|(0x960u+1000);ar_run();
+ intf[0x2b0/4]=2400;ticks+=50*8333;ar_run();
  assert(fg_scanout_ar_state==0 && !(intf[0x2b4/4]&0x80000000u) && fg_scanout_front==fg_scanout_ar_fetch && fg_scanout_ar_st[FG_AR_OFF_IDLE]==1);
  // The next present re-arms it without a new verification.
  fg_scanout_ar_arming();assert(fg_scanout_ar_state==4);
- ar_run();assert(fg_scanout_ar_state==2 && intf[0x2b4/4]==0x80000001u && fg_scanout_ar_st[FG_AR_ON]==2);
+ ar_run();assert(fg_scanout_ar_state==2 && intf[0x2b4/4]==0x80000000u && fg_scanout_ar_st[FG_AR_ON]==2);
  // CPU fallback disables it first.
  (void)fuxi_gpu_scanout_cpu_acquire();
  assert(fg_scanout_ar_state==0 && !(intf[0x2b4/4]&0x80000000u) && fg_scanout_ar_st[FG_AR_OFF_CPU]==1);
@@ -828,10 +828,19 @@ static void ar_tests(uint8_t *panel) {
  sspp[0xa4/4]=0xb8000000u;
  ar_manual_publish(30);ar_run();
  assert(fg_scanout_ar_state==1 && fg_scanout_front==1);
- te=30;
- for(unsigned i=0;i<110 && fg_scanout_ar_state==1;i++){ticks+=1000;intf[0x2b0/4]=2400;if(i%8==7)te++;intf[0x298/4]=(te<<16)|(0x960u+1000);ar_run();}
- assert(fg_scanout_ar_state==3 && !(intf[0x2b4/4]&0x80000000u) && fg_scanout_ar_st[FG_AR_OFF_FAIL]==1 && fg_scanout_front==0 && sspp[0x14/4]==0xb8000000u && fg_scanout_ar_st[FG_AR_DROPS]==1);
+ // Count 0 never repeats (line idle): after 100 ms count 1 is tried, then the mode is given up for the boot and the staged source restored.
+ for(unsigned i=0;i<400 && (fg_scanout_ar_state==1 || fg_scanout_ar_state==4);i++){ticks+=1000;intf[0x2b0/4]=2400;ar_run();}
+ assert(fg_scanout_ar_state==3 && fg_scanout_ar_idx==1 && !(intf[0x2b4/4]&0x80000000u) && fg_scanout_ar_st[FG_AR_OFF_FAIL]==2 && fg_scanout_front==0 && sspp[0x14/4]==0xb8000000u && fg_scanout_ar_st[FG_AR_DROPS]==1 && fg_scanout_ar_st[FG_AR_ON]==2);
+ // Hardware that repeats every second TE (F185, count 1): count 0 shows 48% duty (too low for 95%), count 1 is confirmed at 48%.
+ triple_setup(panel);
+ fg_scanout_panel120_active=1;fg_scanout_period_us=8333;fg_scanout_te_init=0x960;fg_scanout_ar_state=0;fg_scanout_ar_idx=0;fg_scanout_ar_confirmed=0;fg_scanout_ar_busy=0;fg_scanout_ar_flip_valid=0;memset(fg_scanout_ar_st,0,sizeof(fg_scanout_ar_st));
+ sspp[0xa4/4]=0xb8000000u;
+ ar_manual_publish(35);ar_run();
+ assert(fg_scanout_ar_state==1 && intf[0x2b4/4]==0x80000000u);
+ for(unsigned i=0;i<400 && fg_scanout_ar_state!=2 && fg_scanout_ar_state!=3;i++){ticks+=1000;intf[0x2b0/4]=(i%21)<10?300:2400;ar_run();}
+ assert(fg_scanout_ar_state==2 && fg_scanout_ar_idx==1 && fg_scanout_ar_confirmed && intf[0x2b4/4]==0x80000001u && fg_scanout_ar_st[FG_AR_ON]==2 && fg_scanout_ar_st[FG_AR_OFF_FAIL]==1);
  // The latched source is not one of A/B/C: autorefresh is never enabled.
+ fg_scanout_ar_state=0;fg_scanout_ar_idx=0;
  triple_setup(panel);
  fg_scanout_panel120_active=1;fg_scanout_period_us=8333;fg_scanout_te_init=0x960;fg_scanout_ar_state=0;fg_scanout_ar_busy=0;sspp[0xa4/4]=0xb8000000u;
  ar_manual_publish(40);sspp[0xa4/4]=0x12345678u;ar_run();
