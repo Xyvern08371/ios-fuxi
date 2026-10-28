@@ -223,6 +223,12 @@ static int fuxi_gpu_ready(void) {return state==1;}
 static void g3_emit(uint32_t v) {ring[g3_wptr++&8191]=v;}
 static unsigned pmapWalks;
 static ppnum_t pmap_find_phys(unsigned map,uintptr_t va) {(void)map; pmapWalks++; return (unsigned)(0x200000+((va>>14)&0xfff)*3);}
+static unsigned char modTab[4096];static unsigned pokes,pokeSets=1,invalidPages;
+#define MODIDX(p) (((p)-0x200000)/3)
+#define FG_ABI_DTY_POKE(p) do{pokes++;if(pokeSets)modTab[(((uintptr_t)(p))>>14)&0xfff]=1;}while(0)
+static int pmap_valid_page(ppnum_t p) {(void)p;return !invalidPages;}
+static int pmap_is_modified(ppnum_t p) {return modTab[MODIDX(p)];}
+static void pmap_clear_modify(ppnum_t p) {modTab[MODIDX(p)]=0;}
 static void clock_interval_to_deadline(unsigned n,unsigned scale,uint64_t *d) {*d=ticks+(uint64_t)n*scale/1000;}
 static void thread_call_setup_with_options(thread_call_data_t *c,void (*fn)(void *,void *),void *arg,unsigned pri,unsigned opt) {(void)arg;(void)pri;(void)opt;c->fn=fn;}
 static int thread_call_enter_delayed(thread_call_data_t *c,uint64_t d) {(void)c;(void)d;enqueued++;return 0;}
@@ -245,6 +251,7 @@ static void seed(void) {
  memset(fg_abi_ibs,0,sizeof(fg_abi_ibs));memset(fg_abi_stall_stats,0,sizeof(fg_abi_stall_stats));
  memset(fg_abi_maps,0,sizeof(fg_abi_maps));fg_abi_map_seq=fg_abi_submit_map_seq=0;
 }
+static unsigned wait_us(void){unsigned k;return fuxi_gpu_abi_submit_wait_us(&k);}
 static unsigned wakes;static void count_wake(void) {wakes++;}
 static void reset(void) {
  seed();
@@ -492,10 +499,37 @@ int main(void) {
  complete();fg_abi_watch(NULL,NULL);assert(!cacheInvalidate);
  assert(!fuxi_gpu_abi_unmap(va,16384) && cacheInvalidate==256 && !fg_abi_imports[0].iova && !fg_abi_imports[0].gpu_only);
  assert(!fuxi_gpu_abi_unmap(va+0x10000,16384) && cacheInvalidate==256);
+ // Per-page dirty tracking (bit 524288): clear then clean at map, only modified pages cleaned at submit, fail closed.
+ {
+  struct fuxi_gpu_clean_split cs;
+  reset();fg_abi_dirty=1;fg_abi_dty_ok=0;memset(fg_abi_dty_used,0,sizeof(fg_abi_dty_used));memset(modTab,0,sizeof(modTab));pokeSets=1;pokes=0;invalidPages=0;fuxi_gpu_abi_clean_split(&cs);
+  unsigned pg=(unsigned)((source>>14)&0xfff);if(pg>4090)pg=0;
+  assert(!fuxi_gpu_abi_map_import(va,source,49152,3) && fg_abi_dty_ok==1 && pokes==1 && fg_abi_imports[0].dty_first==1 && fg_abi_imports[0].dty_pages==3 && fg_abi_dty_used[0]);
+  assert(cacheClean==768 && !modTab[pg] && !modTab[pg+1] && !modTab[pg+2]);
+  cacheClean=0;modTab[pg+1]=1; // a CPU store after the map
+  assert(!fuxi_gpu_abi_submit(addresses,sizes,1,&fence) && cacheClean==256 && !modTab[pg+1]);
+  fuxi_gpu_abi_clean_split(&cs);
+  assert(cs.dty_state==2 && cs.dty_checked==3 && cs.dty_dirty==1 && cs.dty_kib==16 && cs.dty_imports==1 && !cs.dty_full_kib && cs.submits==1);
+  complete();fg_abi_watch(NULL,NULL);cacheClean=0;
+  assert(!fuxi_gpu_abi_submit(addresses,sizes,1,&fence) && !cacheClean); // nothing written since: nothing cleaned
+  fuxi_gpu_abi_clean_split(&cs);assert(cs.dty_checked==3 && !cs.dty_dirty);
+  complete();fg_abi_watch(NULL,NULL);
+  assert(!fuxi_gpu_abi_unmap(va,49152) && !fg_abi_dty_used[0] && !fg_abi_imports[0].dty_first);
+  // An unmanaged page, or a failed self-test, keeps the full clean (fail closed).
+  invalidPages=1;cacheClean=0;assert(!fuxi_gpu_abi_map_import(va,source,49152,3) && !fg_abi_imports[0].dty_first && !cacheClean);
+  assert(!fuxi_gpu_abi_submit(addresses,sizes,1,&fence) && cacheClean==768);fuxi_gpu_abi_clean_split(&cs);assert(cs.dty_full_kib==48 && !cs.dty_checked);
+  complete();fg_abi_watch(NULL,NULL);assert(!fuxi_gpu_abi_unmap(va,49152));
+  invalidPages=0;pokeSets=0;fg_abi_dty_ok=0;
+  assert(!fuxi_gpu_abi_map_import(va,source,49152,3) && fg_abi_dty_ok==2 && !fg_abi_imports[0].dty_first);
+  cacheClean=0;assert(!fuxi_gpu_abi_submit(addresses,sizes,1,&fence) && cacheClean==768);fuxi_gpu_abi_clean_split(&cs);assert(cs.dty_state==3);
+  complete();fg_abi_watch(NULL,NULL);assert(!fuxi_gpu_abi_unmap(va,49152));
+  // Retire IVAC is timed apart from the submit side.
+  fg_abi_dirty=0;pokeSets=1;fg_abi_dty_ok=0;
+ }
  // Submit wait hint: a held present gets the rest of the 4 ms hold, a running copy 1 ms, anything else 100 us.
- reset();fg_abi_hold=1;fg_abi_present_wait=1;fg_abi_hold_since=ticks=1000;assert(fuxi_gpu_abi_submit_wait_us()==4000);
- ticks=1000+3000;assert(fuxi_gpu_abi_submit_wait_us()==1001);ticks=1000+4000;assert(fuxi_gpu_abi_submit_wait_us()==1);
- fg_abi_present_wait=0;fg_busy=1;assert(fuxi_gpu_abi_submit_wait_us()==1000);fg_busy=0;assert(fuxi_gpu_abi_submit_wait_us()==100);fg_abi_hold=0;
+ reset();fg_abi_hold=1;fg_abi_present_wait=1;fg_abi_hold_since=ticks=1000;assert(wait_us()==4000);
+ ticks=1000+3000;assert(wait_us()==1001);ticks=1000+4000;assert(wait_us()==1);
+ fg_abi_present_wait=0;fg_busy=1;assert(wait_us()==1000);fg_busy=0;assert(wait_us()==100);fg_abi_hold=0;
  // A client job retiring wakes the waiters.
  {wakes=0;fuxi_gpu_abi_wake_hook=count_wake;reset();assert(!fuxi_gpu_abi_map(va,source,bytes,3,0,2) && !fuxi_gpu_abi_submit(addresses,sizes,1,&fence));
   complete();fg_abi_watch(NULL,NULL);assert(wakes>=1);fuxi_gpu_abi_wake_hook=NULL;}

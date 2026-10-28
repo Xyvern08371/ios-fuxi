@@ -39,7 +39,7 @@ void fuxi_gpu_abi_submit_split(uint64_t ns[8], uint32_t why[5], uint32_t n[2], u
 /* Wake hook (set by the userclient): called when a refused submit may now be admitted. Safe to call with it NULL. */
 extern void (*fuxi_gpu_abi_wake_hook)(void);
 #define FG_ABI_WAKE() do { if (fuxi_gpu_abi_wake_hook) fuxi_gpu_abi_wake_hook(); } while (0)
-unsigned fuxi_gpu_abi_submit_wait_us(void);
+unsigned fuxi_gpu_abi_submit_wait_us(unsigned *kind); /* kind: 0 rest of a present hold, 1 running copy, 2 other */
 struct fuxi_gpu_clean_split;
 void fuxi_gpu_abi_clean_split(struct fuxi_gpu_clean_split *out);
 void fuxi_gpu_abi_publish(void);

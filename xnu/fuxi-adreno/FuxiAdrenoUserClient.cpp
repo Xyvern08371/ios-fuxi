@@ -479,7 +479,7 @@ class FuxiAdrenoUserClient : public IOUserClient {
    if (!lookup()) return kIOReturnBadArgument;
    uint64_t deadline; clock_interval_to_deadline(150,NSEC_PER_MSEC,&deadline);
    uint64_t spBack=0, spSleep=0, spStart=mach_absolute_time();
-   unsigned spAtt=0, spWaits=0, spEvents=0;
+   unsigned spAtt=0, spWaits=0, spEvents=0, spWn[3]={}; uint64_t spWt[3]={};
    for (;;) {
     uint64_t fence=0, b0=mach_absolute_time();
     uint32_t seq0=abiEventSeq();
@@ -490,18 +490,20 @@ class FuxiAdrenoUserClient : public IOUserClient {
      uint64_t end=mach_absolute_time();
      abiSplit(FG_SPLIT_ARGS,spLook-sp0-spFence); abiSplit(FG_SPLIT_FENCE,spFence); abiSplit(FG_SPLIT_LOOKUP,spStart-spLook);
      abiSplit(FG_SPLIT_BACKEND,spBack); abiSplit(FG_SPLIT_SLEEP,spSleep); abiSplit(FG_SPLIT_TOTAL,end-sp0);
-     abiSplit(FG_SPLIT_BOS,r.buffer_count); abiSplit(FG_SPLIT_LIVE,liveBos_); abiSplit(FG_SPLIT_ATT,spAtt); abiSplit(FG_SPLIT_WAITS,spWaits); abiSplit(FG_SPLIT_EVENTS,spEvents); abiSplit(FG_SPLIT_DONE,0);
+     abiSplit(FG_SPLIT_BOS,r.buffer_count); abiSplit(FG_SPLIT_LIVE,liveBos_); abiSplit(FG_SPLIT_ATT,spAtt); abiSplit(FG_SPLIT_WAITS,spWaits); abiSplit(FG_SPLIT_EVENTS,spEvents);
+     for (unsigned k=0;k<3;k++) { abiSplit(FG_SPLIT_WN0+k,spWn[k]); abiSplit(FG_SPLIT_WT0+k,spWt[k]); }
+     abiSplit(FG_SPLIT_DONE,0);
      return kIOReturnSuccess;
     }
     if (s<0) return kIOReturnIOError;
     if (mach_absolute_time()>=deadline) return kIOReturnBusy;
     uint64_t p0=mach_absolute_time();
-    unsigned us=fuxi_gpu_abi_submit_wait_us();
+    unsigned kind=2, us=fuxi_gpu_abi_submit_wait_us(&kind);
     IOLockUnlock(lock_); /* Never hold the ring mutex during scheduler waits, and let the other calls of this client run. */
     bool woke=abiEventWait(seq0,us);
     IOLockLock(lock_);
     uint64_t slept=mach_absolute_time()-p0;
-    spSleep+=slept; ++spWaits; if (woke) ++spEvents; abiStat(FG_ABI_STAT_SLEEP,slept);
+    spSleep+=slept; ++spWaits; if (woke) ++spEvents; abiStat(FG_ABI_STAT_SLEEP,slept); spWn[kind]++; spWt[kind]+=slept;
     if (!live_) return kIOReturnNotOpen;
     if (!lookup()) return kIOReturnBadArgument;
    }
@@ -678,7 +680,7 @@ extern "C" void fuxi_gpu_abi_stats_log(void)
 static void abiSplitReport(const uint64_t *sum, unsigned n, uint64_t lockMax, const unsigned *bn, const uint64_t *bm)
 {
  uint64_t t[FG_SPLIT_SUMS], ns[8], lmax, kib[2], rest; uint32_t why[5], c[2];
- for (unsigned i=0;i<=FG_SPLIT_TOTAL;i++) absolutetime_to_nanoseconds(sum[i],&t[i]);
+ for (unsigned i=0;i<FG_SPLIT_SUMS;i++) absolutetime_to_nanoseconds(sum[i],&t[i]);
  #define U10(v,d) (unsigned)(((v)/((d) ? (d) : 1))/100)
  #define T1(v,d) U10(v,d)/10,U10(v,d)%10
  rest=t[FG_SPLIT_TOTAL]>t[FG_SPLIT_ARGS]+t[FG_SPLIT_FENCE]+t[FG_SPLIT_LOOKUP]+t[FG_SPLIT_BACKEND]+t[FG_SPLIT_SLEEP] ?
@@ -695,8 +697,20 @@ static void abiSplitReport(const uint64_t *sum, unsigned n, uint64_t lockMax, co
  IOLog("FUXI GPU ABI: submit_split backend att %u ok %u ref %u (busy/hold/noq/pw/full %u/%u/%u/%u/%u) us/ok idle %u.%u frame %u.%u tlb %u.%u cache %u.%u ring %u.%u bell %u.%u"
      " lockwait %u.%u max %u.%u refused_us %u.%u\n",c[0],c[1],ref,why[0],why[1],why[2],why[3],why[4],
      T1(ns[0],ok),T1(ns[1],ok),T1(ns[2],ok),T1(ns[3],ok),T1(ns[4],ok),T1(ns[5],ok),T1(ns[6],c[0]),(unsigned)(lmax/100000)/10,(unsigned)(lmax/100000)%10,T1(ns[7],ref));
+ IOLog("FUXI GPU ABI: submit_split waits/submit by kind: hold %u.%u (%u us each) copy %u.%u (%u us each) other %u.%u (%u us each); event wakes %u of %u\n",
+     (unsigned)(sum[FG_SPLIT_WN0]*10/n)/10,(unsigned)(sum[FG_SPLIT_WN0]*10/n)%10,(unsigned)(t[FG_SPLIT_WT0]/1000/(sum[FG_SPLIT_WN0] ? sum[FG_SPLIT_WN0] : 1)),
+     (unsigned)(sum[FG_SPLIT_WN1]*10/n)/10,(unsigned)(sum[FG_SPLIT_WN1]*10/n)%10,(unsigned)(t[FG_SPLIT_WT1]/1000/(sum[FG_SPLIT_WN1] ? sum[FG_SPLIT_WN1] : 1)),
+     (unsigned)(sum[FG_SPLIT_WN2]*10/n)/10,(unsigned)(sum[FG_SPLIT_WN2]*10/n)%10,(unsigned)(t[FG_SPLIT_WT2]/1000/(sum[FG_SPLIT_WN2] ? sum[FG_SPLIT_WN2] : 1)),
+     (unsigned)sum[FG_SPLIT_EVENTS],(unsigned)sum[FG_SPLIT_WAITS]);
  struct fuxi_gpu_clean_split cs;
  fuxi_gpu_abi_clean_split(&cs);
+ if (cs.dty_state) {
+  uint64_t pg=cs.dty_checked ? cs.dty_checked : 1; unsigned sb=cs.submits ? cs.submits : 1;
+  IOLog("FUXI GPU ABI: submit_split dirty state %u (2 active 3 refused) tracked_imports %u submits %u per submit: pages_checked %u dirty %u kb_cleaned %u full_kb %u check_us %u.%u clean_us %u.%u"
+      " per_page_ns %u ivac_us %u.%u\n",cs.dty_state,cs.dty_imports,cs.submits,(unsigned)(cs.dty_checked/sb),(unsigned)(cs.dty_dirty/sb),(unsigned)(cs.dty_kib/sb),(unsigned)(cs.dty_full_kib/sb),
+      (unsigned)(cs.dty_check_ns/sb/1000),(unsigned)(cs.dty_check_ns/sb/100)%10,(unsigned)(cs.dty_clean_ns/sb/1000),(unsigned)(cs.dty_clean_ns/sb/100)%10,
+      (unsigned)(cs.dty_check_ns/pg),(unsigned)(cs.ivac_ns/sb/1000),(unsigned)(cs.ivac_ns/sb/100)%10);
+ }
  IOLog("FUXI GPU ABI: submit_split clean/ok kb rw %u ro %u go_skip %u us rw %u.%u ro %u.%u imports %u gpu_only %u mapped_mb %u\n",
      (unsigned)(cs.kib[0]/ok),(unsigned)(cs.kib[1]/ok),(unsigned)(cs.go_kib/ok),T1(cs.ns[0],ok),T1(cs.ns[1],ok),cs.imports,cs.go_imports,(unsigned)(cs.mapped_kib>>10));
  IOLog("FUXI GPU ABI: submit_split buckets kb/us <64K %u/%u.%u <1M %u/%u.%u <16M %u/%u.%u big %u/%u.%u\n",

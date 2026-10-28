@@ -19,7 +19,7 @@ static thread_call_data_t fg_client_watchdog;
 /* Every mapped import can be referenced indirectly by PM4, not just the IB
  * list. Serialize cache handoff with the same GPU lock as submit/retirement.
  * The user client owns these prepared kernel mappings until successful unmap. */
-static struct { uint64_t iova, bytes; uintptr_t source; unsigned permissions, gpu_only; } fg_abi_imports[FG_ABI_MAX_IMPORTS];
+static struct { uint64_t iova, bytes; uintptr_t source; unsigned permissions, gpu_only, dty_first, dty_pages; } fg_abi_imports[FG_ABI_MAX_IMPORTS];
 static unsigned fg_abi_host_handoff, fg_abi_ncimport, fg_abi_unstick, fg_abi_cohtest, fg_abi_tlbpages, fg_abi_mapwait, fg_abi_queue, fg_abi_roimport, fg_abi_pace;
 /* Queue mode (bit 512): jobs in flight are seq-completed, at most this many; stats: queued, deepest chain, refused for a waiting present, refused full. */
 #define FG_ABI_QUEUE_MAX 4u
@@ -31,7 +31,7 @@ void (*fuxi_gpu_abi_wake_hook)(void);
 #define FG_ABI_WAKE() do { if (fuxi_gpu_abi_wake_hook) fuxi_gpu_abi_wake_hook(); } while (0)
 #endif
 static unsigned fg_abi_start;
-static unsigned fg_abi_probe, fg_abi_spin, fg_abi_mid, fg_abi_ar, fg_abi_hard;
+static unsigned fg_abi_probe, fg_abi_spin, fg_abi_mid, fg_abi_ar, fg_abi_hard, fg_abi_dirty;
 static uint64_t fg_abi_hold_since;
 /* Ticks the last fuxi_gpu_abi_map spent after taking the GPU lock (the caller's total minus this is the wait for that lock). */
 static uint64_t fg_abi_map_work;
@@ -72,6 +72,88 @@ static void fg_abi_cache_region(uintptr_t source, uint64_t bytes, int complete)
  if (complete) fg_abi_invalidated+=bytes;
  else fg_abi_cleaned+=bytes;
 }
+/* Per-page dirty tracking of import cleans (fuxigpuncimport bit 524288). The CPU-written pages of an import are found with the pmap modify
+ * bit instead of cleaning every byte at every submit. Protocol per 16K page: pmap_clear_modify (write-protects every mapping and flushes
+ * the TLB, so the next CPU store faults and arm_fast_fault sets the bit again) BEFORE the clean, so a store between the two is cleaned
+ * now or flagged again for the next submit, never lost. Fail closed: an import whose pages are not all managed, whose page list does not
+ * fit, or any import once the self-test refused, keeps the full clean at every submit. Kernel stores through a wired mapping or the
+ * physical aperture do not set the bit; this driver writes no import pages (alloc zeroing is for allocated BOs, the coherency probe uses
+ * its own page). */
+#define FG_DTY_CHUNK 64u
+#define FG_DTY_CHUNKS 512u
+#ifndef FG_ABI_DTY_POKE
+#define FG_ABI_DTY_POKE(p) do { uint32_t v_; do { v_=*(volatile uint32_t *)(p); } while (!__sync_bool_compare_and_swap((volatile uint32_t *)(p),v_,v_)); } while (0)
+#endif
+static ppnum_t fg_abi_dty_ppn[FG_DTY_CHUNKS*FG_DTY_CHUNK];
+static uint8_t fg_abi_dty_used[FG_DTY_CHUNKS];
+static unsigned fg_abi_dty_ok; /* 0 untested, 1 the modify bit tracks stores, 2 refused */
+/* window stats: pages checked, pages dirty, bytes cleaned, bytes of untracked full cleans, ticks checking, ticks cleaning, ticks of retire IVAC, submits, tracked imports mapped */
+static uint64_t fg_abi_dty_st[9];
+static int fg_abi_dty_selftest(uintptr_t source, ppnum_t ppn)
+{
+ pmap_clear_modify(ppn);
+ if (pmap_is_modified(ppn)) return 1;
+ FG_ABI_DTY_POKE(source); /* same-value atomic store: a user store racing it is not overwritten */
+ if (!pmap_is_modified(ppn)) return 2;
+ pmap_clear_modify(ppn);
+ return pmap_is_modified(ppn) ? 3 : 0;
+}
+/* Track a freshly mapped import: 1 tracked (pages cleared and cleaned by the caller's clean), 0 not tracked. */
+static void fg_abi_dty_attach(unsigned slot, uintptr_t source, uint64_t bytes)
+{
+ fg_abi_imports[slot].dty_first=fg_abi_imports[slot].dty_pages=0;
+ if (!fg_abi_dirty || fg_abi_dty_ok==2 || fg_abi_coh==1) return;
+ unsigned pages=(unsigned)(bytes>>PAGE_SHIFT), need=(pages+FG_DTY_CHUNK-1)/FG_DTY_CHUNK, first=FG_DTY_CHUNKS;
+ if (!pages || need>FG_DTY_CHUNKS) return;
+ for (unsigned c=0,run=0;c<FG_DTY_CHUNKS;c++) {
+  run=fg_abi_dty_used[c] ? 0 : run+1;
+  if (run==need) { first=c+1-need; break; }
+ }
+ if (first==FG_DTY_CHUNKS) return;
+ ppnum_t *pp=&fg_abi_dty_ppn[first*FG_DTY_CHUNK];
+ for (unsigned i=0;i<pages;i++) {
+  ppnum_t ppn=pmap_find_phys(kernel_pmap,source+((uintptr_t)i<<PAGE_SHIFT));
+  if (!ppn || !pmap_valid_page(ppn)) return;
+  pp[i]=ppn;
+ }
+ if (!fg_abi_dty_ok) {
+  int r=fg_abi_dty_selftest(source,pp[0]);
+  fg_abi_dty_ok=r ? 2 : 1;
+  printf("FUXI GPU ABI: import dirty tracking self-test %s (%d)\n",r ? "refused, full cleans stay" : "passed",r);
+  if (r) return;
+ }
+ for (unsigned i=0;i<pages;i++) pmap_clear_modify(pp[i]);
+ for (unsigned c=0;c<need;c++) fg_abi_dty_used[first+c]=1;
+ fg_abi_imports[slot].dty_first=first+1; fg_abi_imports[slot].dty_pages=pages;
+ fg_abi_dty_st[8]++;
+}
+static void fg_abi_dty_detach(unsigned slot)
+{
+ if (!fg_abi_imports[slot].dty_first) return;
+ unsigned first=fg_abi_imports[slot].dty_first-1, need=(fg_abi_imports[slot].dty_pages+FG_DTY_CHUNK-1)/FG_DTY_CHUNK;
+ for (unsigned c=0;c<need;c++) fg_abi_dty_used[first+c]=0;
+ fg_abi_imports[slot].dty_first=fg_abi_imports[slot].dty_pages=0;
+}
+/* The submit clean of one tracked import: only pages whose modify bit is set. */
+static void fg_abi_dty_clean(unsigned slot)
+{
+ const ppnum_t *pp=&fg_abi_dty_ppn[(fg_abi_imports[slot].dty_first-1)*FG_DTY_CHUNK];
+ const uintptr_t source=fg_abi_imports[slot].source;
+ const unsigned pages=fg_abi_imports[slot].dty_pages;
+ uint64_t t0=rsr("cntpct_el0"), clean=0, dirty=0;
+ for (unsigned i=0;i<pages;i++) {
+  if (!pmap_is_modified(pp[i])) continue;
+  uint64_t c0=rsr("cntpct_el0");
+  pmap_clear_modify(pp[i]);
+  fg_abi_cache_region(source+((uintptr_t)i<<PAGE_SHIFT),1u<<PAGE_SHIFT,0);
+  clean+=rsr("cntpct_el0")-c0; dirty++;
+ }
+ uint64_t t1=rsr("cntpct_el0");
+ fg_abi_dty_st[0]+=pages; fg_abi_dty_st[1]+=dirty; fg_abi_dty_st[2]+=dirty<<PAGE_SHIFT;
+ fg_abi_dty_st[4]+=(t1-t0)-clean; fg_abi_dty_st[5]+=clean;
+ fg_abi_skipped+=(uint64_t)(pages-dirty)<<PAGE_SHIFT;
+ if (dirty) fg_abi_cc_note(fg_abi_imports[slot].permissions,dirty<<PAGE_SHIFT,clean);
+}
 static void fg_abi_import_cache(int complete)
 {
  if (complete && !fg_abi_host_handoff) return;
@@ -100,11 +182,14 @@ static void fg_abi_import_cache(int complete)
    fg_abi_skipped+=fg_abi_imports[i].bytes;
    continue;
   }
+  if (!complete && fg_abi_imports[i].dty_first && fg_abi_dty_ok==1) { fg_abi_dty_clean(i); continue; }
   uint64_t c0=rsr("cntpct_el0");
   fg_abi_cache_region(fg_abi_imports[i].source,fg_abi_imports[i].bytes,complete);
-  if (!complete) fg_abi_cc_note(fg_abi_imports[i].permissions,fg_abi_imports[i].bytes,rsr("cntpct_el0")-c0);
+  if (!complete) { fg_abi_cc_note(fg_abi_imports[i].permissions,fg_abi_imports[i].bytes,rsr("cntpct_el0")-c0); if (fg_abi_dirty) fg_abi_dty_st[3]+=fg_abi_imports[i].bytes; }
+  else fg_abi_dty_st[6]+=rsr("cntpct_el0")-c0;
  }
  __asm__ volatile("dsb sy" ::: "memory");
+ if (!complete) fg_abi_dty_st[7]++;
  fg_abi_host_handoff=!complete;
 }
 void fuxi_gpu_import_stats(uint64_t *cleaned, uint64_t *skipped, uint64_t *invalidated,
@@ -367,7 +452,7 @@ static int fg_abi_init(void)
 {
  unsigned bits=0;
  (void)PE_parse_boot_argn("fuxigpuncimport",&bits,sizeof(bits));
- fg_abi_ncimport=bits&1; fg_wptr_fence=(bits>>1)&1; fg_abi_unstick=(bits>>2)&1; fg_abi_cohtest=(bits>>6)&1; fg_abi_tlbpages=(bits>>7)&1; fg_abi_mapwait=(bits>>8)&1; fg_abi_queue=(bits>>9)&1; fg_abi_roimport=(bits>>10)&1; fg_abi_pace=(bits>>11)&1; fg_abi_hold=(bits>>12)&1; fg_abi_start=(bits>>13)&1; fg_abi_probe=(bits>>14)&1; fg_abi_spin=(bits>>15)&1; fg_abi_mid=(bits>>16)&1; fg_abi_ar=(bits>>17)&1; fg_abi_hard=(bits>>18)&1; fg_abi_hold_since=0; fg_abi_present_wait=0; memset(fg_abi_q_stats,0,sizeof(fg_abi_q_stats));
+ fg_abi_ncimport=bits&1; fg_wptr_fence=(bits>>1)&1; fg_abi_unstick=(bits>>2)&1; fg_abi_cohtest=(bits>>6)&1; fg_abi_tlbpages=(bits>>7)&1; fg_abi_mapwait=(bits>>8)&1; fg_abi_queue=(bits>>9)&1; fg_abi_roimport=(bits>>10)&1; fg_abi_pace=(bits>>11)&1; fg_abi_hold=(bits>>12)&1; fg_abi_start=(bits>>13)&1; fg_abi_probe=(bits>>14)&1; fg_abi_spin=(bits>>15)&1; fg_abi_mid=(bits>>16)&1; fg_abi_ar=(bits>>17)&1; fg_abi_hard=(bits>>18)&1; fg_abi_dirty=(bits>>19)&1; fg_abi_hold_since=0; fg_abi_present_wait=0; memset(fg_abi_q_stats,0,sizeof(fg_abi_q_stats));
  fg_abi_coh=fg_abi_coh_tries=0;
  for (unsigned i=0;i<sizeof(fg_abi_used)/sizeof(fg_abi_used[0]);i++) fg_abi_used[i]=0;
  /* 772 4K pages: root, two L2s, kernel runtime L3, 768 client L3s.
@@ -568,7 +653,9 @@ int fuxi_gpu_abi_map_import(uint64_t iova, uintptr_t source, uint64_t bytes, uns
  if (slot==FG_ABI_MAX_IMPORTS) return -1;
  int s=fg_abi_map_locked(iova,source,bytes,permissions,fg_abi_coh_wb,fg_abi_coh_wb ? 3 : 2); /* write-back only after the wb-ish self-test passed */
  if (!s) {
-  if ((gpu_only || (fg_abi_ncimport && (permissions&2))) && fg_abi_coh!=1) {
+  fg_abi_imports[slot].iova=0; /* not live until filled below */
+  fg_abi_dty_attach(slot,source,bytes); /* clears the modify bits before the clean below */
+  if ((gpu_only || fg_abi_imports[slot].dty_first || (fg_abi_ncimport && (permissions&2))) && fg_abi_coh!=1) {
    /* Before the first GPU use: publish preexisting CPU pixels/dirty lines.
     * The GPU lock prevents any submission until this handoff has finished. */
    __asm__ volatile("dsb sy" ::: "memory");
@@ -591,6 +678,7 @@ static void fg_abi_import_remove(uint64_t iova, uint64_t bytes)
     fg_abi_cache_region(fg_abi_imports[i].source,bytes,1);
     __asm__ volatile("dsb sy" ::: "memory");
    }
+   fg_abi_dty_detach(i);
    fg_abi_imports[i].iova=0; fg_abi_imports[i].gpu_only=0;
   }
 }
@@ -727,9 +815,10 @@ int fuxi_gpu_abi_submit(const uint64_t *iovas, const uint64_t *sizes,
 }
 /* Microseconds a refused submit should wait before trying again: the rest of the present hold (the copy submit wakes it earlier), up to
  * 1 ms for a running copy (its retirement wakes it), 100 us otherwise (nothing signals those; they stay polled). */
-unsigned fuxi_gpu_abi_submit_wait_us(void)
+unsigned fuxi_gpu_abi_submit_wait_us(unsigned *kind)
 {
  FG_GUARD;
+ *kind=fg_abi_hold && fg_abi_present_wait ? 0 : fg_busy ? 1 : 2;
  const uint64_t now=rsr("cntpct_el0"), f=rsr("cntfrq_el0");
  if (fg_abi_hold && fg_abi_present_wait && fg_abi_hold_since && f) {
   uint64_t end=fg_abi_hold_since+f*4/1000;
@@ -748,6 +837,10 @@ void fuxi_gpu_abi_clean_split(struct fuxi_gpu_clean_split *o)
  for (unsigned i=0;i<2;i++) { o->kib[i]=fg_abi_cc_bytes[i]>>10; o->ns[i]=fg_abi_cc_ticks[i]*1000000000ull/f; }
  for (unsigned i=0;i<4;i++) { o->bkt_kib[i]=fg_abi_cc_bb[i]>>10; o->bkt_ns[i]=fg_abi_cc_bt[i]*1000000000ull/f; }
  o->go_kib=fg_abi_cc_go>>10;
+ o->dty_state=fg_abi_dirty ? fg_abi_dty_ok+1 : 0; o->dty_checked=fg_abi_dty_st[0]; o->dty_dirty=fg_abi_dty_st[1]; o->dty_kib=fg_abi_dty_st[2]>>10; o->dty_full_kib=fg_abi_dty_st[3]>>10;
+ o->dty_check_ns=fg_abi_dty_st[4]*1000000000ull/f; o->dty_clean_ns=fg_abi_dty_st[5]*1000000000ull/f; o->ivac_ns=fg_abi_dty_st[6]*1000000000ull/f; o->submits=(uint32_t)fg_abi_dty_st[7];
+ o->dty_imports=0; for (unsigned i=0;i<FG_ABI_MAX_IMPORTS;i++) if (fg_abi_imports[i].iova && fg_abi_imports[i].dty_first) o->dty_imports++;
+ memset(fg_abi_dty_st,0,sizeof(fg_abi_dty_st)-sizeof(fg_abi_dty_st[0]));
  for (unsigned i=0;i<FG_ABI_MAX_IMPORTS;i++) if (fg_abi_imports[i].iova) {
   o->imports++; o->mapped_kib+=fg_abi_imports[i].bytes>>10; if (fg_abi_imports[i].gpu_only) o->go_imports++;
   for (unsigned k=0;k<3;k++) if (fg_abi_imports[i].bytes>o->top_kib[k]<<10 || !o->top_kib[k]) {

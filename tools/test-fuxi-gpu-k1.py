@@ -70,7 +70,7 @@ static void abiSplit(unsigned,uint64_t) {}
 static unsigned waitHint=100,eventWaits,lastWaitSeq;static uint32_t eventSeq;static bool eventWoke;
 static uint32_t abiEventSeq() {return eventSeq;}
 static int lastWaitDepth=-1;static bool abiEventWait(uint32_t seq0,unsigned) {eventWaits++;lastWaitSeq=seq0;lastWaitDepth=lockDepth;return eventWoke;}
-static unsigned fuxi_gpu_abi_submit_wait_us() {return waitHint;}
+static unsigned fuxi_gpu_abi_submit_wait_us(unsigned *k) {*k=1;return waitHint;}
 static const char *abiStep(unsigned) {return "test";}
 using OSObject=int;using IOExternalMethodDispatch=int;
 struct IOExternalMethodArguments {

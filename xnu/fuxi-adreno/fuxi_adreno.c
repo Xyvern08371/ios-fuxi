@@ -731,7 +731,7 @@ int fuxi_gpu_poll(struct fg_times *t)
   if (fg_scanout_requested && !fg_scanout_verify()) {
    fg_fail("scanout pixel mismatch", 0x604);
    int drained = fg_isolate();
-   fg_busy = 0;
+   fg_busy = 0; FG_ABI_WAKE();
    if (!drained && fg_scanout_owned) (void)fg_scanout_stop("GPU DMA drain failed");
    return drained ? -1 : -2;
   }
@@ -743,7 +743,7 @@ int fuxi_gpu_poll(struct fg_times *t)
  fg_fail("async present fence/fault/deadline", 0x603);
  /* Only fault containment has bounded register polling; no scheduler wait. */
  int drained = fg_isolate();
- fg_busy = 0;
+ fg_busy = 0; FG_ABI_WAKE();
  if (!drained && fg_scanout_owned) (void)fg_scanout_stop("GPU DMA drain failed");
  t->wait += mach_absolute_time()-fg_submit_time;
  return drained ? -1 : -2;
