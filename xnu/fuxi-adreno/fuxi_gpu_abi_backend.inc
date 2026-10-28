@@ -83,6 +83,10 @@ static void fg_abi_cache_region(uintptr_t source, uint64_t bytes, int complete)
 #define FG_DTY_CHUNK 64u
 #define FG_DTY_CHUNKS 512u
 #ifndef FG_ABI_DTY_POKE
+/* kernel build: the osfmk pmap reference/modify routines have no bsd/dev prototypes */
+extern void pmap_clear_modify(ppnum_t pn);
+extern boolean_t pmap_is_modified(ppnum_t pn);
+extern boolean_t pmap_valid_page(ppnum_t pn);
 #define FG_ABI_DTY_POKE(p) do { uint32_t v_; do { v_=*(volatile uint32_t *)(p); } while (!__sync_bool_compare_and_swap((volatile uint32_t *)(p),v_,v_)); } while (0)
 #endif
 static ppnum_t fg_abi_dty_ppn[FG_DTY_CHUNKS*FG_DTY_CHUNK];
