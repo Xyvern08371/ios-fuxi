@@ -260,6 +260,7 @@ static void gpu_model(void) {
  if(cohMode==3) {ticks+=60000;return;}
  if(cohMode==4) {fault=1;regs[0x928]=1;return;}
  const uint64_t base=FG_ABI_VA_START+FG_ABI_VA_SIZE-0x10000;
+ unsigned coh=cohMode==1 || (cohMode==6 && (*fg_abi_leaf(base+0x4000)&(1u<<2)) && ((*fg_abi_leaf(base+0x4000)>>8)&3)==3);
  uint32_t *ib=(uint32_t *)(scratch+(FG_ABI_COH_IB-G_MEM));
  uint32_t *res=(uint32_t *)(scratch+(FG_ABI_COH_RES-G_MEM));
  uint32_t *page=(uint32_t *)fg_abi_coh_page;
@@ -268,9 +269,9 @@ static void gpu_model(void) {
   unsigned op=(ib[at]>>16)&0x7f,n=ib[at]&0x3fff;
   if(op==0x73) {assert(n==5 && !ib[at+1]);uint64_t dst=ib[at+2],src=ib[at+4];
    assert(dst>=base+0x1000 && dst<base+0x1040 && src>=base+0x4000 && src<base+0x4200 && !(src&3));
-   uint32_t v=cohMode==1 || (cohMode==5 && dst!=base+0x1000+12) ? page[(src-base-0x4000)/4] : 0; res[(dst-base-0x1000)/4]=v;m2m++;}
+   uint32_t v=coh || (cohMode==5 && dst!=base+0x1000+12) ? page[(src-base-0x4000)/4] : 0; res[(dst-base-0x1000)/4]=v;m2m++;}
   else if(op==0x3d) {assert(n==3);uint64_t dst=ib[at+1];assert(dst>=base+0x4200 && dst<base+0x4400 && !ib[at+2]);
-   if(cohMode==1 || cohMode==5) page[(dst-base-0x4000)/4]=ib[at+3];wr++;}
+   if(coh || cohMode==5) page[(dst-base-0x4000)/4]=ib[at+3];wr++;}
   else assert(op==0x12 || op==0x26);
   at+=1+n;
  }
@@ -690,26 +691,29 @@ int main(void) {
  assert(fuxi_gpu_abi_unmap(va,16384)==-1 && fg_abi_poisoned && delays==1000); /* TLBSYNC never completes */
  puts("PASS: ranged TLBIVAL on small unmap (VA|ASID format, sync, 512-page limit, ASID fallback) and fail-closed on write/sync failure");
  /* Coherent-import self-test (value 64): only a fully matching run skips import cache maintenance. */
- for(unsigned mode=1;mode<=5;mode++) {
+ for(unsigned mode=1;mode<=6;mode++) {
   seed();ncimportArg=64;assert(fg_abi_init());assert(fg_abi_cohtest && !fg_abi_ncimport && !fg_abi_coh);
   assert(!fuxi_gpu_abi_map(va-0x100000,source,4096,3,0,2) && !fuxi_gpu_abi_unmap(va-0x100000,4096)); /* no probe before an import */
   assert(!fg_abi_coh && !delays && !doorbells);
   cohMode=mode;
   int s=fuxi_gpu_abi_map_import(va,source,16384,3);
   assert(s==((mode==3||mode==4)?-1:0));
-  assert(fg_abi_coh==(mode==1?1u:2u) && doorbells==1);
-  assert(!strstr(lastLog,"retry") && strstr(lastLog,"coherent-import self-test"));
-  assert(cacheClean==256 && cacheInvalidate==0); /* only the probe page's own cleanup */
+  assert(fg_abi_coh==((mode==1||mode==6)?1u:2u) && doorbells==((mode==1||mode==3||mode==4)?1u:2u) && fg_abi_coh_wb==(mode==6));
+  assert(!strstr(lastLog,"retry") && strstr(lastLog,"coherent-import"));
+  assert(cacheClean==((mode==1||mode==3||mode==4)?256u:512u) && cacheInvalidate==0); /* only the probe page's own cleanup */
   assert(fg_abi_cleaned==0); /* not accounted as import traffic */
   if(mode<3) assert(strstr(lastLog,mode==1?"pass cpu_to_gpu 8/8 gpu_to_cpu 8/8":"stale cpu_to_gpu 0/8 gpu_to_cpu 0/8"));
-  if(mode==5) assert(strstr(lastLog,"stale cpu_to_gpu 7/8 gpu_to_cpu 8/8"));
+  if(mode==5) assert(strstr(lastLog,"stale cpu_to_gpu 7/8 gpu_to_cpu 8/8") && strstr(lastLog,"(wb-ish)"));
+  if(mode==6) assert(strstr(lastLog,"coherent-import(wb-ish) pass cpu_to_gpu 8/8 gpu_to_cpu 8/8") && strstr(lastLog,"write-back inner-shareable"));
   if(mode==3||mode==4) {assert(state==2 && fg_abi_poisoned && strstr(lastLog,"self-test fault"));continue;}
   for(unsigned i=0;i<4;i++) assert(!*fg_abi_leaf(FG_ABI_COH_IOVA+4096*i) && !fg_abi_used_get(fg_abi_pg(FG_ABI_COH_IOVA+4096*i)));
   assert(!*fg_abi_leaf(FG_ABI_COH_IOVA+0x4000) && fg_abi_imports[0].iova==va && fg_abi_imports[0].source==source);
   cacheClean=0;cohMode=0;
   assert(!fuxi_gpu_abi_submit(addresses,sizes,1,&fence));
   complete();assert(!fuxi_gpu_abi_poll(fence));
-  if(mode==1) assert(!cacheClean && !cacheInvalidate && fg_abi_skipped==16384 && !fg_abi_cleaned && !fg_abi_invalidated);
+  if(mode==6) {uint64_t lf=*fg_abi_leaf(va);assert((lf&(1u<<2)) && ((lf>>8)&3)==3);}
+  else if(mode>1) {uint64_t lf=*fg_abi_leaf(va);assert(!(lf&(1u<<2)) && ((lf>>8)&3)==2);}
+  if(mode==1||mode==6) assert(!cacheClean && !cacheInvalidate && fg_abi_skipped==16384 && !fg_abi_cleaned && !fg_abi_invalidated);
   else assert(cacheClean==256 && cacheInvalidate==256 && fg_abi_skipped==0);
   unsigned before=doorbells;
   assert(!fuxi_gpu_abi_map_import(va+0x10000,source+65536,16384,1) && doorbells==before); /* verdict is final, no re-probe */
@@ -729,7 +733,7 @@ int main(void) {
  /* With value 1 as well: a proven mapping needs no map-time clean either; an unproven one still gets it. */
  for(unsigned mode=1;mode<=2;mode++) {
   seed();ncimportArg=65;assert(fg_abi_init());cohMode=mode;
-  assert(!fuxi_gpu_abi_map_import(va,source,16384,3) && cacheClean==(mode==1?256u:512u));cohMode=0;
+  assert(!fuxi_gpu_abi_map_import(va,source,16384,3) && cacheClean==(mode==1?256u:768u));cohMode=0;
  }
  puts("PASS: coherent self-test (pass skips maintenance; stale/partial/hang/fault/busy/occupied stay on the clean+invalidate path; probe window left unmapped)");
 
