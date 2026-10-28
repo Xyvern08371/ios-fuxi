@@ -36,7 +36,7 @@ int main() {
  NativeAdrenoAbiParams query={};NativeAdrenoAbiDeviceInfo info={};
  assert(!deviceQuery(NativeAdrenoMethodQuery,nullptr,&query));
  assert(query.abi_version==NativeAdrenoAbiVersion && query.input_bits==31 && query.output_bits==36 &&
-     query.flags==NativeAdrenoParamsHostImport && query.max_bo_bytes==(1u<<28));
+     query.flags==(NativeAdrenoParamsHostImport|NativeAdrenoParamsImportGpuOnly) && query.max_bo_bytes==(1u<<28));
  assert(!deviceQuery(NativeAdrenoMethodGetDeviceInfo,nullptr,&info));
  /* Decode the actual page-granular 2b readback, restoring inclusive end. */
  const uint32_t min=0x1000000,max=0x12ff000;
@@ -245,6 +245,7 @@ static void seed(void) {
  memset(fg_abi_ibs,0,sizeof(fg_abi_ibs));memset(fg_abi_stall_stats,0,sizeof(fg_abi_stall_stats));
  memset(fg_abi_maps,0,sizeof(fg_abi_maps));fg_abi_map_seq=fg_abi_submit_map_seq=0;
 }
+static unsigned wakes;static void count_wake(void) {wakes++;}
 static void reset(void) {
  seed();
  assert(fg_abi_init()); assert(fuxi_gpu_abi_available());
@@ -478,6 +479,25 @@ int main(void) {
  assert(!fuxi_gpu_abi_submit(addresses,sizes,1,&fence) && cacheClean==512);
  complete();fg_abi_watch(NULL,NULL);assert(cacheInvalidate==256); // only the writable range
  assert(!fuxi_gpu_abi_unmap(va,16384) && !fuxi_gpu_abi_unmap(va+0x10000,16384));
+ // GPU_ONLY imports: cleaned once at map, never at submit or retirement, invalidated once at unmap; the read-only neighbour is unchanged.
+ {struct fuxi_gpu_clean_split z;fuxi_gpu_abi_clean_split(&z);}
+ reset();assert(!fuxi_gpu_abi_map_import(va,source,16384,3|FG_ABI_IMPORT_GPU_ONLY) && !fuxi_gpu_abi_map_import(va+0x10000,source,16384,1));
+ assert(cacheClean==256 && fg_abi_imports[0].gpu_only && !fg_abi_imports[1].gpu_only && fg_abi_imports[0].permissions==3);
+ cacheClean=0;
+ assert(!fuxi_gpu_abi_submit(addresses,sizes,1,&fence) && cacheClean==256);
+ {struct fuxi_gpu_clean_split cs;fuxi_gpu_abi_clean_split(&cs);
+  assert(cs.kib[1]==16 && !cs.kib[0] && cs.go_kib==16 && cs.imports==2 && cs.go_imports==1 && cs.bkt_kib[0]==16 && cs.top_kib[0]==16 && cs.top_perm[0]==(3|16));
+  fuxi_gpu_abi_clean_split(&cs);assert(!cs.kib[1] && !cs.go_kib && cs.imports==2);}
+ complete();fg_abi_watch(NULL,NULL);assert(!cacheInvalidate);
+ assert(!fuxi_gpu_abi_unmap(va,16384) && cacheInvalidate==256 && !fg_abi_imports[0].iova && !fg_abi_imports[0].gpu_only);
+ assert(!fuxi_gpu_abi_unmap(va+0x10000,16384) && cacheInvalidate==256);
+ // Submit wait hint: a held present gets the rest of the 4 ms hold, a running copy 1 ms, anything else 100 us.
+ reset();fg_abi_hold=1;fg_abi_present_wait=1;fg_abi_hold_since=ticks=1000;assert(fuxi_gpu_abi_submit_wait_us()==4000);
+ ticks=1000+3000;assert(fuxi_gpu_abi_submit_wait_us()==1001);ticks=1000+4000;assert(fuxi_gpu_abi_submit_wait_us()==1);
+ fg_abi_present_wait=0;fg_busy=1;assert(fuxi_gpu_abi_submit_wait_us()==1000);fg_busy=0;assert(fuxi_gpu_abi_submit_wait_us()==100);fg_abi_hold=0;
+ // A client job retiring wakes the waiters.
+ {wakes=0;fuxi_gpu_abi_wake_hook=count_wake;reset();assert(!fuxi_gpu_abi_map(va,source,bytes,3,0,2) && !fuxi_gpu_abi_submit(addresses,sizes,1,&fence));
+  complete();fg_abi_watch(NULL,NULL);assert(wakes>=1);fuxi_gpu_abi_wake_hook=NULL;}
  // A retired job is seen by the next submit/map/unmap itself, without waiting for the 2 ms watchdog.
  reset();assert(!fuxi_gpu_abi_map(va,source,bytes,3,0,2));
  assert(!fuxi_gpu_abi_submit(addresses,sizes,1,&fence) && fg_client_busy);

@@ -36,6 +36,12 @@ int fuxi_gpu_abi_start(void);
 void fuxi_gpu_abi_queue_stats(uint32_t q[6]);
 /* submit_split window (see fuxi_gpu_abi_backend.inc), taken and cleared by the caller's 600-submit report. */
 void fuxi_gpu_abi_submit_split(uint64_t ns[8], uint32_t why[5], uint32_t n[2], uint64_t *lockmax_ns, uint64_t kib[2]);
+/* Wake hook (set by the userclient): called when a refused submit may now be admitted. Safe to call with it NULL. */
+extern void (*fuxi_gpu_abi_wake_hook)(void);
+#define FG_ABI_WAKE() do { if (fuxi_gpu_abi_wake_hook) fuxi_gpu_abi_wake_hook(); } while (0)
+unsigned fuxi_gpu_abi_submit_wait_us(void);
+struct fuxi_gpu_clean_split;
+void fuxi_gpu_abi_clean_split(struct fuxi_gpu_clean_split *out);
 void fuxi_gpu_abi_publish(void);
 #ifdef __cplusplus
 }

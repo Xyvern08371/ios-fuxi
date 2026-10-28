@@ -30,6 +30,7 @@ PREFIX = r'''
 #include <assert.h>
 #define FG_GUARD
 #include <stdint.h>
+#define FG_ABI_WAKE() ((void)0)
 static unsigned fg_abi_present_wait, fg_client_busy, fg_scanout_owned, fg_scanout_writable, fg_scanout_requested;
 static unsigned fg_scanout_double_active,fg_scanout_front,fg_scanout_back_ready,fg_scanout_ready_drops,fg_scanout_triple_requested,fg_scanout_ready,fg_scanout_copy;
 static uintptr_t fg_scanout_source;

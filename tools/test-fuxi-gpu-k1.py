@@ -52,12 +52,12 @@ static int fuxi_gpu_abi_available() {return available;}
 static int fuxi_gpu_abi_timestamp(uint64_t *t) {*t=0;if(!timeRc)*t=gpuTicks;return timeRc;}
 static int fuxi_gpu_abi_status(uint64_t *f,uint64_t *s) {*f=*s=0;if(!statusRc){*f=gpuFaults;*s=gpuSuspends;}return statusRc;}
 static int fuxi_gpu_abi_poll(uint64_t) {return 0;}
-static int fuxi_gpu_abi_map(uint64_t,uintptr_t,uint64_t,unsigned,unsigned,unsigned) {return 0;}
+static unsigned lastMapPerms;static int fuxi_gpu_abi_map(uint64_t,uintptr_t,uint64_t,unsigned p,unsigned,unsigned) {lastMapPerms=p;return 0;}
 static int fuxi_gpu_abi_map_import(uint64_t,uintptr_t,uint64_t,unsigned) {return 0;}
 static uint64_t fuxi_gpu_abi_map_work() {return 0;}
 static bool queueOn;static int fuxi_gpu_abi_queue_enabled() {return queueOn;}
-static int submitRc=-1;static unsigned submitCount,submitCalls;static uint64_t submitLast;
-static int fuxi_gpu_abi_submit(const uint64_t *,const uint64_t *b,unsigned n,uint64_t *f) {submitCalls++;submitCount=n;submitLast=b[n-1];*f=submitCalls;return submitRc;}
+static int submitRc=-1,submitBusy;static unsigned submitCount,submitCalls;static uint64_t submitLast;
+static int fuxi_gpu_abi_submit(const uint64_t *,const uint64_t *b,unsigned n,uint64_t *f) {submitCalls++;submitCount=n;submitLast=b[n-1];*f=submitCalls;if(submitBusy>0){submitBusy--;return 1;}return submitRc;}
 static uint64_t mach_absolute_time() {return 0;}
 static constexpr unsigned NSEC_PER_MSEC=1000000;
 static void clock_interval_to_deadline(unsigned,unsigned,uint64_t *d) {*d=1;}
@@ -67,6 +67,10 @@ static bool *spinKill;
 static void abiStat(unsigned slot,uint64_t) {assert(slot<FG_ABI_STATS);statCount[slot]++;}
 static void abiPause() {pauses++;}
 static void abiSplit(unsigned,uint64_t) {}
+static unsigned waitHint=100,eventWaits,lastWaitSeq;static uint32_t eventSeq;static bool eventWoke;
+static uint32_t abiEventSeq() {return eventSeq;}
+static int lastWaitDepth=-1;static bool abiEventWait(uint32_t seq0,unsigned) {eventWaits++;lastWaitSeq=seq0;lastWaitDepth=lockDepth;return eventWoke;}
+static unsigned fuxi_gpu_abi_submit_wait_us() {return waitHint;}
 static const char *abiStep(unsigned) {return "test";}
 using OSObject=int;using IOExternalMethodDispatch=int;
 struct IOExternalMethodArguments {
@@ -224,6 +228,17 @@ int main() {
   queueOn=true;d.firstFence_=1;d.lastFence_=5;assert(!call(d,5,&big,&sr) && spins==s0+1);
   d.firstFence_=1;d.lastFence_=5;big.s.wait_fence=9;assert(call(d,5,&big,&sr)==kIOReturnBadArgument && spins==s0+1); // not a fence of the chain: the normal refusal
   queueOn=false;big.s.wait_fence=0;
+  // A refused submit sleeps on the event with lock_ dropped (not polling), re-validates its IBs and goes through when admitted.
+  submitRc=0;submitBusy=2;eventWaits=0;eventWoke=true;eventSeq=7;waitHint=1234;big.s.buffer_count=1;pauses=0;
+  assert(!call(d,5,&big,&sr) && eventWaits==2 && lastWaitSeq==7 && lastWaitDepth==0 && !pauses && lockDepth==0);
+  submitBusy=0;
+  // BoMap.reserved: bit 0 (GPU_ONLY) is accepted, any other bit refused; zero stays valid.
+  {NativeAdrenoAbiBoMap mp{h.handle,0x20010000,3,0,2,2};NativeAdrenoAbiBoMapReply mr{};
+   assert(call(d,3,&mp,&mr)==kIOReturnBadArgument);mp.reserved=1;mp.iova=0x20010000;
+   NativeAdrenoAbiBoAlloc al2{65536,12,0};NativeAdrenoAbiBoAllocReply h2;assert(!call(d,2,&al2,&h2));mp.handle=h2.handle;
+   assert(!call(d,3,&mp,&mr) && mr.iova==0x20010000 && !(lastMapPerms&FG_ABI_IMPORT_GPU_ONLY));
+   NativeAdrenoAbiBoFree fr{h2.handle};d.find(h2.handle)->iova=0;assert(!call(d,4,&fr,nullptr));}
+  NativeAdrenoAbiParams qp{};assert(!call(d,1,nullptr,&qp) && qp.flags==(NativeAdrenoParamsHostImport|NativeAdrenoParamsImportGpuOnly));
   inputOverride=0;submitRc=-1;b->iova=0;assert(!d.clientClose());
  }
  puts("PASS: actual methods 7/8 dispatch/errors/lengths, 1024 BO allocation/refusal/reuse/close, handle index after churn, 128-IB and legacy 416-byte submit records, shared wired quota, metadata refusal and CPU leases");

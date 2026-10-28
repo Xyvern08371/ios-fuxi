@@ -736,6 +736,7 @@ int fuxi_gpu_poll(struct fg_times *t)
    return drained ? -1 : -2;
   }
   fg_busy = 0;
+  FG_ABI_WAKE(); /* the copy retired: a client submit refused for it may go */
   return 1;
  }
  if (!err && !fg_expired()) return 0;
@@ -815,6 +816,7 @@ int fuxi_gpu_copy(unsigned slot, uint64_t generation, uintptr_t source, uint64_t
  fg_submit_time = mach_absolute_time();
  fg_scanout_stamps.submitted = fg_submit_time; fg_scanout_stamps.fence = 0;
  fg_busy = 1; fg_abi_present_wait = 0; /* the copy owns the GPU now; the client hold (bit 4096) ends */
+ FG_ABI_WAKE(); /* a held client submit re-checks: the hold ended, the GPU is busy with the copy */
  return 2; /* submitted; source is owned until poll retires this fence */
 }
 #include "fuxi_gpu_abi_backend.inc"

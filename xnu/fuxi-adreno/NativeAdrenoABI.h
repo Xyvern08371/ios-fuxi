@@ -42,8 +42,14 @@ struct NativeAdrenoAbiParams {
     uint64_t max_bo_bytes;
 };
 enum {
-    NativeAdrenoParamsHostImport = 1  /* BoImport pins the caller's own pages (an IOSurface's) as a BO */
+    NativeAdrenoParamsHostImport = 1, /* BoImport pins the caller's own pages (an IOSurface's) as a BO */
+    NativeAdrenoParamsImportGpuOnly = 2 /* BoMap accepts NativeAdrenoMapGpuOnly in `reserved` for an imported BO */
 };
+/* BoMap.reserved bits (zero keeps the old behaviour, every other bit is refused). NativeAdrenoMapGpuOnly: the caller promises that no CPU
+ * thread reads or writes the imported range from this map until BoFree/unmap (Metal storageModePrivate textures and buffers, private
+ * render targets). The kernel then cleans the range once at map, skips the per-submit clean and the retirement invalidate, and
+ * invalidates it once at unmap. Ignored for allocated BOs. A kernel that does not report NativeAdrenoParamsImportGpuOnly refuses it. */
+enum { NativeAdrenoMapGpuOnly = 1 };
 struct NativeAdrenoAbiBoAlloc {
     uint64_t bytes;               /* 4KiB multiple, <= max_bo_bytes */
     uint32_t align_log2;          /* 12..24 */
@@ -74,7 +80,7 @@ struct NativeAdrenoAbiBoMap {
     uint32_t permissions;         /* bit0 read, bit1 write; read required */
     uint32_t writeback;           /* 0 normal non-coherent, 1 WB/WA */
     uint32_t shareability;        /* 2 outer, 3 inner */
-    uint32_t reserved;            /* zero */
+    uint32_t reserved;            /* zero, or NativeAdrenoMapGpuOnly */
 };
 struct NativeAdrenoAbiBoMapReply {
     uint64_t iova;

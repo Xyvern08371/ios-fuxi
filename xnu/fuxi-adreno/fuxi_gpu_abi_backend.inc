@@ -19,12 +19,17 @@ static thread_call_data_t fg_client_watchdog;
 /* Every mapped import can be referenced indirectly by PM4, not just the IB
  * list. Serialize cache handoff with the same GPU lock as submit/retirement.
  * The user client owns these prepared kernel mappings until successful unmap. */
-static struct { uint64_t iova, bytes; uintptr_t source; unsigned permissions; } fg_abi_imports[FG_ABI_MAX_IMPORTS];
+static struct { uint64_t iova, bytes; uintptr_t source; unsigned permissions, gpu_only; } fg_abi_imports[FG_ABI_MAX_IMPORTS];
 static unsigned fg_abi_host_handoff, fg_abi_ncimport, fg_abi_unstick, fg_abi_cohtest, fg_abi_tlbpages, fg_abi_mapwait, fg_abi_queue, fg_abi_roimport, fg_abi_pace;
 /* Queue mode (bit 512): jobs in flight are seq-completed, at most this many; stats: queued, deepest chain, refused for a waiting present, refused full. */
 #define FG_ABI_QUEUE_MAX 4u
 static uint32_t fg_abi_q_stats[6]; /* queued, deepest, refused for a present, full, refused by the hold, hold expired */
 static unsigned fg_abi_hold;
+/* Hook the userclient installs: wakes submits waiting out a refusal (NULL in host tests, where the macro is defined here). */
+void (*fuxi_gpu_abi_wake_hook)(void);
+#ifndef FG_ABI_WAKE
+#define FG_ABI_WAKE() do { if (fuxi_gpu_abi_wake_hook) fuxi_gpu_abi_wake_hook(); } while (0)
+#endif
 static unsigned fg_abi_start;
 static unsigned fg_abi_probe, fg_abi_spin, fg_abi_mid, fg_abi_ar, fg_abi_hard;
 static uint64_t fg_abi_hold_since;
@@ -48,6 +53,14 @@ static unsigned fg_abi_stage, fg_abi_stall_lines;
 static struct { uint64_t iova, bytes; uintptr_t source; uint32_t seq; } fg_abi_maps[FG_ABI_MAX_BOS];
 static uint32_t fg_abi_map_seq, fg_abi_submit_map_seq;
 static uint64_t fg_abi_cleaned, fg_abi_skipped, fg_abi_invalidated;
+/* Per-submit clean volume by class (0 GPU-writable, 1 read-only) and size bucket (<64K, <1M, <16M, more), bytes and ticks, plus the bytes
+ * the GPU_ONLY imports skipped; taken and cleared by fuxi_gpu_abi_clean_split. */
+static uint64_t fg_abi_cc_bytes[2], fg_abi_cc_ticks[2], fg_abi_cc_bb[4], fg_abi_cc_bt[4], fg_abi_cc_go;
+static void fg_abi_cc_note(unsigned permissions, uint64_t bytes, uint64_t ticks)
+{
+ unsigned c=(permissions&2) ? 0 : 1, b=bytes<(1u<<16) ? 0 : bytes<(1u<<20) ? 1 : bytes<(1u<<24) ? 2 : 3;
+ fg_abi_cc_bytes[c]+=bytes; fg_abi_cc_ticks[c]+=ticks; fg_abi_cc_bb[b]+=bytes; fg_abi_cc_bt[b]+=ticks;
+}
 static void fg_abi_cache_region(uintptr_t source, uint64_t bytes, int complete)
 {
  uintptr_t end=source+bytes;
@@ -70,6 +83,9 @@ static void fg_abi_import_cache(int complete)
  /* A read-only PTE cannot be written by the GPU, so retirement has no stale
   * lines to drop for it; the submit-side clean still covers every import. */
  for (unsigned i=0;i<FG_ABI_MAX_IMPORTS;i++) if (fg_abi_imports[i].iova && (!complete || (fg_abi_imports[i].permissions&2))) {
+  /* GPU_ONLY (NativeAdrenoMapGpuOnly): the client promised no CPU access for the mapped lifetime, the range was cleaned at map and is
+   * invalidated at unmap, so neither the submit clean nor the retirement invalidate has anything to do. */
+  if (fg_abi_imports[i].gpu_only) { fg_abi_skipped+=fg_abi_imports[i].bytes; if (!complete) fg_abi_cc_go+=fg_abi_imports[i].bytes; continue; }
   /* NativeAdreno b686b90 (MIT), adapted: GPU-written imports are already
    * NC in our SMMU. Opt-in requires NO CPU writes for their mapped lifetime,
    * not merely while a submission is in flight. Clean once at map, then
@@ -83,7 +99,9 @@ static void fg_abi_import_cache(int complete)
    fg_abi_skipped+=fg_abi_imports[i].bytes;
    continue;
   }
+  uint64_t c0=rsr("cntpct_el0");
   fg_abi_cache_region(fg_abi_imports[i].source,fg_abi_imports[i].bytes,complete);
+  if (!complete) fg_abi_cc_note(fg_abi_imports[i].permissions,fg_abi_imports[i].bytes,rsr("cntpct_el0")-c0);
  }
  __asm__ volatile("dsb sy" ::: "memory");
  fg_abi_host_handoff=!complete;
@@ -315,7 +333,7 @@ static int fg_abi_observe(void)
   fg_abi_import_cache(1); /* before fence success, even without a user wait */
   if (fg_abi_stage) fg_abi_stall_done();
   fg_abi_completed = fg_abi_seq;
-  fg_client_busy = 0; if (!fg_abi_hold) fg_abi_present_wait = 0; /* hold: the waiting present, not the next client job, takes the idle GPU */
+  FG_ABI_WAKE(); fg_client_busy = 0; if (!fg_abi_hold) fg_abi_present_wait = 0; /* hold: the waiting present, not the next client job, takes the idle GPU */
   return 0;
  }
  /* Queue mode: the ring is in order with a WFI after every frame, so a fence below the newest job's means every job up to it has
@@ -539,6 +557,8 @@ static void fg_abi_coh_probe(void);
 int fuxi_gpu_abi_map_import(uint64_t iova, uintptr_t source, uint64_t bytes, unsigned permissions)
 {
  FG_GUARD;
+ unsigned gpu_only=permissions&FG_ABI_IMPORT_GPU_ONLY; /* internal flag of the userclient, not a PTE permission */
+ permissions&=~FG_ABI_IMPORT_GPU_ONLY;
  if (!source || !bytes || ((source|bytes)&(NativeAdrenoAbiHostPageBytes-1)) ||
      bytes>FG_ABI_MAX_BYTES || source+bytes<source) return -1;
  if (fg_abi_cohtest && !fg_abi_coh) fg_abi_coh_probe(); /* first import = first use; runs before this range is mapped */
@@ -547,14 +567,14 @@ int fuxi_gpu_abi_map_import(uint64_t iova, uintptr_t source, uint64_t bytes, uns
  if (slot==FG_ABI_MAX_IMPORTS) return -1;
  int s=fg_abi_map_locked(iova,source,bytes,permissions,0,2);
  if (!s) {
-  if (fg_abi_ncimport && fg_abi_coh!=1 && (permissions&2)) {
+  if ((gpu_only || (fg_abi_ncimport && (permissions&2))) && fg_abi_coh!=1) {
    /* Before the first GPU use: publish preexisting CPU pixels/dirty lines.
     * The GPU lock prevents any submission until this handoff has finished. */
    __asm__ volatile("dsb sy" ::: "memory");
    fg_abi_cache_region(source,bytes,0);
    __asm__ volatile("dsb sy" ::: "memory");
   }
-  fg_abi_imports[slot].permissions=permissions;
+  fg_abi_imports[slot].permissions=permissions; fg_abi_imports[slot].gpu_only=gpu_only;
   fg_abi_imports[slot].source=source; fg_abi_imports[slot].bytes=bytes; fg_abi_imports[slot].iova=iova;
  }
  return s;
@@ -562,7 +582,16 @@ int fuxi_gpu_abi_map_import(uint64_t iova, uintptr_t source, uint64_t bytes, uns
 static void fg_abi_import_remove(uint64_t iova, uint64_t bytes)
 {
  for (unsigned i=0;i<FG_ABI_MAX_IMPORTS;i++)
-  if (fg_abi_imports[i].iova==iova && fg_abi_imports[i].bytes==bytes) fg_abi_imports[i].iova=0;
+  if (fg_abi_imports[i].iova==iova && fg_abi_imports[i].bytes==bytes) {
+   /* A GPU_ONLY range was never touched by the CPU after the map-time clean, but a speculative CPU fetch may have cached lines the GPU then
+    * overwrote: drop them before the pages go back to the kernel. */
+   if (fg_abi_imports[i].gpu_only && fg_abi_coh!=1) {
+    __asm__ volatile("dsb sy" ::: "memory");
+    fg_abi_cache_region(fg_abi_imports[i].source,bytes,1);
+    __asm__ volatile("dsb sy" ::: "memory");
+   }
+   fg_abi_imports[i].iova=0; fg_abi_imports[i].gpu_only=0;
+  }
 }
 static int fg_abi_unmap_locked(uint64_t iova, uint64_t bytes)
 {
@@ -694,6 +723,40 @@ int fuxi_gpu_abi_submit(const uint64_t *iovas, const uint64_t *sizes,
   for (unsigned i=0;i<FG_SS_BELL+1;i++) fg_abi_ss_t[i]+=fg_abi_ss_cur[i];
  } else fg_abi_ss_t[FG_SS_REFUSED]+=rsr("cntpct_el0")-t1;
  return s;
+}
+/* Microseconds a refused submit should wait before trying again: the rest of the present hold (the copy submit wakes it earlier), up to
+ * 1 ms for a running copy (its retirement wakes it), 100 us otherwise (nothing signals those; they stay polled). */
+unsigned fuxi_gpu_abi_submit_wait_us(void)
+{
+ FG_GUARD;
+ const uint64_t now=rsr("cntpct_el0"), f=rsr("cntfrq_el0");
+ if (fg_abi_hold && fg_abi_present_wait && fg_abi_hold_since && f) {
+  uint64_t end=fg_abi_hold_since+f*4/1000;
+  if (now>=end) return 1;
+  uint64_t us=(end-now)*1000000/f+1;
+  return us>4000 ? 4000 : (unsigned)us;
+ }
+ return fg_busy ? 1000 : 100;
+}
+/* Clean volume of the submits since the last call (see fg_abi_cc_note) and the biggest mapped imports now. */
+void fuxi_gpu_abi_clean_split(struct fuxi_gpu_clean_split *o)
+{
+ FG_GUARD;
+ uint64_t f=rsr("cntfrq_el0"); if (!f) f=1;
+ memset(o,0,sizeof(*o));
+ for (unsigned i=0;i<2;i++) { o->kib[i]=fg_abi_cc_bytes[i]>>10; o->ns[i]=fg_abi_cc_ticks[i]*1000000000ull/f; }
+ for (unsigned i=0;i<4;i++) { o->bkt_kib[i]=fg_abi_cc_bb[i]>>10; o->bkt_ns[i]=fg_abi_cc_bt[i]*1000000000ull/f; }
+ o->go_kib=fg_abi_cc_go>>10;
+ for (unsigned i=0;i<FG_ABI_MAX_IMPORTS;i++) if (fg_abi_imports[i].iova) {
+  o->imports++; o->mapped_kib+=fg_abi_imports[i].bytes>>10; if (fg_abi_imports[i].gpu_only) o->go_imports++;
+  for (unsigned k=0;k<3;k++) if (fg_abi_imports[i].bytes>o->top_kib[k]<<10 || !o->top_kib[k]) {
+   for (unsigned j=2;j>k;j--) { o->top_kib[j]=o->top_kib[j-1]; o->top_perm[j]=o->top_perm[j-1]; }
+   o->top_kib[k]=fg_abi_imports[i].bytes>>10; o->top_perm[k]=fg_abi_imports[i].permissions|(fg_abi_imports[i].gpu_only ? 16 : 0);
+   break;
+  }
+ }
+ memset(fg_abi_cc_bytes,0,sizeof(fg_abi_cc_bytes)); memset(fg_abi_cc_ticks,0,sizeof(fg_abi_cc_ticks));
+ memset(fg_abi_cc_bb,0,sizeof(fg_abi_cc_bb)); memset(fg_abi_cc_bt,0,sizeof(fg_abi_cc_bt)); fg_abi_cc_go=0;
 }
 /* Window totals in ns, then cleared: ns[] = idle-check, frame, tlb, cache, ring, bell, gpu-lock wait, refused attempts (all attempts);
  * why[5]; n[0] attempts, n[1] successes; the longest lock wait; KiB cleaned and skipped by the successful submits. */
