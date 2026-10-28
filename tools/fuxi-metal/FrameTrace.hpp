@@ -79,7 +79,7 @@ struct FrameSample {
  uint64_t wall=0,cpuBeforeCommit=0,shadowCopy=0,leaseLock=0,backendSubmit=0,gpuWait=0,gpuExec=0;
  // lease_lock split: frontend lease vs backend lock/slot; exclusion wait vs kernel lock by role; surfaces by role.
  uint64_t leaseFront=0,leaseBack=0,leaseExclWait=0,leaseLockWrite=0,leaseLockRead=0,leaseWrites=0,leaseReads=0;
- uint64_t inflight=0,completionLatency=0;
+ uint64_t inflight=0,completionLatency=0,workerDepth=0;
  uint64_t schedWait=0,commitCall=0,commitGap=0,admissionWait=0,snapshot=0,submitQueue=0;
  uint64_t backendLock=0,slotWait=0,flush=0,queueSubmit=0,retireQueue=0,retireLock=0,invalidate=0,retireHost=0,surfaceRelease=0,scheduledHandlers=0;
  uint64_t textureShadowBytes=0,textureRepitchedBytes=0;std::array<uint64_t,3> textureShadowUses{};
@@ -268,7 +268,7 @@ public:
    p(&FrameSample::gpuExec,50),p(&FrameSample::gpuExec,90),draws/n,passes/n,counts.pipelines/n,counts.descriptors/n,counts.allocations/n);
   for(unsigned i=0;i<8;++i)fprintf(out,"%s%u:%llu",i?",":"",i,(unsigned long long)cpus[i]);
   fprintf(out,",unknown:%llu encode_counts_unknown=%llu gpu_exec_unavailable=%llu",(unsigned long long)cpus[8],(unsigned long long)encodeUnknown,(unsigned long long)gpuUnavailable);
-  if(systemTranslationPolicy().overlap)fprintf(out," overlap_depth=%.0f/%.0f completion_ms=%.3f/%.3f",double(percentile(&FrameSample::inflight,50)),double(percentile(&FrameSample::inflight,90)),p(&FrameSample::completionLatency,50),p(&FrameSample::completionLatency,90));
+  if(systemTranslationPolicy().overlap)fprintf(out," overlap_depth=%.0f/%.0f completion_ms=%.3f/%.3f worker_depth=%.0f/%.0f",double(percentile(&FrameSample::inflight,50)),double(percentile(&FrameSample::inflight,90)),p(&FrameSample::completionLatency,50),p(&FrameSample::completionLatency,90),double(percentile(&FrameSample::workerDepth,50)),double(percentile(&FrameSample::workerDepth,90)));
   if(systemTranslationPolicy().merge){fprintf(out," merged_draws/frame=%.2f merged_splits=",mergedDraws/n);
    for(size_t i=1;i<mergeSplits.size();++i)fprintf(out,"%s%s:%llu",i==1?"":",",mergeSplitNames[i],(unsigned long long)mergeSplits[i]);}
   fprintf(out," interval=%.3f/%.3f ms cadence_ticks=1:%llu,2:%llu,3:%llu,4+:%llu",p(&FrameSample::interval,50),p(&FrameSample::interval,90),(unsigned long long)cadence[0],(unsigned long long)cadence[1],(unsigned long long)cadence[2],(unsigned long long)cadence[3]);

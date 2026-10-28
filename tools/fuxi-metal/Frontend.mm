@@ -913,7 +913,7 @@ static id surveyPipeline(id refused,NSError **error,id device){
 struct FuxiEventPoint {size_t operation;FuxiEvent *event;uint64_t value;bool signal;};
 @class FuxiCommandBuffer;
 static thread_local FuxiCommandBuffer *completionCommand;
-@interface FuxiQueue : FuxiLabeledObject { @public fuxi::CommandStorage<fuxi::Operation> _operationStorage;fuxi::UploadStorage<FuxiBuffer *> _uploadStorage;fuxi::ShadowPool _shadowPool;id _device;dispatch_queue_t _completionQueue,_submitQueue,_retireQueue,_finishQueue,_deliveryQueue;dispatch_semaphore_t _inflight;std::atomic<unsigned> _depth;std::atomic<uint64_t> _traceReturn,_traceDelivery,_traceHandlers,_traceWaitCompleted,_traceWaitScheduled; }
+@interface FuxiQueue : FuxiLabeledObject { @public fuxi::CommandStorage<fuxi::Operation> _operationStorage;fuxi::UploadStorage<FuxiBuffer *> _uploadStorage;fuxi::ShadowPool _shadowPool;id _device;dispatch_queue_t _completionQueue,_submitQueue,_retireQueue,_finishQueue,_deliveryQueue;dispatch_semaphore_t _inflight;std::atomic<unsigned> _depth,_pending;std::atomic<uint64_t> _traceReturn,_traceDelivery,_traceHandlers,_traceWaitCompleted,_traceWaitScheduled; }
 @end
 @interface FuxiCommandBuffer : FuxiLabeledObject {
  @public FuxiQueue *_queue; NSMutableArray *_resources,*_handlers,*_scheduledHandlers; NSError *_error;dispatch_group_t _completionGroup;
@@ -1435,7 +1435,8 @@ static NSString *renderPassText(MTLRenderPassDescriptor *d){
  @synchronized(self){_status=MTLCommandBufferStatusError;if(!_error)_error=[[NSError alloc] initWithDomain:MTLCommandBufferErrorDomain code:MTLCommandBufferErrorInternal userInfo:@{NSLocalizedDescriptionKey:[NSString stringWithUTF8String:message]}];}
 }
 - (void)executeCommitted {
- if(_frameTrace)_flightTrace.submitQueue=fuxi::frameNanos(_commitReturn);
+ unsigned pending=_overlap?_queue->_pending.fetch_sub(1):0;
+ if(_frameTrace){_flightTrace.submitQueue=fuxi::frameNanos(_commitReturn);_flightTrace.workerDepth=pending;}
  bool backboard=!strcmp(clientProcess,"backboardd");_gpuBefore=backboard?fuxi::Backend::gpuNanos.load():0;
  auto before=fuxi::frameCounts;
  {fuxi::FrameTraceScope scope((_frameTrace || _overlap)?&_flightTrace:nullptr);
@@ -1543,7 +1544,7 @@ static NSString *renderPassText(MTLRenderPassDescriptor *d){
 - (void)reserveOverlap {
  auto start=_frameTrace?fuxi::FrameClock::now():fuxi::FrameClock::time_point{};
  if(!_earlySubmit){dispatch_semaphore_wait(_queue->_inflight,DISPATCH_TIME_FOREVER);if(_frameTrace)_flightTrace.admissionWait+=fuxi::frameNanos(start);_flightTrace.inflight=++_queue->_depth;}
- _enqueued=YES;dispatch_group_enter(_commitReady);
+ _enqueued=YES;dispatch_group_enter(_commitReady);++_queue->_pending;
  dispatch_async(_queue->_submitQueue,^{@autoreleasepool{
   dispatch_group_wait(_commitReady,DISPATCH_TIME_FOREVER);
   if(_earlySubmit){auto start=_frameTrace?fuxi::FrameClock::now():fuxi::FrameClock::time_point{};dispatch_semaphore_wait(_queue->_inflight,DISPATCH_TIME_FOREVER);if(_frameTrace)_flightTrace.admissionWait+=fuxi::frameNanos(start);_flightTrace.inflight=++_queue->_depth;}
@@ -1778,7 +1779,7 @@ static NSString *surfaceDescriptorText(IOSurfaceRef surface,NSUInteger plane){
 - (id)newCommandQueueWithMaxCommandBufferCount:(NSUInteger)n {CENSUS();
  if(!n || n>64) {unsupported(self,_cmd);return nil;}FuxiQueue *q=[self newCommandQueue];if(n==1 && q && q->_inflight){dispatch_release(q->_inflight);q->_inflight=dispatch_semaphore_create(1);}return q;
 }
-- (id)newCommandQueue {CENSUS();if(clientMode==fuxi::ClientMode::census)return nil;FuxiQueue *q=[FuxiQueue new];q->_device=[self retain];q->_depth=0;q->_traceReturn=0;q->_traceDelivery=0;q->_traceHandlers=0;q->_traceWaitCompleted=0;q->_traceWaitScheduled=0;if(fuxi::systemTranslationPolicy().overlap){
+- (id)newCommandQueue {CENSUS();if(clientMode==fuxi::ClientMode::census)return nil;FuxiQueue *q=[FuxiQueue new];q->_device=[self retain];q->_depth=0;q->_pending=0;q->_traceReturn=0;q->_traceDelivery=0;q->_traceHandlers=0;q->_traceWaitCompleted=0;q->_traceWaitScheduled=0;if(fuxi::systemTranslationPolicy().overlap){
  // The compositor's submit/retire/handler work is on the frame path; at default
  // QoS it competes with background daemons (UniXNU AdrenoMetal c6d29ca does the same).
  dispatch_queue_attr_t attr=dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL,compositorQoS(),0);
