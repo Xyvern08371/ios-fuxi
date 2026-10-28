@@ -1359,7 +1359,7 @@
 +#endif
 --- a/bsd/dev/fuxi_gpu_scanout.inc
 +++ b/bsd/dev/fuxi_gpu_scanout.inc
-@@ -0,0 +1,1529 @@
+@@ -0,0 +1,1571 @@
 +/* SPDX-License-Identifier: MIT
 + * Copyright (c) 2026 NativeMetal contributors
 + * Ported from UniXNU drivers/NativeMetal/GpuScanoutClient.h (MIT).
@@ -1510,7 +1510,7 @@
 + * START-bit-clear ("clear"), the first write-line idle after it was active ("lineend", 0 when never seen active) and "done" = the
 + * later of clear and lineend, the same condition acquire uses. The worker only stores results; accounting runs under FG_GUARD at the
 + * next publish, so a window is consistent. Read-only MMIO, no behaviour change. Not yet observed on device. */
-+static unsigned fg_abi_probe, fg_abi_spin, fg_abi_mid, fg_abi_ar, fg_scanout_ar_state; /* ar_state: 0 manual, 1 verifying, 2 active, 3 disabled, 4 arming */
++static unsigned fg_abi_probe, fg_abi_spin, fg_abi_mid, fg_abi_ar, fg_abi_hard, fg_scanout_ar_state; /* ar_state: 0 manual, 1 verifying, 2 active, 3 disabled, 4 arming */
 +static int fg_scanout_ar_on(void) { return fg_scanout_ar_state == 1 || fg_scanout_ar_state == 2; }
 +/* Opt-in (fuxigpuncimport bit 32768), panel120 + double/triple only. The 1080x2400 transfer runs ~8.0 ms from the TE edge in an 8.3 ms
 + * period, so a START catches the next TE only if written in the ~0.3 ms between transfer-done and that TE. The first version woke a
@@ -1533,14 +1533,23 @@
 +#define FG_SCAN_SPIN_DONE_US 7950u
 +#define FG_SCAN_SPIN_TAIL_PCT 6u
 +#define FG_SCAN_SPIN_CATCH_US 600u
++/* Opt-in (fuxigpuncimport bit 262144, needs bit 32768): hard spin. The thread call is armed FG_SCAN_HARD_LEAD_US before the predicted done
++ * (it wakes ~0.4 ms late on average, up to 3 ms), then polls the done condition with ~1 us steps, interrupts masked in 50 us slices (never
++ * across the FG_GUARD lock), for at most FG_SCAN_HARD_MAX_US per frame (overrun counted); the START goes out at the first done sample.
++ * The thread is not bound to a core (the scheduler binding helpers live in the perf module). Not yet observed on device. */
++#define FG_SCAN_HARD_LEAD_US 1500u
++#define FG_SCAN_HARD_MAX_US 2000u
++#define FG_SCAN_HARD_SLICE_US 50u
 +enum {FG_SPIN_WAKES, FG_SPIN_PUBLISHED, FG_SPIN_NO_BACK, FG_SPIN_RACED, FG_SPIN_EXPIRED, FG_SPIN_HIT, FG_SPIN_LATE, FG_SPIN_NO_ACTIVE,
 +      FG_SPIN_SYNCS, FG_SPIN_SYNC_FAIL, FG_SPIN_CATCH_FAIL, FG_SPIN_SKIPPED, FG_SPIN_NEAR_EDGE, FG_SPIN_ARRIVAL, FG_SPIN_MISSED, FG_SPIN_PHASE_REJECT, FG_SPIN_DIRECT, FG_SPIN_OFFERED,
-+      FG_SPIN_ARR_BUSY, FG_SPIN_ARR_STALE, FG_SPIN_ARR_PAST, FG_SPIN_COPY_OPEN, FG_SPIN_UNSTOLEN, FG_SPIN_STALL, FG_SPIN_REFUSED, FG_SPIN_N};
++      FG_SPIN_ARR_BUSY, FG_SPIN_ARR_STALE, FG_SPIN_ARR_PAST, FG_SPIN_COPY_OPEN, FG_SPIN_UNSTOLEN, FG_SPIN_STALL, FG_SPIN_REFUSED, FG_SPIN_WAIT_DONE, FG_SPIN_IN_WINDOW, FG_SPIN_OVERRUN, FG_SPIN_NOT_RUNNING, FG_SPIN_N};
 +static thread_call_data_t fg_scanout_spin_call;
 +static unsigned fg_scanout_spin_setup, fg_scanout_spin_busy, fg_scanout_spin_serial, fg_scanout_async_published, fg_scanout_spin_sync, fg_scanout_spin_c0;
 +static unsigned fg_scanout_last_count, fg_scanout_ph_ok, fg_scanout_ph_c, fg_scanout_ph_done_us, fg_scanout_ph_late_us;
 +static uint64_t fg_scanout_ph_t, fg_scanout_ph_p, fg_scanout_ph_e, fg_scanout_ph_wake;
 +static unsigned fg_scanout_spin_stat[FG_SPIN_N]; /* FG_SPIN_* */
++static unsigned fg_scanout_hard_d2s[5], fg_scanout_hard_n;
++static uint64_t fg_scanout_hard_sum, fg_scanout_hard_max, fg_scanout_hard_total;
 +static uint64_t fg_scanout_spin_err_sum, fg_scanout_spin_err_max, fg_scanout_spin_late_sum, fg_scanout_spin_late_max;
 +static unsigned fg_scanout_spin_err_n, fg_scanout_spin_late_n, fg_scanout_spin_replanned, fg_scanout_spin_rejects, fg_scanout_spin_mw[4], fg_scanout_spin_mm[4];
 +/* The display path owns the writable token from its acquire() until the copy is offered through fuxi_gpu_scanout_publish() (or the next
@@ -1626,6 +1635,7 @@
 + * (W176: avg 0.5 ms, max 1.1 ms; a 0.4 ms lead woke after done and never saw the line active), capped. */
 +static unsigned fg_scanout_spin_lead_us(void)
 +{
++ if (fg_abi_hard) return FG_SCAN_HARD_LEAD_US;
 + unsigned lead = FG_SCAN_SPIN_LEAD_US + fg_scanout_ph_late_us*3/2;
 + return lead > FG_SCAN_SPIN_LEAD_MAX_US ? FG_SCAN_SPIN_LEAD_MAX_US : lead;
 +}
@@ -1641,11 +1651,18 @@
 + fg_scanout_ph_late_us = fg_scanout_ph_late_us - fg_scanout_ph_late_us/4 + us/4;
 +}
 +static void fg_scanout_spin_kick(int fresh);
++/* Done seen at idle_t, START written (fg_scanout_last_start): histogram of the gap against the ~360 us window. */
++static void fg_scanout_hard_note(uint64_t idle_t)
++{
++ uint64_t d = fg_scanout_last_start > idle_t ? fg_scanout_last_start - idle_t : 0, us = d*1000000/rsr("cntfrq_el0");
++ fg_scanout_hard_d2s[us < 50 ? 0 : us < 100 ? 1 : us < 200 ? 2 : us < 360 ? 3 : 4]++;
++ if (us < 360) fg_scanout_spin_stat[FG_SPIN_IN_WINDOW]++;
++}
 +static void fg_scanout_spin_run(thread_call_param_t a, thread_call_param_t b)
 +{
 + (void)a; (void)b;
 + uint64_t t0 = rsr("cntpct_el0"), p = fg_scanout_ph_p, e = fg_scanout_ph_e, late = t0 > fg_scanout_ph_wake ? t0 - fg_scanout_ph_wake : 0;
-+ unsigned serial = fg_scanout_spin_serial, c0 = fg_scanout_spin_c0, result = FG_SPIN_EXPIRED, active = 0, nedge = 0, c = c0, published = 0;
++ unsigned serial = fg_scanout_spin_serial, c0 = fg_scanout_spin_c0, result = FG_SPIN_EXPIRED, active = 0, nedge = 0, c = c0, published = 0, hard = fg_abi_hard;
 + uint64_t idle_t = 0, edge_t = 0;
 + fg_scanout_spin_stat[FG_SPIN_WAKES]++;
 + unsigned want = 1 + fg_scanout_spin_replanned, mb = fg_scanout_spin_m < fg_scanout_us_to_ticks(500) ? 0 : fg_scanout_spin_m < fg_scanout_us_to_ticks(1000) ? 1 : fg_scanout_spin_m < fg_scanout_us_to_ticks(2000) ? 2 : 3;
@@ -1661,10 +1678,13 @@
 +  return;
 + }
 + {
-+  uint64_t end = e + p + p*FG_SCAN_SPIN_TAIL_PCT/100;
++  uint64_t end = e + p + p*FG_SCAN_SPIN_TAIL_PCT/100, slice = 0, hard_limit = t0 + fg_scanout_us_to_ticks(FG_SCAN_HARD_MAX_US);
++  unsigned masked = 0;
++  boolean_t irq = FALSE;
 +  for (;;) {
 +   unsigned line, start, cnt;
 +   uint64_t now = rsr("cntpct_el0");
++   if (hard && !masked) { irq = ml_set_interrupts_enabled(FALSE); masked = 1; slice = now + fg_scanout_us_to_ticks(FG_SCAN_HARD_SLICE_US); }
 +   if (!fg_scanout_te_count(&cnt) || !fg_scanout_read(FG_SCAN_INTF+0x2b0, &line) || !fg_scanout_read(FG_SCAN_CTL+0x1c, &start)) break;
 +   nedge = (cnt - c0) & 0xffffu; c = cnt; line &= 65535;
 +   if (nedge && line != 0 && line < 2400) active = 1;
@@ -1678,16 +1698,20 @@
 +   if (nedge && (active || (fg_scanout_spin_m >= fg_scanout_us_to_ticks(FG_SCAN_SPIN_SAFE_US) && now >= e + fg_scanout_us_to_ticks(FG_SCAN_SPIN_MINXFER_US))) &&
 +       !(start & 1) && (line == 0 || line >= 2400)) {
 +    idle_t = now;
++    if (masked) { (void)ml_set_interrupts_enabled(irq); masked = 0; }
 +    FG_GUARD;
++    if (hard && fg_scanout_starts == serial && fg_scanout_back_ready) fg_scanout_spin_stat[FG_SPIN_WAIT_DONE]++;
 +    if (fg_scanout_starts != serial || fg_scanout_failed || !fg_scanout_back_ready || fg_busy) result = fg_scanout_back_ready ? FG_SPIN_RACED : FG_SPIN_NO_BACK;
 +    else if (fg_scanout_copy_open) result = FG_SPIN_COPY_OPEN;
-+    else if (fg_scanout_publish() == 1) { fg_scanout_async_published = 1; fg_scanout_spin_stolen = 1; published = 1; result = FG_SPIN_PUBLISHED; }
++    else if (fg_scanout_publish() == 1) { fg_scanout_async_published = 1; fg_scanout_spin_stolen = 1; published = 1; result = FG_SPIN_PUBLISHED; if (hard) fg_scanout_hard_note(idle_t); }
 +    else result = FG_SPIN_RACED;
 +    break;
 +   }
++   if (hard && now >= hard_limit) { result = FG_SPIN_OVERRUN; break; }
 +   if (now >= end) { result = active ? FG_SPIN_EXPIRED : FG_SPIN_NO_ACTIVE; break; }
-+   delay(2);
++   if (hard) { if (now >= slice) { (void)ml_set_interrupts_enabled(irq); masked = 0; } delay(1); } else delay(2);
 +  }
++  if (masked) (void)ml_set_interrupts_enabled(irq);
 + }
 + /* The next edge arrives within ~0.3 ms of an on-time idle: catch it to resync the model, measure E-to-idle and the prediction error. */
 + if (idle_t) {
@@ -1713,6 +1737,10 @@
 + {
 +  FG_GUARD;
 +  fg_scanout_spin_stat[result]++;
++  if (hard) {
++   uint64_t d = rsr("cntpct_el0") - t0;
++   fg_scanout_hard_sum += d; fg_scanout_hard_n++; fg_scanout_hard_total += d; if (d > fg_scanout_hard_max) fg_scanout_hard_max = d;
++  }
 +  if (result == FG_SPIN_MISSED && !fg_scanout_spin_replanned) fg_scanout_spin_mm[mb]++;
 +  if (published) fg_scanout_spin_stat[nedge == want ? FG_SPIN_HIT : FG_SPIN_LATE]++;
 +  fg_scanout_spin_late_sum += late; fg_scanout_spin_late_n++; if (late > fg_scanout_spin_late_max) fg_scanout_spin_late_max = late;
@@ -2067,7 +2095,10 @@
 + __asm__ volatile("dsb sy" ::: "memory");
 + return 1;
 +}
-+/* Opt-in (fuxigpuncimport bit 131072), panel120 + triple only: pingpong autorefresh scanout. The bootloader left INTF1 AUTOREFRESH_CONFIG
++/* DO NOT ENABLE (G186): leave bit 131072 off. Count 0 does not repeat the transfer and count 1 only every second TE (60 Hz), so this can
++ * never reach 120 Hz; and after an autorefresh disable the CTL START bit was seen stuck (start=0x1, write line 0), so the drain timed out
++ * ("transfer drain timeout") and the scanout stopped for the boot. Kept only for reference.
++ * Opt-in (fuxigpuncimport bit 131072), panel120 + triple only: pingpong autorefresh scanout. The bootloader left INTF1 AUTOREFRESH_CONFIG
 + * (+0x2b4) = 0x80000001 (bit31 enable, low16 frame count 1) and ownership clears bit31. After a normal START the monitor thread sets bit31
 + * again (count 1): the hardware then repeats the transfer of the latched SSPP source on every TE with no software START. A present is
 + * then only a source flip: SRC0 (0xae05014) + CTL flush bit0 (the pipe registers are latched by the hardware at a frame start; this is
@@ -2737,6 +2768,16 @@
 +       st[FG_SPIN_NEAR_EDGE], st[FG_SPIN_SKIPPED], st[FG_SPIN_MISSED], st[FG_SPIN_PHASE_REJECT],
 +       fg_scanout_spin_mw[0], fg_scanout_spin_mw[1], fg_scanout_spin_mw[2], fg_scanout_spin_mw[3],
 +       fg_scanout_spin_mm[0], fg_scanout_spin_mm[1], fg_scanout_spin_mm[2], fg_scanout_spin_mm[3]);
++   if (fg_abi_hard) {
++    unsigned *d = fg_scanout_hard_d2s;
++    printf("FUXI SCANOUT: hard_spin waiting_at_done=%u started_in_window=%u done_to_start_us<50/<100/<200/<360/more=%u/%u/%u/%u/%u spin_us avg=%llu max=%llu"
++        " cpu_spin_ms_per_s=%llu missed copy_open=%u near_edge=%u spin_not_running=%u overrun=%u\n",
++        st[FG_SPIN_WAIT_DONE], st[FG_SPIN_IN_WINDOW], d[0], d[1], d[2], d[3], d[4],
++        (unsigned long long)(fg_scanout_hard_n ? fg_scanout_hard_sum*1000000/hz/fg_scanout_hard_n : 0), (unsigned long long)(fg_scanout_hard_max*1000000/hz),
++        (unsigned long long)(span ? fg_scanout_hard_total*1000/span : 0), st[FG_SPIN_COPY_OPEN], st[FG_SPIN_NEAR_EDGE], st[FG_SPIN_NOT_RUNNING], st[FG_SPIN_OVERRUN]);
++    for (unsigned i = 0; i < 5; i++) d[i] = 0;
++    fg_scanout_hard_n = 0; fg_scanout_hard_sum = fg_scanout_hard_max = fg_scanout_hard_total = 0;
++   }
 +   for (unsigned i = 0; i < 4; i++) fg_scanout_spin_mw[i] = fg_scanout_spin_mm[i] = 0;
 +   for (unsigned i = 0; i < FG_SPIN_N; i++) st[i] = 0;
 +   fg_scanout_spin_err_sum = fg_scanout_spin_err_max = fg_scanout_spin_late_sum = fg_scanout_spin_late_max = 0;
@@ -2839,6 +2880,7 @@
 + }
 + fg_scanout_unsteal();
 + int r = fg_scanout_publish();
++ if (r == 1 && fg_abi_hard && !fg_scanout_spin_busy) fg_scanout_spin_stat[FG_SPIN_NOT_RUNNING]++;
 + if (r < 0) fg_scanout_refused("retry");
 + return r;
 +}
@@ -2944,7 +2986,7 @@
 +static uint32_t fg_abi_q_stats[6]; /* queued, deepest, refused for a present, full, refused by the hold, hold expired */
 +static unsigned fg_abi_hold;
 +static unsigned fg_abi_start;
-+static unsigned fg_abi_probe, fg_abi_spin, fg_abi_mid, fg_abi_ar;
++static unsigned fg_abi_probe, fg_abi_spin, fg_abi_mid, fg_abi_ar, fg_abi_hard;
 +static uint64_t fg_abi_hold_since;
 +/* Ticks the last fuxi_gpu_abi_map spent after taking the GPU lock (the caller's total minus this is the wait for that lock). */
 +static uint64_t fg_abi_map_work;
@@ -3266,7 +3308,7 @@
 +{
 + unsigned bits=0;
 + (void)PE_parse_boot_argn("fuxigpuncimport",&bits,sizeof(bits));
-+ fg_abi_ncimport=bits&1; fg_wptr_fence=(bits>>1)&1; fg_abi_unstick=(bits>>2)&1; fg_abi_cohtest=(bits>>6)&1; fg_abi_tlbpages=(bits>>7)&1; fg_abi_mapwait=(bits>>8)&1; fg_abi_queue=(bits>>9)&1; fg_abi_roimport=(bits>>10)&1; fg_abi_pace=(bits>>11)&1; fg_abi_hold=(bits>>12)&1; fg_abi_start=(bits>>13)&1; fg_abi_probe=(bits>>14)&1; fg_abi_spin=(bits>>15)&1; fg_abi_mid=(bits>>16)&1; fg_abi_ar=(bits>>17)&1; fg_abi_hold_since=0; fg_abi_present_wait=0; memset(fg_abi_q_stats,0,sizeof(fg_abi_q_stats));
++ fg_abi_ncimport=bits&1; fg_wptr_fence=(bits>>1)&1; fg_abi_unstick=(bits>>2)&1; fg_abi_cohtest=(bits>>6)&1; fg_abi_tlbpages=(bits>>7)&1; fg_abi_mapwait=(bits>>8)&1; fg_abi_queue=(bits>>9)&1; fg_abi_roimport=(bits>>10)&1; fg_abi_pace=(bits>>11)&1; fg_abi_hold=(bits>>12)&1; fg_abi_start=(bits>>13)&1; fg_abi_probe=(bits>>14)&1; fg_abi_spin=(bits>>15)&1; fg_abi_mid=(bits>>16)&1; fg_abi_ar=(bits>>17)&1; fg_abi_hard=(bits>>18)&1; fg_abi_hold_since=0; fg_abi_present_wait=0; memset(fg_abi_q_stats,0,sizeof(fg_abi_q_stats));
 + fg_abi_coh=fg_abi_coh_tries=0;
 + for (unsigned i=0;i<sizeof(fg_abi_used)/sizeof(fg_abi_used[0]);i++) fg_abi_used[i]=0;
 + /* 772 4K pages: root, two L2s, kernel runtime L3, 768 client L3s.
