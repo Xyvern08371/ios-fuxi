@@ -2984,7 +2984,7 @@
 +SOFTWARE.
 --- a/bsd/dev/fuxi_gpu_abi_backend.inc
 +++ b/bsd/dev/fuxi_gpu_abi_backend.inc
-@@ -0,0 +1,746 @@
+@@ -0,0 +1,785 @@
 +/* Built into fuxi_adreno.c, with access to its proven SMMU/ring helpers.
 + * Single privileged diagnostic client, not a security boundary for PM4.
 + * Its root has no scanout or surface-cache mappings. The kernel-only runtime
@@ -3587,12 +3587,21 @@
 + if (now-fg_abi_hold_since>rsr("cntfrq_el0")*4/1000) { fg_abi_present_wait=0; fg_abi_hold_since=0; fg_abi_q_stats[5]++; return 0; }
 + return 1;
 +}
++/* submit_split (always on, a few counter reads per submit): ticks per phase of a successful backend submit, refused attempts as one lump
++ * with their reasons, the wait for the GPU lock, and the cache clean volume. fg_abi_ss_cur is filled by one attempt under the lock and
++ * committed by fuxi_gpu_abi_submit only when it succeeded. Taken and cleared by fuxi_gpu_abi_submit_split every 600 submits. */
++enum { FG_SS_IDLE, FG_SS_FRAME, FG_SS_TLB, FG_SS_CACHE, FG_SS_RING, FG_SS_BELL, FG_SS_LOCK, FG_SS_REFUSED, FG_SS_N };
++static uint64_t fg_abi_ss_t[FG_SS_N], fg_abi_ss_cur[FG_SS_N], fg_abi_ss_lockmax, fg_abi_ss_clean, fg_abi_ss_skip, fg_abi_ss_cur_clean, fg_abi_ss_cur_skip;
++static uint32_t fg_abi_ss_att, fg_abi_ss_ok, fg_abi_ss_why[5]; /* why: busy/reserved, hold, idle without queue, present waits, chain or ring full */
++#define FG_SS(i) do { uint64_t n_=rsr("cntpct_el0"); fg_abi_ss_cur[i]+=n_-m; m=n_; } while (0)
++#define FG_REFUSE(k) do { fg_abi_ss_why[k]++; return 1; } while (0)
 +static int fg_abi_submit_locked(const uint64_t *iovas, const uint64_t *sizes,
 +    unsigned count, uint64_t *fence)
 +{
++ uint64_t m=rsr("cntpct_el0");
 + if (!fg_abi_live || !fuxi_gpu_ready() || fg_abi_poisoned || fg_abi_seq==UINT32_MAX) return -1;
-+ if (fg_busy || fg_scanout_reserved) return 1;
-+ if (fg_abi_present_held()) { fg_abi_q_stats[4]++; return 1; }
++ if (fg_busy || fg_scanout_reserved) FG_REFUSE(0);
++ if (fg_abi_present_held()) { fg_abi_q_stats[4]++; FG_REFUSE(1); }
 + /* Why a submit needed an idle GPU: (1) it installs the client root with a full-ASID invalidate, which would pull the page tables from
 +  * under a running present job; (2) the ring was assumed empty (RPTR==WPTR) and one fence tracked one job; (3) a frame opens with a
 +  * CP context reset, which is safe only after the previous frame's WFI. Behind a running *client* job (1) is moot, (3) is ordered by
@@ -3601,18 +3610,20 @@
 + int queued=0, idle=fg_abi_wait_idle();
 + if (idle<0) return -1;
 + if (idle) {
-+  if (!fg_abi_queue) return 1;
-+  if (fg_abi_present_wait) { fg_abi_q_stats[2]++; return 1; }
++  if (!fg_abi_queue) FG_REFUSE(2);
++  if (fg_abi_present_wait) { fg_abi_q_stats[2]++; FG_REFUSE(3); }
 +  uint32_t used=(g3_wptr-g3_gr(0x806))&8191;
 +  if (fg_access_failed) return fg_abi_fault("client queue ring read");
-+  if (fg_abi_seq-fg_abi_completed>=FG_ABI_QUEUE_MAX || used+FG_ABI_FRAME_WORDS+64>8191) { fg_abi_q_stats[3]++; return 1; }
++  if (fg_abi_seq-fg_abi_completed>=FG_ABI_QUEUE_MAX || used+FG_ABI_FRAME_WORDS+64>8191) { fg_abi_q_stats[3]++; FG_REFUSE(4); }
 +  if (g3_faulted()) return fg_abi_fault("client pre-queue fault");
 +  queued=1;
 + } else if (g3_faulted() || g3_gr(0x806)!=g3_wptr || g3_gr(0x807)!=g3_wptr || (g3_gr(0x210)&~1u))
 +  return fg_abi_fault("client pre-submit idle/fault");
++ FG_SS(FG_SS_IDLE);
 + uint32_t *words=fg_abi_words; /* serialized by the GPU lock; too large for the kernel stack at 128 IBs */
 + unsigned n=fg_abi_frame(words,iovas,sizes,count,G3_FENCE_VA+FG_ABI_FENCE_OFF,fg_abi_seq,fg_abi_seq+1,1);
 + if (!n) return -1;
++ FG_SS(FG_SS_FRAME);
 + fg_abi_ibs[0]++; fg_abi_ibs[1]+=count; if (count>fg_abi_ibs[2]) fg_abi_ibs[2]=count; if (count>16) fg_abi_ibs[3]++;
 + if (queued) {
 +  /* Same root, nothing to switch. Leaves are only added to never-used VA (fg_abi_map_locked), but if any map happened since the last
@@ -3620,21 +3631,27 @@
 +  uint32_t tlb[128]={0};
 +  if (fg_abi_map_seq!=fg_abi_submit_map_seq && (g4_tlb(tlb) || fg_access_failed)) return fg_abi_fault("client queue TLB");
 + } else if (!fg_abi_switch(FG_ABI_PT)) return fg_abi_fault("client install TTBR");
++ FG_SS(FG_SS_TLB);
 + /* Ordinary BOs are NC on both sides. Imports preserve CPU attributes and
 +  * need an explicit PoC handoff; IO-coherent XNU helpers may be no-ops here.
 +  * No CPU access is allowed until retirement, per external synchronization.
 +  * PM4 prologue/epilogue handle GPU cache invalidate/writeback. */
++ fg_abi_ss_cur_clean=fg_abi_cleaned; fg_abi_ss_cur_skip=fg_abi_skipped;
 + fg_abi_import_cache(0);
++ fg_abi_ss_cur_clean=fg_abi_cleaned-fg_abi_ss_cur_clean; fg_abi_ss_cur_skip=fg_abi_skipped-fg_abi_ss_cur_skip;
 + __asm__ volatile("dsb sy" ::: "memory");
++ FG_SS(FG_SS_CACHE);
 + for (unsigned i=0;i<n;i++) g3_emit(words[i]);
 + g3_wptr &= 8191;
 + __asm__ volatile("dsb sy" ::: "memory");
++ FG_SS(FG_SS_RING);
 + if (!queued) { fg_client_deadline=rsr("cntpct_el0")+rsr("cntfrq_el0")/10; fg_abi_stage=0; }
 + fg_client_busy=1;
 + fg_dcvs_kick();
 + fg_abi_submit_map_seq=fg_abi_map_seq;
 + if (!fg_ring_doorbell() || fg_access_failed) return fg_abi_fault("client doorbell");
 + *fence=++fg_abi_seq;
++ FG_SS(FG_SS_BELL);
 + if (queued) {
 +  fg_abi_q_stats[0]++;
 +  if (fg_abi_seq-fg_abi_completed>fg_abi_q_stats[1]) fg_abi_q_stats[1]=fg_abi_seq-fg_abi_completed;
@@ -3653,8 +3670,30 @@
 +int fuxi_gpu_abi_submit(const uint64_t *iovas, const uint64_t *sizes,
 +    unsigned count, uint64_t *fence)
 +{
++ uint64_t t0=rsr("cntpct_el0");
 + FG_GUARD;
-+ return fg_abi_submit_locked(iovas,sizes,count,fence);
++ uint64_t t1=rsr("cntpct_el0");
++ memset(fg_abi_ss_cur,0,sizeof(fg_abi_ss_cur));
++ int s=fg_abi_submit_locked(iovas,sizes,count,fence);
++ fg_abi_ss_att++; fg_abi_ss_t[FG_SS_LOCK]+=t1-t0; if (t1-t0>fg_abi_ss_lockmax) fg_abi_ss_lockmax=t1-t0;
++ if (!s) {
++  fg_abi_ss_ok++; fg_abi_ss_clean+=fg_abi_ss_cur_clean; fg_abi_ss_skip+=fg_abi_ss_cur_skip;
++  for (unsigned i=0;i<FG_SS_BELL+1;i++) fg_abi_ss_t[i]+=fg_abi_ss_cur[i];
++ } else fg_abi_ss_t[FG_SS_REFUSED]+=rsr("cntpct_el0")-t1;
++ return s;
++}
++/* Window totals in ns, then cleared: ns[] = idle-check, frame, tlb, cache, ring, bell, gpu-lock wait, refused attempts (all attempts);
++ * why[5]; n[0] attempts, n[1] successes; the longest lock wait; KiB cleaned and skipped by the successful submits. */
++void fuxi_gpu_abi_submit_split(uint64_t ns[8], uint32_t why[5], uint32_t n[2], uint64_t *lockmax_ns, uint64_t kib[2])
++{
++ FG_GUARD;
++ uint64_t f=rsr("cntfrq_el0"); if (!f) f=1;
++ for (unsigned i=0;i<FG_SS_N;i++) ns[i]=fg_abi_ss_t[i]*1000000000ull/f;
++ *lockmax_ns=fg_abi_ss_lockmax*1000000000ull/f;
++ memcpy(why,fg_abi_ss_why,sizeof(fg_abi_ss_why)); n[0]=fg_abi_ss_att; n[1]=fg_abi_ss_ok;
++ kib[0]=fg_abi_ss_clean>>10; kib[1]=fg_abi_ss_skip>>10;
++ memset(fg_abi_ss_t,0,sizeof(fg_abi_ss_t)); memset(fg_abi_ss_why,0,sizeof(fg_abi_ss_why));
++ fg_abi_ss_att=fg_abi_ss_ok=0; fg_abi_ss_lockmax=fg_abi_ss_clean=fg_abi_ss_skip=0;
 +}
 +/* Opt-in (fuxigpuncimport value 64) fail-closed CPU/GPU coherency self-test, run once under the GPU lock at the first import map.
 + * It maps a cacheable kernel page with the exact import leaf attributes (Normal NC, outer-shareable) and runs one tiny IB:
@@ -3978,7 +4017,7 @@
 +#endif
 --- a/bsd/dev/fuxi_abi_wire.h
 +++ b/bsd/dev/fuxi_abi_wire.h
-@@ -0,0 +1,126 @@
+@@ -0,0 +1,129 @@
 +/* SPDX-License-Identifier: MIT
 + * A7xx framing adapted from UniXNU NativeAdrenoRing.cpp.
 + * Copyright (c) 2026 NativeAdreno contributors. See LICENSE.NativeAdreno.
@@ -4026,6 +4065,9 @@
 +enum { FG_ABI_STAT_LOCK=0, FG_ABI_STAT_WALK=17, FG_ABI_STAT_ZERO=18, FG_ABI_STAT_SLEEP=19, FG_ABI_STAT_MAPWAIT=20, FG_ABI_STAT_MAPLOCK=21,
 + FG_ABI_STAT_MAPWORK=22, FG_ABI_STAT_ALLOCMEM=23, FG_ABI_STAT_BIND=24, FG_ABI_STATS=25 };
 +struct fg_abi_stat { uint64_t count, total, max; };
++/* submit_split slots of the client (FuxiAdrenoUserClient abiSplit); the backend's phases come from fuxi_gpu_abi_submit_split. */
++enum { FG_SPLIT_ARGS, FG_SPLIT_FENCE, FG_SPLIT_LOOKUP, FG_SPLIT_BACKEND, FG_SPLIT_SLEEP, FG_SPLIT_TOTAL, FG_SPLIT_BOS, FG_SPLIT_LIVE, FG_SPLIT_ATT,
++ FG_SPLIT_DONE, FG_SPLIT_LOCKED, FG_SPLIT_RELEASE, FG_SPLIT_SUMS=FG_SPLIT_DONE, FG_SPLIT_WINDOW=600 };
 +static inline void fg_abi_stat_add(struct fg_abi_stat *stats, unsigned slot, uint64_t ticks)
 +{
 + if (slot >= FG_ABI_STATS) return;
@@ -4107,7 +4149,7 @@
 +#endif
 --- a/bsd/dev/fuxi_gpu_abi.h
 +++ b/bsd/dev/fuxi_gpu_abi.h
-@@ -0,0 +1,41 @@
+@@ -0,0 +1,43 @@
 +/* NativeAdrenoABI platform bridge. All operations serialize with presents. */
 +#ifndef FUXI_GPU_ABI_H
 +#define FUXI_GPU_ABI_H
@@ -4144,6 +4186,8 @@
 +int fuxi_gpu_abi_start(void);
 +/* Queued submits, deepest chain, queue refusals for a waiting present, refusals for a full chain/ring. */
 +void fuxi_gpu_abi_queue_stats(uint32_t q[6]);
++/* submit_split window (see fuxi_gpu_abi_backend.inc), taken and cleared by the caller's 600-submit report. */
++void fuxi_gpu_abi_submit_split(uint64_t ns[8], uint32_t why[5], uint32_t n[2], uint64_t *lockmax_ns, uint64_t kib[2]);
 +void fuxi_gpu_abi_publish(void);
 +#ifdef __cplusplus
 +}
@@ -4353,7 +4397,7 @@
 +#endif
 --- a/iokit/Kernel/arm/fuxi_abi_wire.h
 +++ b/iokit/Kernel/arm/fuxi_abi_wire.h
-@@ -0,0 +1,126 @@
+@@ -0,0 +1,129 @@
 +/* SPDX-License-Identifier: MIT
 + * A7xx framing adapted from UniXNU NativeAdrenoRing.cpp.
 + * Copyright (c) 2026 NativeAdreno contributors. See LICENSE.NativeAdreno.
@@ -4401,6 +4445,9 @@
 +enum { FG_ABI_STAT_LOCK=0, FG_ABI_STAT_WALK=17, FG_ABI_STAT_ZERO=18, FG_ABI_STAT_SLEEP=19, FG_ABI_STAT_MAPWAIT=20, FG_ABI_STAT_MAPLOCK=21,
 + FG_ABI_STAT_MAPWORK=22, FG_ABI_STAT_ALLOCMEM=23, FG_ABI_STAT_BIND=24, FG_ABI_STATS=25 };
 +struct fg_abi_stat { uint64_t count, total, max; };
++/* submit_split slots of the client (FuxiAdrenoUserClient abiSplit); the backend's phases come from fuxi_gpu_abi_submit_split. */
++enum { FG_SPLIT_ARGS, FG_SPLIT_FENCE, FG_SPLIT_LOOKUP, FG_SPLIT_BACKEND, FG_SPLIT_SLEEP, FG_SPLIT_TOTAL, FG_SPLIT_BOS, FG_SPLIT_LIVE, FG_SPLIT_ATT,
++ FG_SPLIT_DONE, FG_SPLIT_LOCKED, FG_SPLIT_RELEASE, FG_SPLIT_SUMS=FG_SPLIT_DONE, FG_SPLIT_WINDOW=600 };
 +static inline void fg_abi_stat_add(struct fg_abi_stat *stats, unsigned slot, uint64_t ticks)
 +{
 + if (slot >= FG_ABI_STATS) return;
@@ -4482,7 +4529,7 @@
 +#endif
 --- a/iokit/Kernel/arm/fuxi_gpu_abi.h
 +++ b/iokit/Kernel/arm/fuxi_gpu_abi.h
-@@ -0,0 +1,41 @@
+@@ -0,0 +1,43 @@
 +/* NativeAdrenoABI platform bridge. All operations serialize with presents. */
 +#ifndef FUXI_GPU_ABI_H
 +#define FUXI_GPU_ABI_H
@@ -4519,6 +4566,8 @@
 +int fuxi_gpu_abi_start(void);
 +/* Queued submits, deepest chain, queue refusals for a waiting present, refusals for a full chain/ring. */
 +void fuxi_gpu_abi_queue_stats(uint32_t q[6]);
++/* submit_split window (see fuxi_gpu_abi_backend.inc), taken and cleared by the caller's 600-submit report. */
++void fuxi_gpu_abi_submit_split(uint64_t ns[8], uint32_t why[5], uint32_t n[2], uint64_t *lockmax_ns, uint64_t kib[2]);
 +void fuxi_gpu_abi_publish(void);
 +#ifdef __cplusplus
 +}

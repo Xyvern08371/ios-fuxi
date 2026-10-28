@@ -34,6 +34,8 @@ int fuxi_gpu_abi_pace(void);
 int fuxi_gpu_abi_start(void);
 /* Queued submits, deepest chain, queue refusals for a waiting present, refusals for a full chain/ring. */
 void fuxi_gpu_abi_queue_stats(uint32_t q[6]);
+/* submit_split window (see fuxi_gpu_abi_backend.inc), taken and cleared by the caller's 600-submit report. */
+void fuxi_gpu_abi_submit_split(uint64_t ns[8], uint32_t why[5], uint32_t n[2], uint64_t *lockmax_ns, uint64_t kib[2]);
 void fuxi_gpu_abi_publish(void);
 #ifdef __cplusplus
 }

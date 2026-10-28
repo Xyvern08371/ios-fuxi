@@ -66,6 +66,7 @@ static int lastSpinDepth=-1;
 static bool *spinKill;
 static void abiStat(unsigned slot,uint64_t) {assert(slot<FG_ABI_STATS);statCount[slot]++;}
 static void abiPause() {pauses++;}
+static void abiSplit(unsigned,uint64_t) {}
 static const char *abiStep(unsigned) {return "test";}
 using OSObject=int;using IOExternalMethodDispatch=int;
 struct IOExternalMethodArguments {

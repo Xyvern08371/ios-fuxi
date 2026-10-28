@@ -31,6 +31,8 @@ static unsigned sleeps;
 static void IOSleep(unsigned ms) {assert(ms==1);sleeps++;now+=1000000;}
 static char logs[8][400];static unsigned logCount;
 static void IOLog(const char *fmt,...) {va_list ap;va_start(ap,fmt);assert(logCount<8);vsnprintf(logs[logCount++],400,fmt,ap);va_end(ap);}
+static uint32_t splitWhy[5]={1,2,3,4,5};
+static void fuxi_gpu_abi_submit_split(uint64_t ns[8],uint32_t why[5],uint32_t n[2],uint64_t *lm,uint64_t kib[2]) {for(int i=0;i<8;i++)ns[i]=(i+1)*600000;memcpy(why,splitWhy,sizeof(splitWhy));n[0]=900;n[1]=600;*lm=6400000;kib[0]=1200*600;kib[1]=0;}
 %s
 %s
 %s
@@ -75,7 +77,20 @@ int main() {
  waitPollUs=0;abiPause();assert(sleeps==1 && delays==2);waitPollUs=100;
  tickScale=1;logCount=0;fuxi_gpu_abi_stats_log();
  assert(logCount==1 && strstr(logs[0]," sleep 3/"));
- puts("PASS: ABI stat aggregation/window reset/log format, sleep slices and sleep accounting");
+ // submit_split: a 600-submit window is one report; a lock_ wait over 500 us is blamed on the selector that released lock_ last.
+ logCount=0;tickScale=1;
+ abiSplit(FG_SPLIT_RELEASE,5);abiSplit(FG_SPLIT_LOCKED,6400000);abiSplit(FG_SPLIT_RELEASE,6);abiSplit(FG_SPLIT_LOCKED,100000);
+ for(unsigned i=0;i<FG_SPLIT_WINDOW;i++){
+  assert(!logCount);
+  abiSplit(FG_SPLIT_ARGS,1000);abiSplit(FG_SPLIT_FENCE,0);abiSplit(FG_SPLIT_LOOKUP,2000);abiSplit(FG_SPLIT_BACKEND,3000000);abiSplit(FG_SPLIT_SLEEP,500000);
+  abiSplit(FG_SPLIT_TOTAL,3600000);abiSplit(FG_SPLIT_BOS,2);abiSplit(FG_SPLIT_LIVE,406);abiSplit(FG_SPLIT_ATT,3);abiSplit(FG_SPLIT_DONE,0);
+ }
+ assert(logCount==3);
+ assert(strstr(logs[0],"submit_split n 600 us/submit total 3600.0 args 1.0 fence_wait 0.0 lookup 2.0 backend 3000.0 retry_sleep 500.0 rest 97.0 attempts 3.0 ibs 2.0 live_bos 406 lookup_ns_per_ib 1000"));
+ assert(strstr(logs[1],"attempts 900 ok 600 refused 300 (busy 1 hold 2 noqueue 3 present_wait 4 full 5)") && strstr(logs[1],"cache_clean_kb/ok 1200 skipped_kb/ok 0") && strstr(logs[1],"gpu_lock_wait/attempt 4.6 max 6.4"));
+ assert(strstr(logs[2],"lock_ max 6.4 ms") && strstr(logs[2]," submit 1/6.4") && !strstr(logs[2]," wait "));
+ logCount=0;abiSplit(FG_SPLIT_DONE,0);assert(!logCount); // restarted
+ puts("PASS: ABI stat aggregation/window reset/log format, sleep slices and sleep accounting, submit_split report");
 }
 '''
 

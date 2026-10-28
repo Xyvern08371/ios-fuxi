@@ -733,6 +733,7 @@ int main(void) {
   complete();assert(!fuxi_gpu_abi_poll(fence));
   assert(!fuxi_gpu_abi_submit(many,lens,3,&fence) && fg_abi_ibs[0]==2 && fg_abi_ibs[1]==131 && fg_abi_ibs[2]==128 && fg_abi_ibs[3]==1);
   uint32_t a[4],b[4],c[8];fuxi_gpu_abi_sched_stats(a,b,c);assert(a[0]==2 && a[1]==131 && b[0]==2 && !gmuReads);
+  {uint64_t sn[8],lm,kib[2];uint32_t why[5],cn[2];fuxi_gpu_abi_submit_split(sn,why,cn,&lm,kib);assert(cn[1]>=2 && cn[0]>=cn[1] && fg_abi_ss_ok==0 && !fg_abi_ss_att);fuxi_gpu_abi_submit_split(sn,why,cn,&lm,kib);assert(!cn[0] && !sn[0] && !lm);}
   puts("PASS: 128-IB frame is one submission across the ring wrap, 129 refused before any doorbell, IB counters");
  }
  /* Fenced WPTR (fuxigpuncimport bit 1): off = one plain write and no GMU access; on = read the AHB fence status and write again while dropped. */
