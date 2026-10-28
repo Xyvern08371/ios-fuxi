@@ -886,7 +886,26 @@ static void hard_tests(uint8_t *panel) {
  assert(starts==s0 && fg_scanout_back_ready && st[FG_SPIN_COPY_OPEN]==1 && st[FG_SPIN_WAIT_DONE]==2 && interruptsOn);
  // The display path starts a waiting frame while no spin runs: counted.
  fg_scanout_copy_open=0;fg_scanout_spin_busy=0;fg_scanout_te_mode=0;fg_scanout_after=0;ctl[0x1c/4]=0;intf[0x2b0/4]=2400;
- assert(fuxi_gpu_scanout_retry()==1 && st[FG_SPIN_NOT_RUNNING]==1);
+ fg_scanout_offer_xfer=0;
+ assert(fuxi_gpu_scanout_retry()==1 && st[FG_SPIN_IDLE_ARRIVAL]==1 && fg_scanout_miss_why[3]==0);
+ // v6: a copy into X is open (token held) while Y is waiting: the spin STARTs Y, the token stays with the copy, X is offered afterwards.
+ ticks+=20000;fg_scanout_ph_t=ticks;fg_scanout_ph_c=11;fg_scanout_last_start=ticks-4000;fg_scanout_last_count=11;ctl[0x1c/4]=1;intf[0x2b0/4]=100;
+ fg_scanout_spin_busy=0;fg_scanout_te_mode=0;fg_scanout_after=0;fg_scanout_triple_requested=1;
+ assert(fuxi_gpu_scanout_acquire()==1 && fg_scanout_copy_open && fg_scanout_writable);
+ unsigned X=fg_scanout_copy,Y=0;while(Y==X || Y==fg_scanout_front) Y++;
+ fg_scanout_ready=Y;fg_scanout_back_ready=1;fg_scanout_ready_at=ticks;
+ st[FG_SPIN_COPY_STARTED]=st[FG_SPIN_COPY_SAME]=0;s0=starts;
+ hard_run(fg_scanout_ph_t,11,0,6550);
+ assert(starts==s0+1 && fg_scanout_front==Y && !fg_scanout_back_ready && st[FG_SPIN_COPY_STARTED]==1 && !st[FG_SPIN_COPY_SAME]);
+ assert(fg_scanout_writable && fg_scanout_copy_open && fg_scanout_copy==X && !fg_scanout_spin_stolen);
+ ticks+=20000;ctl[0x1c/4]=0;intf[0x2b0/4]=2400;
+ assert(fuxi_gpu_scanout_publish()>=0 && fg_scanout_ready==X);
+ // Same buffer as the copy: still refused and counted.
+ fg_scanout_copy_open=1;fg_scanout_copy=fg_scanout_ready=2;fg_scanout_back_ready=1;fg_scanout_spin_busy=0;fg_scanout_writable=1;s0=starts;
+ ticks+=20000;fg_scanout_ph_t=ticks;fg_scanout_ph_c=13;fg_scanout_last_start=ticks-4000;fg_scanout_last_count=13;ctl[0x1c/4]=1;intf[0x2b0/4]=100;
+ hard_run(fg_scanout_ph_t,13,0,6550);
+ assert(starts==s0 && st[FG_SPIN_COPY_SAME]==1);
+ fg_scanout_copy_open=0;
  fg_abi_hard=0;fg_abi_spin=0;fg_scanout_te_mode=keepMode;fg_scanout_period_us=16667;fg_scanout_panel120_active=keepP;fg_scanout_back_ready=0;
  fg_scanout_starts=keepStarts;fg_scanout_current_match=keepMatch;fg_scanout_current_mismatch=keepMismatch;fg_scanout_te_frames=keepTe;intf[0x298/4]=keepCount;ctl[0x1c/4]=1;intf[0x2b0/4]=2400;
 }

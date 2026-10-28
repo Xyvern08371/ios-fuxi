@@ -178,15 +178,20 @@ static int fg_scanout_ar_on(void) { return fg_scanout_ar_state == 1 || fg_scanou
 #define FG_SCAN_HARD_LEAD_US 1500u
 #define FG_SCAN_HARD_MAX_US 2000u
 #define FG_SCAN_HARD_SLICE_US 50u
+/* near_edge (hard spin): a START within 150 us before the predicted edge is not unsafe (a START that misses the TE just waits one more
+ * period, the TE gate is in hardware), it only made the model unsure which edge starts the transfer, so no wake was armed and the frame
+ * was left to the display path's poll. The CTL START bit clears ~17 us after the write; with the spin's missed-edge replan a plan at 20 us
+ * is the floor. */
+#define FG_SCAN_HARD_NEAR_US 20u
 enum {FG_SPIN_WAKES, FG_SPIN_PUBLISHED, FG_SPIN_NO_BACK, FG_SPIN_RACED, FG_SPIN_EXPIRED, FG_SPIN_HIT, FG_SPIN_LATE, FG_SPIN_NO_ACTIVE,
       FG_SPIN_SYNCS, FG_SPIN_SYNC_FAIL, FG_SPIN_CATCH_FAIL, FG_SPIN_SKIPPED, FG_SPIN_NEAR_EDGE, FG_SPIN_ARRIVAL, FG_SPIN_MISSED, FG_SPIN_PHASE_REJECT, FG_SPIN_DIRECT, FG_SPIN_OFFERED,
-      FG_SPIN_ARR_BUSY, FG_SPIN_ARR_STALE, FG_SPIN_ARR_PAST, FG_SPIN_COPY_OPEN, FG_SPIN_UNSTOLEN, FG_SPIN_STALL, FG_SPIN_REFUSED, FG_SPIN_WAIT_DONE, FG_SPIN_IN_WINDOW, FG_SPIN_OVERRUN, FG_SPIN_NOT_RUNNING, FG_SPIN_N};
+      FG_SPIN_ARR_BUSY, FG_SPIN_ARR_STALE, FG_SPIN_ARR_PAST, FG_SPIN_COPY_OPEN, FG_SPIN_UNSTOLEN, FG_SPIN_STALL, FG_SPIN_REFUSED, FG_SPIN_WAIT_DONE, FG_SPIN_IN_WINDOW, FG_SPIN_OVERRUN, FG_SPIN_IDLE_ARRIVAL, FG_SPIN_COPY_STARTED, FG_SPIN_COPY_SAME, FG_SPIN_N};
 static thread_call_data_t fg_scanout_spin_call;
 static unsigned fg_scanout_spin_setup, fg_scanout_spin_busy, fg_scanout_spin_serial, fg_scanout_async_published, fg_scanout_spin_sync, fg_scanout_spin_c0;
 static unsigned fg_scanout_last_count, fg_scanout_ph_ok, fg_scanout_ph_c, fg_scanout_ph_done_us, fg_scanout_ph_late_us;
 static uint64_t fg_scanout_ph_t, fg_scanout_ph_p, fg_scanout_ph_e, fg_scanout_ph_wake;
 static unsigned fg_scanout_spin_stat[FG_SPIN_N]; /* FG_SPIN_* */
-static unsigned fg_scanout_hard_d2s[5], fg_scanout_hard_n;
+static unsigned fg_scanout_hard_d2s[5], fg_scanout_hard_n, fg_scanout_miss_why[5], fg_scanout_kick_why, fg_scanout_offer_xfer; /* kick_why: 0 armed, 1 thread busy, 2 no phase model, 3 near edge, 4 edge past */
 static uint64_t fg_scanout_hard_sum, fg_scanout_hard_max, fg_scanout_hard_total;
 static uint64_t fg_scanout_spin_err_sum, fg_scanout_spin_err_max, fg_scanout_spin_late_sum, fg_scanout_spin_late_max;
 static unsigned fg_scanout_spin_err_n, fg_scanout_spin_late_n, fg_scanout_spin_replanned, fg_scanout_spin_rejects, fg_scanout_spin_mw[4], fg_scanout_spin_mm[4];
@@ -289,6 +294,15 @@ static void fg_scanout_spin_late(uint64_t late)
  fg_scanout_ph_late_us = fg_scanout_ph_late_us - fg_scanout_ph_late_us/4 + us/4;
 }
 static void fg_scanout_spin_kick(int fresh);
+/* v6 (hard spin): a copy into buffer X is open (token held by the display path, GPU copy job possibly busy) while the buffer Y it was
+ * not asked to touch is already published and waiting. Under triple buffering X != Y by construction (the target skips front and ready),
+ * so Y can go to the panel without waiting for the copy: the START needs neither the idle ring nor the token, X is offered later and
+ * then replaces or follows Y. Same-buffer or double-buffer cases still refuse. */
+static int fg_scanout_overlap_ok(void)
+{
+ return fg_scanout_triple_requested && fg_scanout_double_active && fg_scanout_back_ready && fg_scanout_copy_open &&
+     fg_scanout_copy < 3 && fg_scanout_copy != fg_scanout_ready;
+}
 /* Done seen at idle_t, START written (fg_scanout_last_start): histogram of the gap against the ~360 us window. */
 static void fg_scanout_hard_note(uint64_t idle_t)
 {
@@ -339,9 +353,14 @@ static void fg_scanout_spin_run(thread_call_param_t a, thread_call_param_t b)
     if (masked) { (void)ml_set_interrupts_enabled(irq); masked = 0; }
     FG_GUARD;
     if (hard && fg_scanout_starts == serial && fg_scanout_back_ready) fg_scanout_spin_stat[FG_SPIN_WAIT_DONE]++;
-    if (fg_scanout_starts != serial || fg_scanout_failed || !fg_scanout_back_ready || fg_busy) result = fg_scanout_back_ready ? FG_SPIN_RACED : FG_SPIN_NO_BACK;
-    else if (fg_scanout_copy_open) result = FG_SPIN_COPY_OPEN;
-    else if (fg_scanout_publish() == 1) { fg_scanout_async_published = 1; fg_scanout_spin_stolen = 1; published = 1; result = FG_SPIN_PUBLISHED; if (hard) fg_scanout_hard_note(idle_t); }
+    unsigned ov = hard && fg_scanout_overlap_ok();
+    if (fg_scanout_starts != serial || fg_scanout_failed || !fg_scanout_back_ready || (fg_busy && !ov)) result = fg_scanout_back_ready ? FG_SPIN_RACED : FG_SPIN_NO_BACK;
+    else if (fg_scanout_copy_open && !ov) { result = FG_SPIN_COPY_OPEN; if (hard) fg_scanout_spin_stat[FG_SPIN_COPY_SAME]++; }
+    else if (fg_scanout_publish() == 1) {
+     fg_scanout_async_published = 1; fg_scanout_spin_stolen = !ov; published = 1; result = FG_SPIN_PUBLISHED;
+     if (hard) fg_scanout_hard_note(idle_t);
+     if (ov) fg_scanout_spin_stat[FG_SPIN_COPY_STARTED]++;
+    }
     else result = FG_SPIN_RACED;
     break;
    }
@@ -396,7 +415,7 @@ static void fg_scanout_spin_run(thread_call_param_t a, thread_call_param_t b)
 static void fg_scanout_spin_kick(int fresh)
 {
  if (!fg_abi_spin || !fg_scanout_panel120_active || !fg_scanout_double_active || fg_scanout_ar_on()) return;
- if (fg_scanout_spin_busy) { if (!fresh) fg_scanout_spin_stat[FG_SPIN_ARR_BUSY]++; return; }
+ if (fg_scanout_spin_busy) { if (!fresh) { fg_scanout_spin_stat[FG_SPIN_ARR_BUSY]++; fg_scanout_kick_why = 1; } return; }
  if (!fg_scanout_spin_setup) {
   thread_call_setup_with_options(&fg_scanout_spin_call, fg_scanout_spin_run, NULL, THREAD_CALL_PRIORITY_KERNEL, THREAD_CALL_OPTIONS_ONCE);
   fg_scanout_spin_setup = 1;
@@ -406,7 +425,7 @@ static void fg_scanout_spin_kick(int fresh)
  if (!fg_scanout_ph_done_us) fg_scanout_ph_done_us = FG_SCAN_SPIN_DONE_US;
  if (!fg_scanout_ph_late_us) fg_scanout_ph_late_us = FG_SCAN_SPIN_LATE_US;
  if (!fg_scanout_ph_ok || now - fg_scanout_ph_t > 64*fg_scanout_ph_p) {
-  if (!fresh) { fg_scanout_spin_stat[FG_SPIN_ARR_STALE]++; return; }
+  if (!fresh) { fg_scanout_spin_stat[FG_SPIN_ARR_STALE]++; fg_scanout_kick_why = 2; return; }
   fg_scanout_spin_replanned = 0;
   fg_scanout_spin_serial = fg_scanout_starts; fg_scanout_spin_c0 = fg_scanout_last_count;
   fg_scanout_spin_sync = 1; fg_scanout_spin_schedule(now);
@@ -414,8 +433,8 @@ static void fg_scanout_spin_kick(int fresh)
  }
  if (!fg_scanout_back_ready) { if (fresh) fg_scanout_spin_stat[FG_SPIN_SKIPPED]++; return; }
  uint64_t e = fg_scanout_phase_next(fg_scanout_last_start);
- if (e - fg_scanout_last_start < fg_scanout_us_to_ticks(FG_SCAN_SPIN_NEAR_US)) { fg_scanout_spin_stat[FG_SPIN_NEAR_EDGE]++; return; }
- if (now >= e + fg_scanout_ph_p) { fg_scanout_spin_stat[FG_SPIN_ARR_PAST]++; return; }
+ if (e - fg_scanout_last_start < fg_scanout_us_to_ticks(fg_abi_hard ? FG_SCAN_HARD_NEAR_US : FG_SCAN_SPIN_NEAR_US)) { fg_scanout_spin_stat[FG_SPIN_NEAR_EDGE]++; fg_scanout_kick_why = 3; return; }
+ if (now >= e + fg_scanout_ph_p) { fg_scanout_spin_stat[FG_SPIN_ARR_PAST]++; fg_scanout_kick_why = 4; return; }
  if (!fresh) fg_scanout_spin_stat[FG_SPIN_ARRIVAL]++;
  fg_scanout_spin_replanned = 0;
  fg_scanout_spin_serial = fg_scanout_starts; fg_scanout_spin_c0 = fg_scanout_last_count;
@@ -1169,7 +1188,7 @@ static int fg_scanout_acquire(unsigned publication)
   if (!fg_scanout_read(0xae05014, &src) || src != fg_scanout_pa(fg_scanout_front))
    return fg_scanout_stop("double SRC0 changed");
  }
- if (fg_busy) { fg_scanout_wait_ring++; if (publication) fg_scanout_charge_to(FG_WHY_RING); return 0; }
+ if (fg_busy && !(fg_abi_hard && fg_scanout_overlap_ok())) { fg_scanout_wait_ring++; if (publication) fg_scanout_charge_to(FG_WHY_RING); return 0; }
  if (fg_scanout_double_active && fg_scanout_ar_on()) {
   unsigned t;
   if (!fg_scanout_ar_sync()) return fg_scanout_stop("autorefresh sync");
@@ -1304,7 +1323,8 @@ int fuxi_gpu_scanout_cpu_acquire(void)
  */
 static int fg_scanout_publish(void)
 {
- if (fg_scanout_failed || fg_busy || !fg_scanout_writable) return -1;
+ unsigned ov = fg_abi_hard && fg_scanout_overlap_ok(); /* a copy into another buffer is open: the token stays with it */
+ if (fg_scanout_failed || (fg_busy && !ov) || !fg_scanout_writable) return -1;
  unsigned arm_on = fg_scanout_ar_on();
  if (arm_on && !fg_scanout_ar_sync()) return fg_scanout_stop("autorefresh sync");
  if (fg_scanout_double_active && !arm_on) {
@@ -1322,7 +1342,7 @@ static int fg_scanout_publish(void)
  if (fg_abi_mid && !arm_on && !fg_scanout_mid_allow()) return 2; /* outside the tear-safe part of the period: the caller retries */
  fg_scanout_charge_to(fg_scanout_last_why); /* the last wait ran until this poll */
  __asm__ volatile("dsb sy" ::: "memory");
- fg_scanout_writable = 0;
+ if (!ov) fg_scanout_writable = 0;
  if (fg_scanout_double_active && !fg_scanout_address(fg_scanout_pa(fg_scanout_triple_requested ? fg_scanout_ready : fg_scanout_front ^ 1u)))
   return fg_scanout_stop("double SRC0 flush");
  if (!arm_on && !fg_scanout_write(FG_SCAN_CTL+0x1c, 1)) return fg_scanout_stop("start transfer");
@@ -1409,11 +1429,13 @@ static int fg_scanout_publish(void)
    if (fg_abi_hard) {
     unsigned *d = fg_scanout_hard_d2s;
     printf("FUXI SCANOUT: hard_spin waiting_at_done=%u started_in_window=%u done_to_start_us<50/<100/<200/<360/more=%u/%u/%u/%u/%u spin_us avg=%llu max=%llu"
-        " cpu_spin_ms_per_s=%llu missed copy_open=%u near_edge=%u spin_not_running=%u overrun=%u\n",
+        " cpu_spin_ms_per_s=%llu missed copy_open_same_buffer=%u copy_open_but_started=%u near_edge=%u overrun=%u"
+        " retry_started idle_arrival=%u not_armed_busy/no_model/near_edge/edge_past=%u/%u/%u/%u armed_lost=%u\n",
         st[FG_SPIN_WAIT_DONE], st[FG_SPIN_IN_WINDOW], d[0], d[1], d[2], d[3], d[4],
         (unsigned long long)(fg_scanout_hard_n ? fg_scanout_hard_sum*1000000/hz/fg_scanout_hard_n : 0), (unsigned long long)(fg_scanout_hard_max*1000000/hz),
-        (unsigned long long)(span ? fg_scanout_hard_total*1000/span : 0), st[FG_SPIN_COPY_OPEN], st[FG_SPIN_NEAR_EDGE], st[FG_SPIN_NOT_RUNNING], st[FG_SPIN_OVERRUN]);
-    for (unsigned i = 0; i < 5; i++) d[i] = 0;
+        (unsigned long long)(span ? fg_scanout_hard_total*1000/span : 0), st[FG_SPIN_COPY_SAME], st[FG_SPIN_COPY_STARTED], st[FG_SPIN_NEAR_EDGE], st[FG_SPIN_OVERRUN],
+        st[FG_SPIN_IDLE_ARRIVAL], fg_scanout_miss_why[1], fg_scanout_miss_why[2], fg_scanout_miss_why[3], fg_scanout_miss_why[4], fg_scanout_miss_why[0]);
+    for (unsigned i = 0; i < 5; i++) d[i] = fg_scanout_miss_why[i] = 0;
     fg_scanout_hard_n = 0; fg_scanout_hard_sum = fg_scanout_hard_max = fg_scanout_hard_total = 0;
    }
    for (unsigned i = 0; i < 4; i++) fg_scanout_spin_mw[i] = fg_scanout_spin_mm[i] = 0;
@@ -1488,6 +1510,7 @@ int fuxi_gpu_scanout_publish(void)
  fg_scanout_copy_open = 0;
  fg_scanout_unsteal();
  if (fg_scanout_failed || fg_busy || !fg_scanout_writable) { fg_scanout_refused("publish"); return -1; }
+ if (fg_abi_hard && fg_scanout_async_published) fg_scanout_async_published = 0; /* the waiting frame was STARTed during this copy: this offer replaces its record */
  if (fg_scanout_double_active) {
   if (fg_scanout_back_ready && fg_scanout_triple_requested) fg_scanout_ready_drops++;
   fg_scanout_ready = fg_scanout_triple_requested ? fg_scanout_copy : fg_scanout_front ^ 1u;
@@ -1497,7 +1520,11 @@ int fuxi_gpu_scanout_publish(void)
  }
  int r = fg_scanout_publish();
  if (r == 1 && fg_abi_spin) fg_scanout_spin_stat[FG_SPIN_DIRECT]++;
- if (r == 2) fg_scanout_spin_kick(0);
+ if (r == 2) {
+  fg_scanout_kick_why = 0;
+  if (fg_abi_hard) { unsigned line, start; fg_scanout_offer_xfer = fg_scanout_read(FG_SCAN_CTL+0x1c, &start) && fg_scanout_read(FG_SCAN_INTF+0x2b0, &line) && ((start & 1) || ((line & 65535) != 0 && (line & 65535) < 2400)); }
+  fg_scanout_spin_kick(0);
+ }
  return r;
 }
 int fuxi_gpu_scanout_retry(void)
@@ -1518,7 +1545,7 @@ int fuxi_gpu_scanout_retry(void)
  }
  fg_scanout_unsteal();
  int r = fg_scanout_publish();
- if (r == 1 && fg_abi_hard && !fg_scanout_spin_busy) fg_scanout_spin_stat[FG_SPIN_NOT_RUNNING]++;
+ if (r == 1 && fg_abi_hard && !fg_scanout_spin_busy) { if (!fg_scanout_offer_xfer) fg_scanout_spin_stat[FG_SPIN_IDLE_ARRIVAL]++; else fg_scanout_miss_why[fg_scanout_kick_why]++; }
  if (r < 0) fg_scanout_refused("retry");
  return r;
 }
