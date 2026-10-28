@@ -82,6 +82,8 @@ static unsigned fg_scanout_back_ready, fg_scanout_flips, fg_scanout_ready_drops,
 static unsigned fg_scanout_current_match, fg_scanout_current_mismatch, fg_scanout_reentries;
 static uintptr_t fg_scanout_pixels_b, fg_scanout_pixels_c;
 static unsigned fg_scanout_ready, fg_scanout_copy, fg_scanout_buffer_flips[3];
+/* fuxigpuncimport bit 20: copy-source clean outside the ring hold (SweetSurface), SSPP survey. */
+static unsigned fg_scanout_preclean;
 static unsigned fg_scanout_target(void)
 {
  for (unsigned i = 0; i < (fg_scanout_triple_requested ? 3u : 2u); i++)
@@ -106,7 +108,8 @@ void fuxi_gpu_scanout_configure(uintptr_t pixels, unsigned enabled, unsigned che
  fg_scanout_checks = fg_scanout_requested && check == 1 ? 4 : 0;
  if (fg_scanout_requested)
 {
-  unsigned drain = 0, te = 0, panel120 = 0, double_buffer = 0, triple_buffer = 0;
+  unsigned drain = 0, te = 0, panel120 = 0, double_buffer = 0, triple_buffer = 0, nc = 0;
+  fg_scanout_preclean = PE_parse_boot_argn("fuxigpuncimport", &nc, sizeof(nc)) && (nc & 0x100000u);
   fg_scanout_double_requested = PE_parse_boot_argn("fuxiscandouble", &double_buffer, sizeof(double_buffer)) && double_buffer == 1;
   unsigned triple = PE_parse_boot_argn("fuxiscantriple", &triple_buffer, sizeof(triple_buffer)) && triple_buffer == 1;
   fg_scanout_triple_requested = fg_scanout_double_requested && triple;
@@ -120,8 +123,10 @@ void fuxi_gpu_scanout_configure(uintptr_t pixels, unsigned enabled, unsigned che
   }
   printf("FUXI SCANOUT: requested, fence then manual transfer, drain_us=%u te_gate=%u check=%u\n",
       fg_scanout_drain_us, fg_scanout_te_mode, fg_scanout_checks);
+  if (fg_scanout_preclean) printf("FUXI SCANOUT: preclean=1 copy source cleaned before the ring reservation\n");
  }
 }
+int fuxi_gpu_scanout_preclean(void) { return fg_scanout_preclean; }
 void fuxi_gpu_scanout_stamps(struct fg_present_times *times)
 {
  FG_GUARD;
@@ -1178,6 +1183,15 @@ static int fg_scanout_acquire(unsigned publication)
       ar, rd, wr, st);
   printf("FUXI SCANOUT: tear sel=%#x en=%#x vsync=%#x height=%#x init=%#x thresh=%#x start_pos=%#x wr_irq=%#x\n",
       tc[0], tc[1], tc[2], tc[3], tc[4], tc[5], tc[6], tc[7]);
+  if (fg_scanout_preclean) {
+   /* Zero-copy prerequisite, read only: VIG0 SRC_SIZE, SRC_IMG_SIZE, SRC_XY, OUT_SIZE, OUT_XY,
+    * SRC0_ADDR, SRC_YSTRIDE0, SRC_FORMAT, SRC_UNPACK_PATTERN, SRC_OP_MODE (sde_hw_sspp.c offsets). */
+   static const unsigned vig[10] = {0x00, 0x04, 0x08, 0x0c, 0x10, 0x14, 0x24, 0x30, 0x34, 0x38};
+   unsigned sv[10] = {0};
+   for (unsigned i = 0; i < 10; i++) if (!fg_scanout_read(0xae05000u+vig[i], &sv[i])) sv[i] = ~0u;
+   printf("FUXI SCANOUT: sspp vig0 size=%#x img=%#x xy=%#x out_size=%#x out_xy=%#x src0=%#x ystride0=%#x format=%#x unpack=%#x op_mode=%#x\n",
+       sv[0], sv[1], sv[2], sv[3], sv[4], sv[5], sv[6], sv[7], sv[8], sv[9]);
+  }
   return 0;
  }
  unsigned ar, line, start;

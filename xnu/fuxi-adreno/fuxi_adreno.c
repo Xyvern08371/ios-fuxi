@@ -693,6 +693,12 @@ static void fg_clean(uintptr_t source, unsigned pitch, unsigned sx, unsigned sy,
  }
  if (end) CleanPoC_DcacheRegion_Force(begin, end-begin);
 }
+/* fuxigpuncimport bit 20: the whole copy source, by SweetSurface before reserve. Only
+ * cache maintenance on a wired kernel mapping, so no GPU lock and no ring hold. */
+void fuxi_gpu_clean_source(uintptr_t source, uint64_t length)
+{
+ if (source && length) CleanPoC_DcacheRegion_Force(source & ~(uintptr_t)63, ((source & 63)+length+63) & ~(uint64_t)63);
+}
 /* CP_RB_WPTR as a fenced register write (NativeAdreno Adreno740 NativeAdrenoRing::writeWptr, MIT). The GMU drops a CPU write to a GPU
  * register that arrives while the GPU domain is not ready and flags it in GMU_AHB_FENCE_STATUS (0x23b13, bit 0; _CLR at 0x23b14, written
  * 7). Their i491 saw a fence stall on nearly every submission until WPTR was written again. Opt-in (fuxigpuncimport bit 1): one GMU
@@ -768,7 +774,11 @@ int fuxi_gpu_copy(unsigned slot, uint64_t generation, uintptr_t source, uint64_t
       ((uint64_t)sy+height-1)*pitch+((uint64_t)sx+width)*4 > length) return 0;
  }
  uint64_t start = mach_absolute_time();
- fg_clean(source, pitch, sx, sy, width, height);
+ /* Pre-cleaned (bit 20): the caller cleaned the whole source after excluding writers. A passing
+  * coherent-import self-test (bit 64, fg_abi_coh==1 with fg_abi_coh_wb) does NOT remove this clean:
+  * it proved MAIR index 1 (0xff write-back) inner-shareable import leaves, but fuxi_gpu_map maps the
+  * copy source through AttrIndx 0 (MAIR0 0xff44: 0x44 Normal NC), which never snoops CPU caches. */
+ if (!fg_scanout_preclean) fg_clean(source, pitch, sx, sy, width, height);
  t->clean += mach_absolute_time()-start;
  start = mach_absolute_time();
  int err = 0;

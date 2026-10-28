@@ -45,6 +45,11 @@ int fuxi_gpu_scanout_double(void);
 int fuxi_gpu_scanout_triple(void);
 int fuxi_gpu_scanout_cpu_acquire(void);
 int fuxi_gpu_scanout_reserve(void);
+/* fuxigpuncimport bit 20 (1048576, default off): SweetSurface cleans the copy source to PoC
+ * before the ring reservation, outside the GPU lock, and fuxi_gpu_copy then skips its own
+ * clean; also a read-only VIG0 SSPP survey at takeover. clean_source takes no lock. */
+int fuxi_gpu_scanout_preclean(void);
+void fuxi_gpu_clean_source(uintptr_t source, uint64_t length);
 void fuxi_gpu_scanout_release(void);
 void fuxi_gpu_start(uint64_t framebuffer, unsigned width, unsigned height, unsigned pitch);
 int fuxi_gpu_map(unsigned slot, uint64_t generation, uintptr_t source,

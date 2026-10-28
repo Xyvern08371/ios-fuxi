@@ -29,10 +29,11 @@ PREFIX = r'''
 #include <stdio.h>
 #include <stdarg.h>
 #include <string.h>
-static char doubleStats[512];
+static char doubleStats[512],ssppLog[512];
 static int scanout_printf(const char *format,...) {
  va_list args;va_start(args,format);
  if(strstr(format,"double=1 flips="))vsnprintf(doubleStats,sizeof(doubleStats),format,args);
+ if(strstr(format,"sspp vig0"))vsnprintf(ssppLog,sizeof(ssppLog),format,args);
  va_end(args);return 0;
 }
 #define printf scanout_printf
@@ -53,7 +54,7 @@ static unsigned traceCount,dsiReads,dmaStarts,pendingDma,noDone,busyAfterDone,st
 static unsigned errorOnDone,tearReadbackMismatch;
 static volatile uint32_t *fuxi_ctl0=ctl,*fuxi_intf1=intf;
 static int fuxi_gpu_ready(void) {return ready;}
-static unsigned modelDrain,modelTe,modelPanel120,modelDouble,modelTriple,parseDouble,parseTriple;
+static unsigned modelDrain,modelTe,modelPanel120,modelDouble,modelTriple,parseDouble,parseTriple,modelNc;
 static uint8_t modelB[4320u*2400],modelC[4320u*2400];
 static unsigned failBMap,failCMap;
 static uintptr_t fuxi_gpu_nc_pointer(uint64_t pa,uint64_t size) {
@@ -65,7 +66,7 @@ static unsigned fg_scanout_double_for_model(void);
 static int PE_parse_boot_argn(const char *name,void *value,int size) {
  if(!strcmp(name,"fuxiscandouble"))parseDouble++;if(!strcmp(name,"fuxiscantriple"))parseTriple++;
  unsigned v=!strcmp(name,"fuxiscante")?modelTe:!strcmp(name,"fuxiscandrain")?modelDrain:
-     !strcmp(name,"fuxipanel120")?modelPanel120:!strcmp(name,"fuxiscandouble")?modelDouble:!strcmp(name,"fuxiscantriple")?modelTriple:0;
+     !strcmp(name,"fuxipanel120")?modelPanel120:!strcmp(name,"fuxiscandouble")?modelDouble:!strcmp(name,"fuxiscantriple")?modelTriple:!strcmp(name,"fuxigpuncimport")?modelNc:0;
  if(!v || size<4)return 0;*(unsigned *)value=v;return 1;
 }
 static int fg_abi_live_for_scanout(void) {return abiLive;}
@@ -130,7 +131,7 @@ TEST = r'''
 static unsigned fg_scanout_owned_for_model(void) {return fg_scanout_owned;}
 static unsigned fg_scanout_double_for_model(void) {return fg_scanout_double_active;}
 static void reset(void) {
- memset(sspp,0,sizeof(sspp));sspp[0x14/4]=0xb8000000u;
+ memset(sspp,0,sizeof(sspp));sspp[0x14/4]=0xb8000000u;modelNc=fg_scanout_preclean=0;ssppLog[0]=0;
  fg_scanout_double_requested=fg_scanout_double_active=fg_scanout_double_initialized=fg_scanout_front=0;
  parseDouble=parseTriple=0;
  fg_scanout_triple_requested=modelTriple=failCMap=fg_scanout_ready=fg_scanout_copy=0;
@@ -914,6 +915,14 @@ int main(void) {
  reset();assert(fuxi_gpu_scanout_acquire()==1 && fuxi_gpu_scanout_publish()==0);
  assert(fuxi_gpu_scanout_reserve());fuxi_gpu_scanout_release();assert(!reads && !writes && !observations);
  uint8_t *source=malloc(4544u*2436),*panel=malloc(4320u*2400);assert(source && panel);
+ // fuxigpuncimport bit 20 needs the lane; takeover then adds one read-only VIG0 survey and no write.
+ reset();modelNc=327168;fuxi_gpu_scanout_configure((uintptr_t)panel,1,0);
+ assert(!fuxi_gpu_scanout_preclean() && !fuxi_gpu_scanout_acquire() && writes==1 && !ssppLog[0]);
+ reset();modelNc=327168|0x100000u;fuxi_gpu_scanout_configure((uintptr_t)panel,0,0);assert(!fuxi_gpu_scanout_preclean());
+ reset();modelNc=327168|0x100000u;sspp[0]=0x09600438u;sspp[0x24/4]=4320;fuxi_gpu_scanout_configure((uintptr_t)panel,1,0);
+ assert(fuxi_gpu_scanout_preclean() && !fuxi_gpu_scanout_acquire() && writes==1 && !starts);
+ assert(strstr(ssppLog,"size=0x9600438 img=0 xy=0 ") && strstr(ssppLog,"src0=0xb8000000 ystride0=0x10e0 format=0 "));
+ reset();
  // Only exact option value 1 activates the lane/checker.
  fuxi_gpu_scanout_configure((uintptr_t)panel,2,1);assert(!fg_scanout_requested && !fg_scanout_checks);
  fuxi_gpu_scanout_configure((uintptr_t)panel,1,2);assert(fg_scanout_requested && !fg_scanout_checks);
@@ -1162,6 +1171,7 @@ int main(void) {
             'sweet_surface_writer_serial', 'sweet_surface_present_notify', 'sweet_surface_present_reading', 'sweet_gpu_writer', 'sweet_surface_gpu_stats',
             'IOSurfaceRootUserClient::trapLock', 'IOSurfaceRootUserClient::trapUnlock'))
         stubs = '''
+#include <cstdarg>
 #define FUXI 1
 #define kIOSurfaceLockReadOnly 1
 #define kIOReturnNotFound 3
@@ -1184,6 +1194,12 @@ static SweetSurface *hookOther;
 static int fuxi_gpu_scanout_owned() {return owned;}
 static int fuxi_gpu_scanout_reserve() {if(busy)return 0;assert(!reserved);reserved=true;return 1;}
 static void fuxi_gpu_scanout_release() {assert(reserved);reserved=false;}
+static bool precleanOn;static unsigned precleans,zcClass=7,zcLogs;static uintptr_t precleanSource;static uint64_t precleanBytes;
+static void (*precleanHook)();static char zcLog[512];
+static int fuxi_gpu_scanout_preclean() {return precleanOn;}
+static void fuxi_gpu_clean_source(uintptr_t source,uint64_t bytes) {assert(!reserved);if(precleanHook)precleanHook();precleans++;precleanSource=source;precleanBytes=bytes;}
+unsigned sweet_surface_scanout_class(SweetSurface *,uint64_t,uint64_t bytes) {assert(bytes==2399ull*4352+1080*4);return zcClass;}
+static int IOLog(const char *format,...) {va_list args;va_start(args,format);vsnprintf(zcLog,sizeof(zcLog),format,args);va_end(args);zcLogs++;return 0;}
 '''
         extra = '''
  ready=true;busy=true;owned=true;
@@ -1264,12 +1280,35 @@ static void fuxi_gpu_scanout_release() {assert(reserved);reserved=false;}
  assert(sweet_surface_present_begin(surfaces,1,&readable,&epoch));sweet_surface_present_end();
  SweetSurface overflow;overflow.gpuWriters=~0u;
  assert(!sweet_gpu_writer(&overflow,true) && overflow.gpuQuarantined && !overflow.gpuWriterSerial);
+ // Bit 20: the copy source is cleaned before the ring reservation, with the cache lock but neither the
+ // lease lock nor the reservation held, then skipped until a writer lease intervenes; counted and logged.
+ precleanOn=true;owned=true;ready=true;copy_result=2;poll_result=1;fail_map=fail_unmap=false;
+ precleanHook=[]() {assert(sweet_gpu_lock->held && !sweet_writer_lock->held && sweet_gpu_submitting);};
+ {
+  SweetSurface pre;IOMemoryDescriptor preMemory;pre.memory=&preMemory;pre.offset=64;uint64_t elapsed=0;fg_times st;
+  busy=true;assert(sweet_surface_gpu_copy(&pre,0x10000,0,0,0,0,1080,2400)==3 && precleans==1);
+  assert(precleanSource==0x10040 && precleanBytes==preMemory.length-64 && !reserved);
+  busy=false;assert(sweet_surface_gpu_copy(&pre,0x10000,0,0,0,0,1080,2400)==2 && precleans==1);
+  assert(sweet_surface_gpu_poll(&elapsed)==1);
+  assert(sweet_gpu_writer(&pre,true) && sweet_gpu_writer(&pre,false));
+  assert(sweet_surface_gpu_copy(&pre,0x10000,0,0,0,0,1080,2400)==2 && precleans==2);assert(sweet_surface_gpu_poll(&elapsed)==1);
+  zcClass=1;assert(sweet_surface_gpu_copy(&pre,0x10000,0,0,0,0,1080,2399)==2 && precleans==2);assert(sweet_surface_gpu_poll(&elapsed)==1);
+  unsigned logs=zcLogs;sweet_surface_gpu_stats(&st);
+  assert(zcLogs==logs+1 && strstr(zcLog,"cleans=2 skips=2 zerocopy eligible=0 format=0 stride=0 size=1 ") && strstr(zcLog,"high=2 unknown=0"));
+  sweet_surface_gpu_stats(&st);assert(strstr(zcLog,"cleans=0 skips=0 zerocopy eligible=0 format=0 stride=0 size=0 "));
+  // Default off: no pre-clean, no survey, no log.
+  precleanOn=false;logs=zcLogs;
+  assert(sweet_gpu_writer(&pre,true) && sweet_gpu_writer(&pre,false));
+  assert(sweet_surface_gpu_copy(&pre,0x10000,0,0,0,0,1080,2400)==2 && precleans==2);assert(sweet_surface_gpu_poll(&elapsed)==1);
+  sweet_surface_gpu_stats(&st);assert(zcLogs==logs);
+  sweet_gpu_release(&pre);precleanHook=nullptr;
+ }
  owned=false;
- puts("PASS: production pending/reader guards, nonwaiting reservation, old-copy exclusion, two producers, quarantine");
+ puts("PASS: production pending/reader guards, nonwaiting reservation, old-copy exclusion, two producers, quarantine, bit-20 pre-clean order/skip/survey");
 '''
         model = cache.MODEL.replace(' IOLockFree(sweet_gpu_lock);', extra + ' IOLockFree(sweet_gpu_lock);')
         model = model.replace('assert(sweet_surface_gpu_poll(&elapsed)==1);IOLockLock(p);', 'if(sweet_present_count)sweet_surface_present_end();else assert(sweet_surface_gpu_poll(&elapsed)==1);IOLockLock(p);')
-        compile_run(tmp, 'cache', cache.PREFIX.replace('uint64_t gpuReadyTime=0;', 'uint64_t gpuReadyTime=0,gpuWriterSerial=0,gpuWriterEpoch=0;') + stubs + declarations + funcs + model, cpp=True)
+        compile_run(tmp, 'cache', cache.PREFIX.replace('uint64_t gpuReadyTime=0;', 'uint64_t gpuReadyTime=0,gpuWriterSerial=0,gpuWriterEpoch=0,gpuCleanSerial=0,gpuCleanEpoch=0;bool gpuCleanValid=false;') + stubs + declarations + funcs + model, cpp=True)
         source = (ROOT / 'xnu/fuxi-unixnu/SweetFramebuffer.cpp').read_text()
         declaration = source[source.index('class AppleCLCD :'):source.index('OSDefineMetaClassAndStructors(AppleCLCD')]
         declaration = declaration.replace(': public IOMobileFramebuffer', '').replace('OSDeclareDefaultStructors(AppleCLCD);', 'public:')

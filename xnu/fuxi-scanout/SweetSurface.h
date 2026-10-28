@@ -35,6 +35,10 @@ public:
  unsigned gpuWriters;
  uint64_t gpuReadyTime, gpuWriterSerial, gpuWriterEpoch;
  bool gpuQuarantined;
+ /* fuxigpuncimport bit 20: writer serial/epoch at the last pre-clean; zero-copy survey class. */
+ uint64_t gpuCleanSerial, gpuCleanEpoch;
+ bool gpuCleanValid;
+ uint8_t scanoutClass;
 #endif
 	uint32_t width, height, bytesPerRow, offset, pixelFormat, allocSize;
 	uint16_t bytesPerElement;
@@ -64,6 +68,7 @@ int sweet_surface_gpu_poll(uint64_t *);
 void sweet_surface_gpu_stats(struct fg_times *);
 void sweet_surface_display_poison(SweetSurface *);
 uint64_t sweet_surface_writer_serial(SweetSurface *, uint64_t *epoch = NULL);
+unsigned sweet_surface_scanout_class(SweetSurface *, uint64_t offset, uint64_t bytes);
 #endif
 
 /* Retained surface for an id, or NULL. */

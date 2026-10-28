@@ -645,10 +645,16 @@
   (void)PE_parse_boot_argn("fuxigpu_stage", &fg_limit, sizeof(fg_limit));
   (void)PE_parse_boot_argn("fuxigpu_fail", &fg_force, sizeof(fg_force));
   if ((fg_limit != 13 && fg_limit != 16 && fg_limit != 17) ||
-@@ -451,23 +693,58 @@
+@@ -451,23 +693,64 @@
   }
   if (end) CleanPoC_DcacheRegion_Force(begin, end-begin);
  }
++/* fuxigpuncimport bit 20: the whole copy source, by SweetSurface before reserve. Only
++ * cache maintenance on a wired kernel mapping, so no GPU lock and no ring hold. */
++void fuxi_gpu_clean_source(uintptr_t source, uint64_t length)
++{
++ if (source && length) CleanPoC_DcacheRegion_Force(source & ~(uintptr_t)63, ((source & 63)+length+63) & ~(uint64_t)63);
++}
 +/* CP_RB_WPTR as a fenced register write (NativeAdreno Adreno740 NativeAdrenoRing::writeWptr, MIT). The GMU drops a CPU write to a GPU
 + * register that arrives while the GPU domain is not ready and flags it in GMU_AHB_FENCE_STATUS (0x23b13, bit 0; _CLR at 0x23b14, written
 + * 7). Their i491 saw a fence stall on nearly every submission until WPTR was written again. Opt-in (fuxigpuncimport bit 1): one GMU
@@ -706,7 +712,7 @@
   t->wait += mach_absolute_time()-fg_submit_time;
   return drained ? -1 : -2;
  }
-@@ -475,41 +752,72 @@
+@@ -475,41 +758,76 @@
      unsigned pitch, unsigned sx, unsigned sy, unsigned dx, unsigned dy,
      unsigned width, unsigned height, struct fg_times *t)
  {
@@ -727,7 +733,12 @@
 +      ((uint64_t)sy+height-1)*pitch+((uint64_t)sx+width)*4 > length) return 0;
 + }
   uint64_t start = mach_absolute_time();
-  fg_clean(source, pitch, sx, sy, width, height);
+- fg_clean(source, pitch, sx, sy, width, height);
++ /* Pre-cleaned (bit 20): the caller cleaned the whole source after excluding writers. A passing
++  * coherent-import self-test (bit 64, fg_abi_coh==1 with fg_abi_coh_wb) does NOT remove this clean:
++  * it proved MAIR index 1 (0xff write-back) inner-shareable import leaves, but fuxi_gpu_map maps the
++  * copy source through AttrIndx 0 (MAIR0 0xff44: 0x44 Normal NC), which never snoops CPU caches. */
++ if (!fg_scanout_preclean) fg_clean(source, pitch, sx, sy, width, height);
   t->clean += mach_absolute_time()-start;
   start = mach_absolute_time();
   int err = 0;
@@ -787,7 +798,7 @@
  #endif
 --- a/bsd/dev/fuxi_adreno.h
 +++ b/bsd/dev/fuxi_adreno.h
-@@ -2,19 +2,57 @@
+@@ -2,19 +2,62 @@
  #define FUXI_ADRENO_H
  #define FG_CACHE_SLOTS 4u
  /* Timings in mach absolute ticks, CPU uses scheduler runtime (excludes sleep).
@@ -835,6 +846,11 @@
 +int fuxi_gpu_scanout_triple(void);
 +int fuxi_gpu_scanout_cpu_acquire(void);
 +int fuxi_gpu_scanout_reserve(void);
++/* fuxigpuncimport bit 20 (1048576, default off): SweetSurface cleans the copy source to PoC
++ * before the ring reservation, outside the GPU lock, and fuxi_gpu_copy then skips its own
++ * clean; also a read-only VIG0 SSPP survey at takeover. clean_source takes no lock. */
++int fuxi_gpu_scanout_preclean(void);
++void fuxi_gpu_clean_source(uintptr_t source, uint64_t length);
 +void fuxi_gpu_scanout_release(void);
  void fuxi_gpu_start(uint64_t framebuffer, unsigned width, unsigned height, unsigned pitch);
  int fuxi_gpu_map(unsigned slot, uint64_t generation, uintptr_t source,
@@ -1362,7 +1378,7 @@
 +#endif
 --- a/bsd/dev/fuxi_gpu_scanout.inc
 +++ b/bsd/dev/fuxi_gpu_scanout.inc
-@@ -0,0 +1,1598 @@
+@@ -0,0 +1,1612 @@
 +/* SPDX-License-Identifier: MIT
 + * Copyright (c) 2026 NativeMetal contributors
 + * Ported from UniXNU drivers/NativeMetal/GpuScanoutClient.h (MIT).
@@ -1447,6 +1463,8 @@
 +static unsigned fg_scanout_current_match, fg_scanout_current_mismatch, fg_scanout_reentries;
 +static uintptr_t fg_scanout_pixels_b, fg_scanout_pixels_c;
 +static unsigned fg_scanout_ready, fg_scanout_copy, fg_scanout_buffer_flips[3];
++/* fuxigpuncimport bit 20: copy-source clean outside the ring hold (SweetSurface), SSPP survey. */
++static unsigned fg_scanout_preclean;
 +static unsigned fg_scanout_target(void)
 +{
 + for (unsigned i = 0; i < (fg_scanout_triple_requested ? 3u : 2u); i++)
@@ -1471,7 +1489,8 @@
 + fg_scanout_checks = fg_scanout_requested && check == 1 ? 4 : 0;
 + if (fg_scanout_requested)
 +{
-+  unsigned drain = 0, te = 0, panel120 = 0, double_buffer = 0, triple_buffer = 0;
++  unsigned drain = 0, te = 0, panel120 = 0, double_buffer = 0, triple_buffer = 0, nc = 0;
++  fg_scanout_preclean = PE_parse_boot_argn("fuxigpuncimport", &nc, sizeof(nc)) && (nc & 0x100000u);
 +  fg_scanout_double_requested = PE_parse_boot_argn("fuxiscandouble", &double_buffer, sizeof(double_buffer)) && double_buffer == 1;
 +  unsigned triple = PE_parse_boot_argn("fuxiscantriple", &triple_buffer, sizeof(triple_buffer)) && triple_buffer == 1;
 +  fg_scanout_triple_requested = fg_scanout_double_requested && triple;
@@ -1485,8 +1504,10 @@
 +  }
 +  printf("FUXI SCANOUT: requested, fence then manual transfer, drain_us=%u te_gate=%u check=%u\n",
 +      fg_scanout_drain_us, fg_scanout_te_mode, fg_scanout_checks);
++  if (fg_scanout_preclean) printf("FUXI SCANOUT: preclean=1 copy source cleaned before the ring reservation\n");
 + }
 +}
++int fuxi_gpu_scanout_preclean(void) { return fg_scanout_preclean; }
 +void fuxi_gpu_scanout_stamps(struct fg_present_times *times)
 +{
 + FG_GUARD;
@@ -2543,6 +2564,15 @@
 +      ar, rd, wr, st);
 +  printf("FUXI SCANOUT: tear sel=%#x en=%#x vsync=%#x height=%#x init=%#x thresh=%#x start_pos=%#x wr_irq=%#x\n",
 +      tc[0], tc[1], tc[2], tc[3], tc[4], tc[5], tc[6], tc[7]);
++  if (fg_scanout_preclean) {
++   /* Zero-copy prerequisite, read only: VIG0 SRC_SIZE, SRC_IMG_SIZE, SRC_XY, OUT_SIZE, OUT_XY,
++    * SRC0_ADDR, SRC_YSTRIDE0, SRC_FORMAT, SRC_UNPACK_PATTERN, SRC_OP_MODE (sde_hw_sspp.c offsets). */
++   static const unsigned vig[10] = {0x00, 0x04, 0x08, 0x0c, 0x10, 0x14, 0x24, 0x30, 0x34, 0x38};
++   unsigned sv[10] = {0};
++   for (unsigned i = 0; i < 10; i++) if (!fg_scanout_read(0xae05000u+vig[i], &sv[i])) sv[i] = ~0u;
++   printf("FUXI SCANOUT: sspp vig0 size=%#x img=%#x xy=%#x out_size=%#x out_xy=%#x src0=%#x ystride0=%#x format=%#x unpack=%#x op_mode=%#x\n",
++       sv[0], sv[1], sv[2], sv[3], sv[4], sv[5], sv[6], sv[7], sv[8], sv[9]);
++  }
 +  return 0;
 + }
 + unsigned ar, line, start;
@@ -2987,7 +3017,7 @@
 +SOFTWARE.
 --- a/bsd/dev/fuxi_gpu_abi_backend.inc
 +++ b/bsd/dev/fuxi_gpu_abi_backend.inc
-@@ -0,0 +1,966 @@
+@@ -0,0 +1,967 @@
 +/* Built into fuxi_adreno.c, with access to its proven SMMU/ring helpers.
 + * Single privileged diagnostic client, not a security boundary for PM4.
 + * Its root has no scanout or surface-cache mappings. The kernel-only runtime
@@ -3028,7 +3058,8 @@
 +/* fuxigpuncimport is a bitmask, default 0: 1 NC-import map-time clean; 2 fenced WPTR (fg_ring_doorbell); 4 stall recovery
 + * (fg_abi_unstick_step); 64 coherent-import self-test (skips the per-submit clean/retire invalidate only if it proves the GPU path
 + * coherent); 128 ranged TLBIVAL for a small unmap; 256 map waits for an idle GPU first (the pre-N167 behaviour; default maps while a
-+ * job runs, see fg_abi_map_locked); 512 queue a submit behind a running job (see fg_abi_submit_locked). Parsed once in fg_abi_init. */
++ * job runs, see fg_abi_map_locked); 512 queue a submit behind a running job (see fg_abi_submit_locked). Parsed once in fg_abi_init. 1048576
++ * (scanout copy-source pre-clean) is parsed by fuxi_gpu_scanout_configure. */
 +static unsigned fg_abi_coh_wb; /* the passing variant mapped the data page cacheable write-back, inner-shareable: imports are then mapped that way */
 +static unsigned fg_abi_coh, fg_abi_coh_tries; /* coh: 0 untested, 1 proven coherent, 2 refused */
 +/* The submit record holds up to NativeAdrenoAbiMaxBuffers IBs; one frame is then one ring prologue and one CP context reset. */

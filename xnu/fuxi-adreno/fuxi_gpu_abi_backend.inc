@@ -38,7 +38,8 @@ static uint64_t fg_abi_map_work;
 /* fuxigpuncimport is a bitmask, default 0: 1 NC-import map-time clean; 2 fenced WPTR (fg_ring_doorbell); 4 stall recovery
  * (fg_abi_unstick_step); 64 coherent-import self-test (skips the per-submit clean/retire invalidate only if it proves the GPU path
  * coherent); 128 ranged TLBIVAL for a small unmap; 256 map waits for an idle GPU first (the pre-N167 behaviour; default maps while a
- * job runs, see fg_abi_map_locked); 512 queue a submit behind a running job (see fg_abi_submit_locked). Parsed once in fg_abi_init. */
+ * job runs, see fg_abi_map_locked); 512 queue a submit behind a running job (see fg_abi_submit_locked). Parsed once in fg_abi_init. 1048576
+ * (scanout copy-source pre-clean) is parsed by fuxi_gpu_scanout_configure. */
 static unsigned fg_abi_coh_wb; /* the passing variant mapped the data page cacheable write-back, inner-shareable: imports are then mapped that way */
 static unsigned fg_abi_coh, fg_abi_coh_tries; /* coh: 0 untested, 1 proven coherent, 2 refused */
 /* The submit record holds up to NativeAdrenoAbiMaxBuffers IBs; one frame is then one ring prologue and one CP context reset. */

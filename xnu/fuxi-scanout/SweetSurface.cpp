@@ -139,6 +139,9 @@ static void (*sweet_present_wake)(void *);
 static void *sweet_present_context;
 static unsigned sweet_gpu_slot;
 static uint64_t sweet_gpu_begin;
+/* fuxigpuncimport bit 20: pre-cleans, skips (no writer since the last clean) and the zero-copy
+ * class of each submitted frame (sweet_surface_scanout_class), logged with the 600-frame split. */
+static unsigned sweet_gpu_precleans, sweet_gpu_preclean_skips, sweet_gpu_zc[8];
 static bool sweet_gpu_init(void)
 {
  if (!sweet_gpu_lock) {
@@ -190,7 +193,21 @@ int sweet_surface_gpu_copy(SweetSurface *s, uintptr_t src, unsigned sx, unsigned
   IOLockUnlock(sweet_writer_lock); IOLockUnlock(sweet_gpu_lock); return fuxi_gpu_scanout_owned() ? 3 : 0;
  }
  sweet_gpu_submitting = s;
+ /* Bit 20: clean before the reservation, so client submits are not held across it. Writers
+  * wait while submitting == s; one that arrives later bumps the serial and forces a clean. */
+ bool preclean = fuxi_gpu_scanout_preclean(), clean = false;
+ uint64_t cleanSerial = s->gpuWriterSerial, cleanEpoch = s->gpuWriterEpoch;
+ if (preclean) clean = !s->gpuCleanValid || s->gpuCleanSerial != cleanSerial || s->gpuCleanEpoch != cleanEpoch;
  IOLockUnlock(sweet_writer_lock);
+ if (clean) {
+  uint64_t began = mach_absolute_time();
+  fuxi_gpu_clean_source(src+s->offset, s->memory->getLength()-s->offset);
+  sweet_gpu_times.clean += mach_absolute_time()-began;
+  sweet_gpu_precleans++;
+  IOLockLock(sweet_writer_lock);
+  s->gpuCleanSerial = cleanSerial; s->gpuCleanEpoch = cleanEpoch; s->gpuCleanValid = true;
+  IOLockUnlock(sweet_writer_lock);
+ } else if (preclean) sweet_gpu_preclean_skips++;
  if (!fuxi_gpu_scanout_reserve()) {
   IOLockLock(sweet_writer_lock); sweet_gpu_submitting = NULL;
   IOLockWakeup(sweet_writer_lock, &sweet_gpu_inflight, false); IOLockUnlock(sweet_writer_lock);
@@ -235,6 +252,11 @@ int sweet_surface_gpu_copy(SweetSurface *s, uintptr_t src, unsigned sx, unsigned
  sweet_gpu_cache[slot].age = ++sweet_gpu_age;
  result = fuxi_gpu_copy(slot, sweet_gpu_cache[slot].generation, source, length,
      s->bytesPerRow, sx, sy, dx, dy, width, height, &sweet_gpu_times);
+ if (result == 2 && preclean) {
+  unsigned c = width < 1080 || height < 2400 ? 4 : sweet_surface_scanout_class(s,
+      s->offset+(uint64_t)sy*s->bytesPerRow+(uint64_t)sx*4, (uint64_t)(height-1)*s->bytesPerRow+(uint64_t)width*4);
+  sweet_gpu_zc[c < 8 ? c : 0]++;
+ }
  IOLockLock(sweet_writer_lock);
  if (result == 2) {
   s->retain();
@@ -361,7 +383,30 @@ void sweet_surface_gpu_stats(struct fg_times *t)
  IOLockLock(sweet_gpu_lock);
  *t = sweet_gpu_times;
  bzero(&sweet_gpu_times, sizeof(sweet_gpu_times));
+ if (fuxi_gpu_scanout_preclean()) {
+  IOLog("FUXI SCANOUT: preclean cleans=%u skips=%u zerocopy eligible=%u format=%u stride=%u size=%u backing=%u scattered=%u high=%u unknown=%u\n",
+      sweet_gpu_precleans, sweet_gpu_preclean_skips, sweet_gpu_zc[1], sweet_gpu_zc[2], sweet_gpu_zc[3], sweet_gpu_zc[4],
+      sweet_gpu_zc[5], sweet_gpu_zc[6], sweet_gpu_zc[7], sweet_gpu_zc[0]);
+  sweet_gpu_precleans = sweet_gpu_preclean_skips = 0; bzero(sweet_gpu_zc, sizeof(sweet_gpu_zc));
+ }
  IOLockUnlock(sweet_gpu_lock);
+}
+/* Zero-copy survey, read only: could VIG0 fetch [offset, offset+bytes) directly? 1 yes (one
+ * physical run below 4 GiB: SRC0 is a 32-bit PA, the display SMMU is untouched), 2 format,
+ * 3 stride (64-byte multiple, 16-bit YSTRIDE0), 5 backing, 6 scattered pages, 7 above 4 GiB.
+ * Size (4) is the caller's crop test. A wired IOBuffer's pages never move: cache the class. */
+unsigned sweet_surface_scanout_class(SweetSurface *s, uint64_t offset, uint64_t bytes)
+{
+ if (s->pixelFormat != 0x42475241u || s->bytesPerElement != 4 || s->elementWidth != 1 || s->elementHeight != 1) return 2;
+ if ((s->bytesPerRow & 63) || s->bytesPerRow > 0xffffu) return 3;
+ IOBufferMemoryDescriptor *buffer = OSDynamicCast(IOBufferMemoryDescriptor, s->memory);
+ if (!buffer || !bytes || offset+bytes > buffer->getLength()) return 5;
+ if (!s->scanoutClass) {
+  IOByteCount length = 0;
+  addr64_t pa = buffer->getPhysicalSegment(offset, &length, kIOMemoryMapperNone);
+  s->scanoutClass = !pa ? 5 : pa+bytes > (1ull << 32) ? 7 : length < bytes ? 6 : 1;
+ }
+ return s->scanoutClass;
 }
 #endif
 

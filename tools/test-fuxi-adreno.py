@@ -31,7 +31,7 @@ PREFIX = r'''
 #define FG_GUARD
 #include <stdint.h>
 #define FG_ABI_WAKE() ((void)0)
-static unsigned fg_abi_present_wait, fg_client_busy, fg_scanout_owned, fg_scanout_writable, fg_scanout_requested;
+static unsigned fg_abi_present_wait, fg_client_busy, fg_scanout_owned, fg_scanout_writable, fg_scanout_requested, fg_scanout_preclean;
 static unsigned fg_scanout_double_active,fg_scanout_front,fg_scanout_back_ready,fg_scanout_ready_drops,fg_scanout_triple_requested,fg_scanout_ready,fg_scanout_copy;
 static uintptr_t fg_scanout_source;
 static unsigned fg_scanout_pitch,fg_scanout_sx,fg_scanout_sy,fg_scanout_dx,fg_scanout_dy,fg_scanout_w,fg_scanout_h;
@@ -332,6 +332,11 @@ int main(void)
  assert(!fuxi_gpu_poll(&times) && !times.sleeps && fg_busy);
  ticks+=200000;
  assert(fuxi_gpu_poll(&times)==1 && !fg_busy && !isolated);
+ /* fuxigpuncimport bit 20: SweetSurface pre-cleaned the source, so the locked copy path does not clean again. */
+ reset(); assert(fuxi_gpu_map(0,1,(uintptr_t)source_buf,4352*10,&times)); fg_scanout_preclean=1;
+ CleanPoC_DcacheRegion_Force((uintptr_t)source_buf,4352*10); { uint64_t cleaned=clean_bytes; /* the caller's pre-clean */
+ assert(fuxi_gpu_copy(0,1,(uintptr_t)source_buf,4352*10,4352,0,0,0,0,10,10,&times)==2 && clean_bytes==cleaned); }
+ ticks+=200000; assert(fuxi_gpu_poll(&times)==1); fg_scanout_preclean=0;
  // Actual shared fault/reset accounting: saturate, count an asserted
  // containment reset once even if the bus drain is repeated.
  reset();fg_faults=fg_suspends=UINT64_MAX;

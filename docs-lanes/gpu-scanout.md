@@ -1322,3 +1322,59 @@ Two opt-in `/arm-io/disp0` u32 ADT properties (no boot argument), written by
 
 No maximum-interval or TimingElements key is published: their names are not established
 from our own observations. Device effect: not yet observed.
+
+### Zero-copy verdict (2026-10-28) and copy-source pre-clean (`fuxigpuncimport` bit 20)
+
+Verdict, derived from code: VIG0 cannot fetch CA's swap surfaces in place.
+
+- CA's swap surfaces are backboardd BGRA 1125x2436 surfaces with bpr 4608 and
+  0xab8000 bytes (observed at L191: ids 2/3/9). Our own `SweetSurface` create
+  allocates them with `IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
+  InOut|KernelUserShared, size, page_size)`. Those are scattered 16 KiB XNU pages.
+- XNU RAM starts at 0x8c0000000: FuxiAdreno refuses to start unless
+  gPhysBase == FG_RAM_BASE 0x8c0000000. So every surface page is above 4 GiB. SRC0 (+0x14) takes a 32-bit address. The display SMMU is never
+  programmed: A/B/C are splash-carveout PAs written as is, and only
+  0xb8000000..0xb9de3400 has been observed to display.
+- Contiguous RAM below 4 GiB cannot be allocated: XNU owns none. The only
+  reachable pool is the splash carveout. Three 0xab8000 slots fit only if they
+  replace B and C (0xb8a00000..0xbaa28000). That route needs all of these:
+  - an IOSurface allocator hook;
+  - `fuxi_adreno_host_page_ok` accepting non-pmap pages, plus a device-pager
+    prepare in `importHost`, which is untested;
+  - write-combined user mappings;
+  - SRC_XY/IMG_SIZE/YSTRIDE0 writes for the (22,18) crop, whose live values
+    were never dumped;
+  - a writer block until the next START.
+- The other route is translating MDSS through the apps SMMU, as
+  NativeMobileDisplay does. That means taking a context bank and SMR/S2CR away
+  from the bootloader state, on the same SMMU that carries UFS. It would need
+  its own qualification.
+
+Bit 20 of `fuxigpuncimport` (value 1048576, so 327168 becomes 1375744) is the
+cheap alternative plus the survey. It needs `fuxigpuscanout=1`:
+
+- `sweet_surface_gpu_copy` cleans the whole copy source to PoC before
+  `fuxi_gpu_scanout_reserve`. It holds the surface-cache lock but neither the
+  GPU lock nor the ring reservation, and writers are already excluded by
+  `sweet_gpu_submitting`. `fuxi_gpu_copy` then skips its locked `fg_clean`.
+- The clean is skipped while the surface's writer serial and epoch are
+  unchanged since the last clean, for example on reserve retries.
+- The about 550 us clean (L191 split) therefore leaves the window in which
+  client submits are refused or blocked. The GPU copy itself (about 650 us)
+  still holds the ring.
+- At takeover, one read-only VIG0 dump is logged:
+  `FUXI SCANOUT: sspp vig0 size= img= xy= out_size= out_xy= src0= ystride0=
+  format= unpack= op_mode=`.
+- Every 600 frames, `FUXI SCANOUT: preclean cleans= skips= zerocopy eligible=
+  format= stride= size= backing= scattered= high= unknown=` classifies each
+  submitted frame. Expected (derived from code): every frame is `high`.
+- The bit-64 coherent mode (from 144de2d) does not skip this clean. Its pass
+  maps ABI imports write-back inner-shareable (MAIR index 1, 0xff). The copy
+  source is mapped separately by `fuxi_gpu_map` in the kernel present table,
+  with AttrIndx 0 (0x44, Normal non-cacheable), inner-shareable. A
+  non-cacheable GPU read does not snoop CPU caches, so dirty CPU lines must
+  still reach PoC. Skipping would need `fuxi_gpu_map` to use AttrIndx 1 under
+  `fg_abi_coh_wb`. That is a separate change, and the self-test did not
+  exercise the present table's mapping.
+
+Not yet observed.
