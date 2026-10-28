@@ -1359,7 +1359,7 @@
 +#endif
 --- a/bsd/dev/fuxi_gpu_scanout.inc
 +++ b/bsd/dev/fuxi_gpu_scanout.inc
-@@ -0,0 +1,1309 @@
+@@ -0,0 +1,1521 @@
 +/* SPDX-License-Identifier: MIT
 + * Copyright (c) 2026 NativeMetal contributors
 + * Ported from UniXNU drivers/NativeMetal/GpuScanoutClient.h (MIT).
@@ -1510,7 +1510,8 @@
 + * START-bit-clear ("clear"), the first write-line idle after it was active ("lineend", 0 when never seen active) and "done" = the
 + * later of clear and lineend, the same condition acquire uses. The worker only stores results; accounting runs under FG_GUARD at the
 + * next publish, so a window is consistent. Read-only MMIO, no behaviour change. Not yet observed on device. */
-+static unsigned fg_abi_probe, fg_abi_spin, fg_abi_mid;
++static unsigned fg_abi_probe, fg_abi_spin, fg_abi_mid, fg_abi_ar, fg_scanout_ar_state; /* ar_state: 0 manual, 1 verifying, 2 active, 3 disabled, 4 arming */
++static int fg_scanout_ar_on(void) { return fg_scanout_ar_state == 1 || fg_scanout_ar_state == 2; }
 +/* Opt-in (fuxigpuncimport bit 32768), panel120 + double/triple only. The 1080x2400 transfer runs ~8.0 ms from the TE edge in an 8.3 ms
 + * period, so a START catches the next TE only if written in the ~0.3 ms between transfer-done and that TE. The first version woke a
 + * fixed 93% of a period after the START write, but the transfer begins at the next TE after the START, up to a period later, so it woke
@@ -1728,7 +1729,7 @@
 + * missed it, so it is not trusted. */
 +static void fg_scanout_spin_kick(int fresh)
 +{
-+ if (!fg_abi_spin || !fg_scanout_panel120_active || !fg_scanout_double_active) return;
++ if (!fg_abi_spin || !fg_scanout_panel120_active || !fg_scanout_double_active || fg_scanout_ar_on()) return;
 + if (fg_scanout_spin_busy) { if (!fresh) fg_scanout_spin_stat[FG_SPIN_ARR_BUSY]++; return; }
 + if (!fg_scanout_spin_setup) {
 +  thread_call_setup_with_options(&fg_scanout_spin_call, fg_scanout_spin_run, NULL, THREAD_CALL_PRIORITY_KERNEL, THREAD_CALL_OPTIONS_ONCE);
@@ -2066,8 +2067,193 @@
 + __asm__ volatile("dsb sy" ::: "memory");
 + return 1;
 +}
++/* Opt-in (fuxigpuncimport bit 131072), panel120 + triple only: pingpong autorefresh scanout. The bootloader left INTF1 AUTOREFRESH_CONFIG
++ * (+0x2b4) = 0x80000001 (bit31 enable, low16 frame count 1) and ownership clears bit31. After a normal START the monitor thread sets bit31
++ * again (count 1): the hardware then repeats the transfer of the latched SSPP source on every TE with no software START. A present is
++ * then only a source flip: SRC0 (0xae05014) + CTL flush bit0 (the pipe registers are latched by the hardware at a frame start; this is
++ * not assumed but measured). SSPP_CURRENT_SRC0_ADDR (0xae050a4) shows the latched address: it tells which of A/B/C the hardware has
++ * latched. The staged (front) buffer may be unlatched, the latched one (fetch) may be read at any time, and the buffer a latch displaced is
++ * held until a TE after the observation, so a copy never targets front, fetch or a held buffer; a flip over an unlatched buffer simply
++ * replaces it. Verification: within 100 ms the write line must be active in >=60% of the samples with no software START (a transfer that
++ * runs on every TE is active ~95% of the time), else autorefresh is disabled and manual START resumes for the boot (state 3). Idle: 48 TEs
++ * without a flip disable autorefresh (the staged source is already latched), the next present uses a START and re-arms it. CPU fallback and
++ * stop disable it first. Counters: latch line (write line when the address change was first seen) shows whether the latch happens at a
++ * frame start (idle/<200) or mid-transfer (>=600, "latch_mid", a tear risk). Not yet observed on device. */
++#define FG_SCAN_AR_REG (FG_SCAN_INTF+0x2b4)
++#define FG_SCAN_AR_VERIFY_US 100000u
++#define FG_SCAN_AR_MIN_US 40000u
++#define FG_SCAN_AR_IDLE_TES 48u
++enum {FG_AR_FLIPS, FG_AR_ON, FG_AR_OFF_IDLE, FG_AR_OFF_FAIL, FG_AR_OFF_CPU, FG_AR_OFF_STOP, FG_AR_LATCH_MID, FG_AR_BAD_CUR, FG_AR_DROPS, FG_AR_WAKES,
++      FG_AR_TARGET_WAIT, FG_AR_CONFIRMED, FG_AR_N};
++static thread_call_data_t fg_scanout_ar_call;
++static unsigned fg_scanout_ar_setup, fg_scanout_ar_busy, fg_scanout_ar_pending, fg_scanout_ar_fetch, fg_scanout_ar_hold, fg_scanout_ar_hold_te;
++static unsigned fg_scanout_ar_confirmed, fg_scanout_ar_flip_te, fg_scanout_ar_flip_valid, fg_scanout_ar_samples, fg_scanout_ar_active, fg_scanout_ar_te0, fg_scanout_ar_prints;
++static unsigned fg_scanout_ar_st[FG_AR_N], fg_scanout_ar_tpf[5], fg_scanout_ar_ttl[4], fg_scanout_ar_ll[5];
++static uint64_t fg_scanout_ar_t0;
++static void fg_scanout_ar_run(thread_call_param_t a, thread_call_param_t b);
++static void fg_scanout_ar_schedule(unsigned us)
++{
++ uint64_t d;
++ if (fg_scanout_ar_busy) return;
++ if (!fg_scanout_ar_setup) {
++  thread_call_setup_with_options(&fg_scanout_ar_call, fg_scanout_ar_run, NULL, THREAD_CALL_PRIORITY_KERNEL, THREAD_CALL_OPTIONS_ONCE);
++  fg_scanout_ar_setup = 1;
++ }
++ nanoseconds_to_absolutetime((uint64_t)us*1000, &d);
++ fg_scanout_ar_busy = 1;
++ (void)thread_call_enter_delayed(&fg_scanout_ar_call, mach_absolute_time() + d);
++}
++static int fg_scanout_ar_buffer(unsigned cur, unsigned *b)
++{
++ if (cur < 0xb8000000u || (cur - 0xb8000000u) % 0xa00000u || (cur - 0xb8000000u)/0xa00000u > 2) return 0;
++ *b = (cur - 0xb8000000u)/0xa00000u;
++ return 1;
++}
++/* Read the latched source, the TE count and (on a change) the write line. Called under FG_GUARD; 0 = MMIO failure. */
++static int fg_scanout_ar_sync(void)
++{
++ unsigned cur, count, line = 0, b, te;
++ if (!fg_scanout_read(0xae050a4, &cur) || !fg_scanout_read(FG_SCAN_INTF+0x298, &count)) return 0;
++ te = count >> 16;
++ if (!fg_scanout_ar_buffer(cur, &b)) fg_scanout_ar_st[FG_AR_BAD_CUR]++;
++ else if (b != fg_scanout_ar_fetch) {
++  unsigned bucket;
++  (void)fg_scanout_read(FG_SCAN_INTF+0x2b0, &line);
++  line &= 0xffffu;
++  bucket = line == 0 || line >= 2400 ? 0 : line < 200 ? 1 : line < 600 ? 2 : line < 1200 ? 3 : 4;
++  fg_scanout_ar_ll[bucket]++;
++  if (bucket >= 3) fg_scanout_ar_st[FG_AR_LATCH_MID]++;
++  if (b == fg_scanout_front) {
++   if (fg_scanout_ar_pending && fg_scanout_ar_flip_valid) { unsigned d = (te - fg_scanout_ar_flip_te) & 0xffffu; fg_scanout_ar_ttl[d > 3 ? 3 : d]++; }
++   fg_scanout_ar_pending = 0;
++  }
++  fg_scanout_ar_hold = 1u << fg_scanout_ar_fetch; fg_scanout_ar_hold_te = te;
++  fg_scanout_ar_fetch = b;
++ }
++ if (fg_scanout_ar_hold && te != fg_scanout_ar_hold_te) fg_scanout_ar_hold = 0;
++ return 1;
++}
++/* A buffer that is neither the staged one, the latched one nor displaced since the last TE; 3 = none. */
++static unsigned fg_scanout_ar_target(void)
++{
++ for (unsigned i = 0; i < 3; i++)
++  if (i != fg_scanout_front && i != fg_scanout_ar_fetch && !(fg_scanout_ar_hold & (1u << i))) return i;
++ return 3;
++}
++/* After a flip (count read right after the SRC0 write). */
++static void fg_scanout_ar_flipped(unsigned count)
++{
++ unsigned te = count >> 16;
++ if (fg_scanout_ar_flip_valid) { unsigned d = (te - fg_scanout_ar_flip_te) & 0xffffu; fg_scanout_ar_tpf[d > 4 ? 4 : d]++; }
++ fg_scanout_ar_flip_te = te; fg_scanout_ar_flip_valid = 1;
++ fg_scanout_ar_pending = fg_scanout_front != fg_scanout_ar_fetch;
++ fg_scanout_ar_st[FG_AR_FLIPS]++;
++ fg_scanout_ar_schedule(500);
++}
++/* Disable autorefresh; the staged source goes back to what the hardware has latched. newstate 0 = manual until the next present re-arms it, 3 = off for the boot. */
++static int fg_scanout_ar_disable(unsigned newstate, unsigned why, const char *name)
++{
++ unsigned ar, count = 0;
++ if (!fg_scanout_ar_on()) { if (fg_scanout_ar_state == 4) fg_scanout_ar_state = newstate; return 0; }
++ if (!fg_scanout_read(FG_SCAN_AR_REG, &ar) || !fg_scanout_write(FG_SCAN_AR_REG, ar & ~0x80000000u)) { fg_scanout_ar_state = 3; return fg_scanout_stop("autorefresh disable"); }
++ __asm__ volatile("dsb sy" ::: "memory");
++ fg_scanout_ar_state = newstate;
++ if (!fg_scanout_ar_sync()) return fg_scanout_stop("autorefresh sync");
++ if (fg_scanout_front != fg_scanout_ar_fetch) {
++  if (!fg_scanout_address(fg_scanout_pa(fg_scanout_ar_fetch))) return fg_scanout_stop("autorefresh restore source");
++  fg_scanout_front = fg_scanout_ar_fetch; fg_scanout_ar_st[FG_AR_DROPS]++;
++ }
++ fg_scanout_ar_pending = 0; fg_scanout_ar_hold = 0; fg_scanout_back_ready = 0;
++ if (!fg_scanout_read(FG_SCAN_INTF+0x298, &count)) return fg_scanout_stop("autorefresh read te");
++ fg_scanout_arm(count);
++ fg_scanout_ar_st[why]++;
++ if (fg_scanout_ar_prints < 24) { fg_scanout_ar_prints++; printf("FUXI SCANOUT: ar off (%s) state=%u te=%u front=%u\n", name, newstate, count >> 16, fg_scanout_front); }
++ return 0;
++}
++/* From the monitor thread: 1 = state changed (enabled or given up), 0 = try again later. */
++static int fg_scanout_ar_enable(void)
++{
++ unsigned ar, want, back = 0, cur, b, start, count;
++ if (fg_scanout_writable || fg_scanout_copy_open || fg_scanout_back_ready || fg_busy) return 0;
++ if (!fg_scanout_read(FG_SCAN_CTL+0x1c, &start) || (start & 1)) return 0;
++ if (!fg_scanout_read(FG_SCAN_AR_REG, &ar) || !fg_scanout_read(0xae050a4, &cur) || !fg_scanout_read(FG_SCAN_INTF+0x298, &count)) {
++  fg_scanout_ar_state = 3; (void)fg_scanout_stop("autorefresh read"); return 1;
++ }
++ if (!fg_scanout_ar_buffer(cur, &b)) {
++  fg_scanout_ar_st[FG_AR_BAD_CUR]++; fg_scanout_ar_state = 3;
++  printf("FUXI SCANOUT: ar not enabled: latched source %#x is not A/B/C; manual START for the boot\n", cur);
++  return 1;
++ }
++ want = (ar & ~0xffffu) | 0x80000001u;
++ if (!fg_scanout_write(FG_SCAN_AR_REG, want) || !fg_scanout_read(FG_SCAN_AR_REG, &back) || back != want) {
++  (void)fg_scanout_write(FG_SCAN_AR_REG, ar & ~0x80000000u); fg_scanout_ar_state = 3;
++  printf("FUXI SCANOUT: ar not enabled: write %#x read back %#x; manual START for the boot\n", want, back);
++  return 1;
++ }
++ fg_scanout_ar_fetch = b; fg_scanout_ar_hold = 0; fg_scanout_ar_pending = fg_scanout_front != b;
++ fg_scanout_ar_state = fg_scanout_ar_confirmed ? 2 : 1;
++ fg_scanout_ar_t0 = rsr("cntpct_el0"); fg_scanout_ar_samples = fg_scanout_ar_active = 0; fg_scanout_ar_te0 = count >> 16;
++ fg_scanout_ar_flip_te = count >> 16; fg_scanout_ar_flip_valid = 1;
++ fg_scanout_ar_st[FG_AR_ON]++;
++ if (fg_scanout_ar_prints < 24) { fg_scanout_ar_prints++; printf("FUXI SCANOUT: ar on state=%u ar=%#x -> %#x te=%u front=%u latched=%u\n", fg_scanout_ar_state, ar, want, count >> 16, fg_scanout_front, b); }
++ return 1;
++}
++static void fg_scanout_ar_run(thread_call_param_t a, thread_call_param_t b)
++{
++ (void)a; (void)b;
++ FG_GUARD;
++ unsigned us = 4000, count, line;
++ fg_scanout_ar_busy = 0;
++ if (fg_scanout_failed || !fg_abi_ar) return;
++ fg_scanout_ar_st[FG_AR_WAKES]++;
++ if (fg_scanout_ar_state == 4) {
++  if (!fg_scanout_ar_enable()) fg_scanout_ar_schedule(1000);
++  else if (fg_scanout_ar_on()) fg_scanout_ar_schedule(1000);
++  return;
++ }
++ if (!fg_scanout_ar_on()) return;
++ if (!fg_scanout_ar_sync() || !fg_scanout_read(FG_SCAN_INTF+0x298, &count) || !fg_scanout_read(FG_SCAN_INTF+0x2b0, &line)) {
++  (void)fg_scanout_stop("autorefresh monitor MMIO"); return;
++ }
++ line &= 0xffffu;
++ uint64_t elapsed = (rsr("cntpct_el0") - fg_scanout_ar_t0)*1000000/rsr("cntfrq_el0");
++ if (fg_scanout_ar_state == 1) {
++  fg_scanout_ar_samples++;
++  if (line != 0 && line < 2400) fg_scanout_ar_active++;
++  unsigned adv = ((count >> 16) - fg_scanout_ar_te0) & 0xffffu;
++  if (elapsed >= FG_SCAN_AR_MIN_US && fg_scanout_ar_samples >= 20 && fg_scanout_ar_active*100 >= fg_scanout_ar_samples*60 && adv >= 4) {
++   fg_scanout_ar_state = 2; fg_scanout_ar_confirmed = 1; fg_scanout_ar_st[FG_AR_CONFIRMED]++;
++   printf("FUXI SCANOUT: ar confirmed: write line active in %u of %u samples over %llu us with no software START\n",
++       fg_scanout_ar_active, fg_scanout_ar_samples, (unsigned long long)elapsed);
++  } else if (elapsed >= FG_SCAN_AR_VERIFY_US) {
++   printf("FUXI SCANOUT: ar failed: write line active in %u of %u samples over %llu us (te advanced %u); manual START for the boot\n",
++       fg_scanout_ar_active, fg_scanout_ar_samples, (unsigned long long)elapsed, adv);
++   (void)fg_scanout_ar_disable(3, FG_AR_OFF_FAIL, "verify failed");
++   return;
++  }
++  us = 1000;
++ } else if (!fg_scanout_ar_pending && !fg_scanout_writable && !fg_scanout_copy_open && (((count >> 16) - fg_scanout_ar_flip_te) & 0xffffu) >= FG_SCAN_AR_IDLE_TES) {
++  (void)fg_scanout_ar_disable(0, FG_AR_OFF_IDLE, "idle");
++  return;
++ }
++ if (fg_scanout_ar_pending) us = 500;
++ fg_scanout_ar_schedule(us);
++}
++/* After a manual START: ask the monitor to enable autorefresh once the transfer trigger has settled. */
++static void fg_scanout_ar_arming(void)
++{
++ if (!fg_abi_ar || fg_scanout_ar_state != 0 || fg_scanout_failed || !fg_scanout_panel120_active || !fg_scanout_double_active || !fg_scanout_triple_requested) return;
++ fg_scanout_ar_state = 4;
++ fg_scanout_ar_schedule(1000);
++}
 +static int fg_scanout_stop(const char *reason)
 +{
++ if (fg_scanout_ar_on() || fg_scanout_ar_state == 4) {
++  unsigned ar;
++  fg_scanout_ar_state = 3;
++  if (fg_scanout_read(FG_SCAN_AR_REG, &ar)) (void)fg_scanout_write(FG_SCAN_AR_REG, ar & ~0x80000000u);
++  fg_scanout_ar_st[FG_AR_OFF_STOP]++;
++ }
 + if (!fg_scanout_failed)
 +  printf("FUXI SCANOUT: stopped reason=%s; panel held, no framebuffer writes\n", reason);
 + /* Restore the fixed-address shadow even on failure; never hand back ownership
@@ -2299,7 +2485,7 @@
 +  return 0;
 + }
 + unsigned ar, line, start;
-+ if (!fg_scanout_read(FG_SCAN_INTF+0x2b4, &ar) || (ar & 0x80000000u))
++ if (!fg_scanout_read(FG_SCAN_INTF+0x2b4, &ar) || !(ar & 0x80000000u) != !fg_scanout_ar_on())
 +  return fg_scanout_stop("autorefresh changed");
 + if (fg_scanout_double_active) {
 +  unsigned src;
@@ -2307,6 +2493,15 @@
 +   return fg_scanout_stop("double SRC0 changed");
 + }
 + if (fg_busy) { fg_scanout_wait_ring++; if (publication) fg_scanout_charge_to(FG_WHY_RING); return 0; }
++ if (fg_scanout_double_active && fg_scanout_ar_on()) {
++  unsigned t;
++  if (!fg_scanout_ar_sync()) return fg_scanout_stop("autorefresh sync");
++  t = fg_scanout_ar_target();
++  if (t > 2) { fg_scanout_ar_st[FG_AR_TARGET_WAIT]++; return 0; }
++  fg_scanout_copy = t;
++  fg_scanout_writable = 1;
++  return 1;
++ }
 + if (fg_scanout_double_active && !publication) {
 +  if (fg_scanout_back_ready && !fg_scanout_triple_requested) return 0;
 +  fg_scanout_copy = fg_scanout_target();
@@ -2412,6 +2607,7 @@
 +int fuxi_gpu_scanout_cpu_acquire(void)
 +{
 + FG_GUARD;
++ if ((fg_scanout_ar_on() || fg_scanout_ar_state == 4) && fg_scanout_ar_disable(0, FG_AR_OFF_CPU, "cpu fallback") < 0) return -1;
 + int writable = fg_scanout_acquire(1);
 + if (writable != 1 || !fg_scanout_double_active) return writable;
 + unsigned newest = fg_scanout_back_ready ? (fg_scanout_triple_requested ? fg_scanout_ready : fg_scanout_front ^ 1u) : fg_scanout_front;
@@ -2432,7 +2628,9 @@
 +static int fg_scanout_publish(void)
 +{
 + if (fg_scanout_failed || fg_busy || !fg_scanout_writable) return -1;
-+ if (fg_scanout_double_active) {
++ unsigned arm_on = fg_scanout_ar_on();
++ if (arm_on && !fg_scanout_ar_sync()) return fg_scanout_stop("autorefresh sync");
++ if (fg_scanout_double_active && !arm_on) {
 +  int writable = fg_scanout_acquire(1);
 +  if (writable != 1) {
 +   if (!writable) fg_scanout_retries++;
@@ -2441,16 +2639,16 @@
 + }
 + unsigned ar, start;
 + fg_scanout_probe_account();
-+ if (!fg_scanout_read(FG_SCAN_INTF+0x2b4, &ar) || (ar & 0x80000000u) ||
-+     !fg_scanout_read(FG_SCAN_CTL+0x1c, &start) || (start & 1))
++ if (!arm_on && (!fg_scanout_read(FG_SCAN_INTF+0x2b4, &ar) || (ar & 0x80000000u) ||
++     !fg_scanout_read(FG_SCAN_CTL+0x1c, &start) || (start & 1)))
 +  return fg_scanout_stop("publish transfer status");
-+ if (fg_abi_mid && !fg_scanout_mid_allow()) return 2; /* outside the tear-safe part of the period: the caller retries */
++ if (fg_abi_mid && !arm_on && !fg_scanout_mid_allow()) return 2; /* outside the tear-safe part of the period: the caller retries */
 + fg_scanout_charge_to(fg_scanout_last_why); /* the last wait ran until this poll */
 + __asm__ volatile("dsb sy" ::: "memory");
 + fg_scanout_writable = 0;
 + if (fg_scanout_double_active && !fg_scanout_address(fg_scanout_pa(fg_scanout_triple_requested ? fg_scanout_ready : fg_scanout_front ^ 1u)))
 +  return fg_scanout_stop("double SRC0 flush");
-+ if (!fg_scanout_write(FG_SCAN_CTL+0x1c, 1)) return fg_scanout_stop("start transfer");
++ if (!arm_on && !fg_scanout_write(FG_SCAN_CTL+0x1c, 1)) return fg_scanout_stop("start transfer");
 + fg_scanout_probe_t0 = rsr("cntpct_el0");
 + fg_scanout_stamps.previous_start = fg_scanout_stamps.start;
 + fg_scanout_stamps.start = mach_absolute_time();
@@ -2466,6 +2664,7 @@
 + __asm__ volatile("dsb sy" ::: "memory");
 + if (!fg_scanout_read(FG_SCAN_INTF+0x298, &count)) return fg_scanout_stop("read te count");
 + fg_scanout_probe_kick(count >> 16);
++ if (arm_on) fg_scanout_ar_flipped(count);
 + uint64_t now = rsr("cntpct_el0"), hz = rsr("cntfrq_el0");
 + /* START-to-START gaps in actual panel periods: <=1, <=2, <=3, longer. */
 + unsigned gap1 = 0;
@@ -2489,6 +2688,16 @@
 +      fg_scanout_drain_us, fg_scanout_te_mode, te_dhz/10, te_dhz%10,
 +      fg_scanout_iv[0], fg_scanout_iv[1], fg_scanout_iv[2], fg_scanout_iv[3]);
 +  fg_scanout_probe_report();
++  if (fg_abi_ar) {
++   unsigned *st = fg_scanout_ar_st, *tf = fg_scanout_ar_tpf, *tl = fg_scanout_ar_ttl, *ll = fg_scanout_ar_ll;
++   printf("FUXI SCANOUT: ar state=%u confirmed=%u flips=%u on=%u off_idle=%u off_fail=%u off_cpu=%u off_stop=%u drops=%u target_wait=%u wakes=%u"
++       " te_per_flip(0/1/2/3/4+)=%u/%u/%u/%u/%u te_to_latch(0/1/2/3+)=%u/%u/%u/%u latch_line(idle/<200/<600/<1200/more)=%u/%u/%u/%u/%u"
++       " latch_mid=%u bad_cur=%u fetch=%u front=%u hold=%#x\n",
++       fg_scanout_ar_state, fg_scanout_ar_confirmed, st[FG_AR_FLIPS], st[FG_AR_ON], st[FG_AR_OFF_IDLE], st[FG_AR_OFF_FAIL], st[FG_AR_OFF_CPU], st[FG_AR_OFF_STOP],
++       st[FG_AR_DROPS], st[FG_AR_TARGET_WAIT], st[FG_AR_WAKES], tf[0], tf[1], tf[2], tf[3], tf[4], tl[0], tl[1], tl[2], tl[3], ll[0], ll[1], ll[2], ll[3], ll[4],
++       st[FG_AR_LATCH_MID], st[FG_AR_BAD_CUR], fg_scanout_ar_fetch, fg_scanout_front, fg_scanout_ar_hold);
++   memset(st, 0, sizeof(fg_scanout_ar_st)); memset(tf, 0, sizeof(fg_scanout_ar_tpf)); memset(tl, 0, sizeof(fg_scanout_ar_ttl)); memset(ll, 0, sizeof(fg_scanout_ar_ll));
++  }
 +  if (fg_abi_mid) {
 +   unsigned *h = fg_scanout_mid_hist, *g = fg_scanout_mid_g1;
 +   unsigned *vi = fg_scanout_mid_vimm, *vh = fg_scanout_mid_vheld;
@@ -2560,9 +2769,12 @@
 +  fg_scanout_te_window = fg_scanout_te_frames;
 + }
 + __asm__ volatile("dsb sy" ::: "memory");
-+ fg_scanout_mid_account(count, gap1);
-+ fg_scanout_arm(count);
-+ fg_scanout_spin_kick(1);
++ if (!arm_on) {
++  fg_scanout_mid_account(count, gap1);
++  fg_scanout_arm(count);
++  fg_scanout_spin_kick(1);
++  fg_scanout_ar_arming();
++ }
 + return 1;
 +}
 +/* A token the spin thread consumed while no copy was open is restored for the caller that still holds a finished copy. */
@@ -2724,7 +2936,7 @@
 +static uint32_t fg_abi_q_stats[6]; /* queued, deepest, refused for a present, full, refused by the hold, hold expired */
 +static unsigned fg_abi_hold;
 +static unsigned fg_abi_start;
-+static unsigned fg_abi_probe, fg_abi_spin, fg_abi_mid;
++static unsigned fg_abi_probe, fg_abi_spin, fg_abi_mid, fg_abi_ar;
 +static uint64_t fg_abi_hold_since;
 +/* Ticks the last fuxi_gpu_abi_map spent after taking the GPU lock (the caller's total minus this is the wait for that lock). */
 +static uint64_t fg_abi_map_work;
@@ -3046,7 +3258,7 @@
 +{
 + unsigned bits=0;
 + (void)PE_parse_boot_argn("fuxigpuncimport",&bits,sizeof(bits));
-+ fg_abi_ncimport=bits&1; fg_wptr_fence=(bits>>1)&1; fg_abi_unstick=(bits>>2)&1; fg_abi_cohtest=(bits>>6)&1; fg_abi_tlbpages=(bits>>7)&1; fg_abi_mapwait=(bits>>8)&1; fg_abi_queue=(bits>>9)&1; fg_abi_roimport=(bits>>10)&1; fg_abi_pace=(bits>>11)&1; fg_abi_hold=(bits>>12)&1; fg_abi_start=(bits>>13)&1; fg_abi_probe=(bits>>14)&1; fg_abi_spin=(bits>>15)&1; fg_abi_mid=(bits>>16)&1; fg_abi_hold_since=0; fg_abi_present_wait=0; memset(fg_abi_q_stats,0,sizeof(fg_abi_q_stats));
++ fg_abi_ncimport=bits&1; fg_wptr_fence=(bits>>1)&1; fg_abi_unstick=(bits>>2)&1; fg_abi_cohtest=(bits>>6)&1; fg_abi_tlbpages=(bits>>7)&1; fg_abi_mapwait=(bits>>8)&1; fg_abi_queue=(bits>>9)&1; fg_abi_roimport=(bits>>10)&1; fg_abi_pace=(bits>>11)&1; fg_abi_hold=(bits>>12)&1; fg_abi_start=(bits>>13)&1; fg_abi_probe=(bits>>14)&1; fg_abi_spin=(bits>>15)&1; fg_abi_mid=(bits>>16)&1; fg_abi_ar=(bits>>17)&1; fg_abi_hold_since=0; fg_abi_present_wait=0; memset(fg_abi_q_stats,0,sizeof(fg_abi_q_stats));
 + fg_abi_coh=fg_abi_coh_tries=0;
 + for (unsigned i=0;i<sizeof(fg_abi_used)/sizeof(fg_abi_used[0]);i++) fg_abi_used[i]=0;
 + /* 772 4K pages: root, two L2s, kernel runtime L3, 768 client L3s.
