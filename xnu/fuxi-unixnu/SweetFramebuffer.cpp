@@ -182,6 +182,9 @@ public:
  uint64_t      fTeOffset, fTeNext, fTeLastNotify, fTePeriodSum;
  unsigned      fTeSentFrame, fTeLocked, fTeFallback;
  uint16_t      fTePhase[256];  /* 128 us bins, locked notifications only */
+ bool          fSwapHist;      /* disp0 fuxi,swap-hist=1: SwapEnd intervals in vsync periods */
+ uint64_t      fSwapLast, fSwapIdle;
+ uint32_t      fSwapBins[7];   /* 0..4, 5+ (<100 ms), idle */
  bool teVsyncTick(uint64_t &now, bool fallback);
  void teVsyncLog(uint64_t now);
 #endif
@@ -291,17 +294,46 @@ static bool sweet_fb_refresh_wanted(uint32_t panel120, bool hzPresent, uint32_t 
  return panel120 == 1 && !(hzPresent && hz <= 60);
 }
 
+/* Opt-in disp0 ADT properties (the boot-arg line is nearly full): absent or not a u32 -> 0. */
+static uint32_t sweet_fb_adt_u32(IOService *provider, const char *key)
+{
+ OSData *data = provider ? OSDynamicCast(OSData, provider->getProperty(key)) : NULL;
+ uint32_t value = 0;
+ if (data && data->getLength() == sizeof(value)) memcpy(&value, data->getBytesNoCopy(), sizeof(value));
+ return value;
+}
+
+/* disp0 fuxi,refresh-mhz: the panel's measured rate in mHz (120800 for TE 8.278 ms), so CA's
+ * free-running display timer does not beat against TE. Outside 61..240 Hz: nominal 120 Hz. */
+static uint32_t sweet_fb_refresh_interval_mhz(uint32_t mhz)
+{
+ if (mhz < 61000 || mhz > 240000) mhz = 120000;
+ return (uint32_t)(((1ULL << 32) * 1000 + mhz / 2) / mhz);
+}
+
+/* A SwapEnd interval in vsync periods: 0..4, 5 = 5+ below idle, 6 = idle (at least `idle`). */
+static uint32_t sweet_fb_swap_bin(uint64_t interval, uint64_t period, uint64_t idle)
+{
+ if (interval >= idle) return 6;
+ uint64_t n = period ? (interval + period / 2) / period : 5;
+ return n > 5 ? 5 : (uint32_t)n;
+}
+
 static void sweet_fb_refresh_publish(AppleCLCD *fb)
 {
  uint32_t panel120 = 0, hz = 0;
  PE_parse_boot_argn("fuxipanel120", &panel120, sizeof(panel120));
  bool hzPresent = PE_parse_boot_argn("sweetfb_hz", &hz, sizeof(hz));
  if (!sweet_fb_refresh_wanted(panel120, hzPresent, hz)) return;
+ uint32_t mhz = sweet_fb_adt_u32(fb->getProvider(), "fuxi,refresh-mhz");
+ uint32_t value = mhz ? sweet_fb_refresh_interval_mhz(mhz) : sweet_fb_refresh_interval(120);
  OSDictionary *refresh = OSDictionary::withCapacity(1);
- OSNumber *interval = OSNumber::withNumber((uint64_t)sweet_fb_refresh_interval(120), 32);
+ OSNumber *interval = OSNumber::withNumber((uint64_t)value, 32);
  if (refresh && interval && refresh->setObject("displayMinRefreshInterval", interval) &&
-     fb->setProperty("IOMFBDisplayRefresh", refresh))
-  IOLog("SWEET FB: IOMFBDisplayRefresh displayMinRefreshInterval=%u (120 Hz)\n", sweet_fb_refresh_interval(120));
+     fb->setProperty("IOMFBDisplayRefresh", refresh)) {
+  if (mhz) IOLog("SWEET FB: IOMFBDisplayRefresh displayMinRefreshInterval=%u (fuxi,refresh-mhz=%u)\n", value, mhz);
+  else IOLog("SWEET FB: IOMFBDisplayRefresh displayMinRefreshInterval=%u (120 Hz)\n", value);
+ }
  OSSafeReleaseNULL(interval);
  OSSafeReleaseNULL(refresh);
 }
@@ -481,6 +513,9 @@ AppleCLCD::start(IOService *provider)
 	fBacklightPowerNotifications = backlight == 2 || backlight == 3;
 	fuxi_backlight_publish(this);
 	sweet_fb_refresh_publish(this);
+ fSwapHist = sweet_fb_adt_u32(provider, "fuxi,swap-hist") == 1;
+ nanoseconds_to_absolutetime(100000000ULL, &fSwapIdle);
+ if (fSwapHist) IOLog("SWEET FB: swap interval histogram on (fuxi,swap-hist)\n");
 #endif
 	registerService();
 	IOLog("SWEET FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u, presented as %ux%u\n",
@@ -977,6 +1012,13 @@ AppleCLCD::swap(const uint8_t *rec)
  if (outstanding > fOutstandingMax) fOutstandingMax = outstanding;
  fPending[fPendingCount++] = record;
  fStatSwaps++; fDirty = true; wakePresentLocked();
+#if defined(FUXI)
+ /* Diagnostic only: fTe is the timer's last observation, read without its ordering. */
+ if (fSwapHist) {
+  if (fSwapLast) fSwapBins[sweet_fb_swap_bin(record.swapped - fSwapLast, fTeValid ? fTe.period : fTickAbs, fSwapIdle)]++;
+  fSwapLast = record.swapped;
+ }
+#endif
  IOLockUnlock(fLock);
 #if defined(FUXI)
  if (fScanout && fWriterWakeCall && fFlushTicks == 1) writerRetired(this);
@@ -1327,10 +1369,19 @@ void AppleCLCD::presentStats(uint64_t took)
   uint64_t waits[2] = { fWaitPoll[0], fWaitPoll[1] }, early = fWaitEarly, latest = fWaitLatest;
   unsigned outstanding = fOutstandingMax;
 		fStatSwaps = fStatDropped = 0;
+#if defined(FUXI)
+  uint32_t bins[7]; memcpy(bins, fSwapBins, sizeof(bins)); bzero(fSwapBins, sizeof(fSwapBins));
+  uint64_t period_ns = 0; absolutetime_to_nanoseconds(fTeValid ? fTe.period : fTickAbs, &period_ns);
+#endif
 		IOLockUnlock(fLock);
 		IOLog("SWEET FB: stats %u frames in %llu ms, copy avg %llu us max %llu us, "
 		    "%u swaps, %u not shown queued_pending=%u fifo_overflow=%u ready_skips=%u ownership_defers=%u reuse_before_show=%llu wait_mode0=%llu wait_mode1=%llu wait_early=%llu wait_id0=%llu outstanding_max=%u early_retires=%u\n", fStatFrames, span_ns / 1000000, avg_ns / 1000,
 		    max_ns / 1000, swaps, dropped, pending, overflow, skips, fScanoutDefers, reuse, waits[0], waits[1], early, latest, outstanding, fEarlyRetires);
+#if defined(FUXI)
+  if (fSwapHist)
+   IOLog("SWEET FB: swap_interval period_us=%llu vsyncs 0/1/2/3/4/5+/idle=%u/%u/%u/%u/%u/%u/%u\n", period_ns / 1000,
+       bins[0], bins[1], bins[2], bins[3], bins[4], bins[5], bins[6]);
+#endif
 		uint64_t gpu_ns, cpu_ns;
 		absolutetime_to_nanoseconds(fGpuTime, &gpu_ns);
 		absolutetime_to_nanoseconds(fCpuTime, &cpu_ns);

@@ -403,7 +403,15 @@ int main(void) {
  assert(sweet_fb_refresh_interval(120)==35791394 && sweet_fb_refresh_interval(60)==71582788 && sweet_fb_refresh_interval(0)==0);
  assert(!sweet_fb_refresh_wanted(0,false,0) && sweet_fb_refresh_wanted(1,false,0) && !sweet_fb_refresh_wanted(2,false,0));
  assert(sweet_fb_refresh_wanted(1,true,120) && !sweet_fb_refresh_wanted(1,true,60) && !sweet_fb_refresh_wanted(1,true,30));
- puts("PASS: IOMFBDisplayRefresh interval and gating");return 0;
+ assert(sweet_fb_refresh_interval_mhz(120000)==sweet_fb_refresh_interval(120) && sweet_fb_refresh_interval_mhz(120800)==35554365);
+ assert(sweet_fb_refresh_interval_mhz(0)==35791394 && sweet_fb_refresh_interval_mhz(60000)==35791394 && sweet_fb_refresh_interval_mhz(240001)==35791394);
+ assert(sweet_fb_refresh_interval_mhz(61000)==70409300 && sweet_fb_refresh_interval_mhz(240000)==17895697);
+ const uint64_t te=8274,idle=100000;
+ assert(sweet_fb_swap_bin(0,te,idle)==0 && sweet_fb_swap_bin(4136,te,idle)==0 && sweet_fb_swap_bin(4137,te,idle)==1 && sweet_fb_swap_bin(8274,te,idle)==1);
+ assert(sweet_fb_swap_bin(16548,te,idle)==2 && sweet_fb_swap_bin(16667,te,idle)==2 && sweet_fb_swap_bin(24822,te,idle)==3 && sweet_fb_swap_bin(33096,te,idle)==4);
+ assert(sweet_fb_swap_bin(45000,te,idle)==5 && sweet_fb_swap_bin(99999,te,idle)==5 && sweet_fb_swap_bin(100000,te,idle)==6 && sweet_fb_swap_bin(50,0,idle)==5);
+ assert(sweet_fb_swap_bin(16667,16667,idle)==1 && sweet_fb_swap_bin(8333,16667,idle)==0);
+ puts("PASS: IOMFBDisplayRefresh interval, fuxi,refresh-mhz and gating; swap-interval bins");return 0;
 }
 '''
 
@@ -933,7 +941,8 @@ def main():
         display = (SRC / 'SweetFramebuffer.cpp').read_text()
         refresh = tmp / 'refresh.c'
         refresh.write_text('#include <assert.h>\n#include <stdbool.h>\n#include <stdint.h>\n#include <stdio.h>\n' +
-            function(display, 'sweet_fb_refresh_interval') + function(display, 'sweet_fb_refresh_wanted') + REFRESH_TEST)
+            function(display, 'sweet_fb_refresh_interval') + function(display, 'sweet_fb_refresh_wanted') +
+            function(display, 'sweet_fb_refresh_interval_mhz') + function(display, 'sweet_fb_swap_bin') + REFRESH_TEST)
         subprocess.run(['clang', '-std=gnu11', '-Wall', '-Wextra', '-Werror', str(refresh), '-o', str(tmp / 'refresh')], check=True)
         subprocess.run([str(tmp / 'refresh')], check=True)
         assert re.search(r'setObject\("displayMinRefreshInterval", interval\)', display) and \
@@ -943,7 +952,7 @@ def main():
         declaration = declaration.replace(': public IOMobileFramebuffer', '').replace(
             'OSDeclareDefaultStructors(AppleCLCD);', 'public:')
         methods = ''.join(function(display, name) for name in (
-            'sweet_fb_te_configure', 'AppleCLCD::teVsyncTick', 'AppleCLCD::teVsyncLog',
+            'sweet_fb_swap_bin', 'sweet_fb_te_configure', 'AppleCLCD::teVsyncTick', 'AppleCLCD::teVsyncLog',
             'AppleCLCD::presentWantedLocked', 'AppleCLCD::wakePresentLocked', 'sweet_fb_rearm',
             'AppleCLCD::vsyncFired', 'AppleCLCD::scanoutLog', 'get32', 'AppleCLCD::observeRecord', 'AppleCLCD::recordDone', 'AppleCLCD::consumeRecord', 'AppleCLCD::retireEarly', 'AppleCLCD::releaseRecord',
             'AppleCLCD::swapWait', 'AppleCLCD::stopRecords',

@@ -1296,3 +1296,29 @@ Precise delta for our design (carve three 0xAB8000 drawables out of the
 Expected gain is 0.6-1.3 ms GPU time per frame and about 1-3 ms present
 latency (estimates); the fps effect is unobserved and the prior is small. Not
 started.
+
+## CA frame pacing and opt-in disp0 display properties (default off)
+
+Observed in the ios-0098-m9j A180/C182/I188/L191 boots (all `fuxipanel120=1 fuxivsyncte=1`):
+backboardd never calls selector 72, so no client has the type-5 vsync notification
+enabled and the TE-locked heartbeat (`callbacks_vsync` about 120/s, `period_us`
+8266..8280) reaches no CA client. CA paces on its own timer from
+`IOMFBDisplayRefresh.displayMinRefreshInterval` (35791394 = 1/120 s, logged at start):
+FuxiMetal `frame trace interval` p50 is 8.28..8.36 ms in light windows and 8.5..10.2 ms
+under load (p90 17..33 ms), so CA targets about 120 Hz and is throughput-limited (wall p50
+15..24 ms), not capped at 60. `late` in `backboardd frames=` counts wall > 16.67 ms and
+`cadence_ticks` uses 16.67 ms ticks, so neither separates 8.3 from 16.7 ms intervals.
+
+Two opt-in `/arm-io/disp0` u32 ADT properties (no boot argument), written by
+`tools/mkadt-fuxi.py --refresh-mhz N` and `--swap-hist`:
+
+- `fuxi,refresh-mhz` (61000..240000, else nominal 120 Hz): with `fuxipanel120=1`, publish
+  `displayMinRefreshInterval = round(2^32*1000/N)`, e.g. 120800 -> 35554365, so CA's
+  free-running 8.333 ms timer does not slip one TE about every 1.2 s against the
+  measured 8.274 ms panel. Logs `SWEET FB: IOMFBDisplayRefresh displayMinRefreshInterval=V (fuxi,refresh-mhz=N)`.
+- `fuxi,swap-hist=1`: after each `SWEET FB: stats` line, log
+  `SWEET FB: swap_interval period_us=P vsyncs 0/1/2/3/4/5+/idle=...`, SwapEnd-to-SwapEnd
+  intervals rounded to TE periods (60 Hz fallback period without TE), idle at 100 ms.
+
+No maximum-interval or TimingElements key is published: their names are not established
+from our own observations. Device effect: not yet observed.

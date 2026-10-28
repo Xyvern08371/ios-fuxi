@@ -172,6 +172,23 @@ def set_display_gamut(root, gamut):
     return root
 
 
+def set_display_options(root, refresh_mhz=0, swap_hist=False):
+    """Opt-in /arm-io/disp0 properties read by SweetFramebuffer (none by default):
+    fuxi,refresh-mhz publishes displayMinRefreshInterval at that rate (with fuxipanel120=1),
+    fuxi,swap-hist=1 logs SwapEnd intervals in vsync periods. Replaces existing values."""
+    if refresh_mhz and not 61000 <= refresh_mhz <= 240000:
+        raise ValueError('--refresh-mhz must be 61000..240000')
+    wanted = ([('fuxi,refresh-mhz', struct.pack('<I', refresh_mhz))] if refresh_mhz else []) + \
+        ([('fuxi,swap-hist', struct.pack('<I', 1))] if swap_hist else [])
+    if not wanted:
+        return root
+    arm_io = next(c for c in root.children if c.name == 'arm-io')
+    disp0 = next(c for c in arm_io.children if c.name == 'disp0')
+    names = {k for k, _ in wanted}
+    disp0.props = [p for p in disp0.props if p[0] not in names] + [(k, 0, v) for k, v in wanted]
+    return root
+
+
 def ensure_mac_addresses(root):
     """Add mkadt's synthetic /chosen Wi-Fi and Bluetooth MACs if missing, so
     older --template ADTs get them too (MobileGestalt UniqueDeviceID inputs)."""
@@ -209,6 +226,8 @@ def main():
     ap.add_argument('--product-haptics', action='store_true', help='add /product/haptics copied from the D22AP tree')
     ap.add_argument('--product-camera', action='store_true', help='add an empty /product/camera node (no flash)')
     ap.add_argument('--display-gamut', choices=('P3', 'sRGB'), help='set /product artwork-display-gamut (sRGB: no deep colour surfaces)')
+    ap.add_argument('--refresh-mhz', type=int, default=0, help='disp0 fuxi,refresh-mhz: CA refresh interval at this rate (e.g. 120800 = measured TE); needs fuxipanel120=1')
+    ap.add_argument('--swap-hist', action='store_true', help='disp0 fuxi,swap-hist=1: log SwapEnd interval histogram per SWEET FB stats window')
     ap.add_argument('--d22ap-adt', type=Path, default=Path(mkadt.D22AP_ADT), help='real D22AP device tree (not in git)')
     args = ap.parse_args()
     mem_size = MEM_SIZE if args.ram_layout == 'full' else LEGACY_SIZE
@@ -228,6 +247,7 @@ def main():
         root = add_product_children(root, args.product_haptics, args.product_camera, args.d22ap_adt)
         if args.display_gamut:
             root = set_display_gamut(root, args.display_gamut)
+        root = set_display_options(root, args.refresh_mhz, args.swap_hist)
         has_ufs = any(n.name == 'fuxi-ufs' for n in root.children)
         validate_live(args.live_fdt, has_ufs)
         blob = adt.serialize(root)
